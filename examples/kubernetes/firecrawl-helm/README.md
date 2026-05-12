@@ -13,7 +13,7 @@ This chart deploys Firecrawl on Kubernetes with:
 
 ## Image Strategy
 
-- **x86-only cluster**: use official Firecrawl images from GHCR (`ghcr.io/firecrawl/...`).
+- **x86-only cluster**: use this fork's images from GHCR (`ghcr.io/tekgnosis-net/...`).
 - **ARM or mixed ARM+x86 cluster**: use your multi-arch `winkkgmbh` images.
 
 Official Firecrawl images are fine for x86. Use winkk images only when ARM support is needed.
@@ -52,17 +52,17 @@ HELM_NO_PLUGINS=1 helm upgrade firecrawl . \
   --create-namespace
 ```
 
-### Use Official Firecrawl Images (x86-only)
+### Use Fork Images from GHCR (x86-only)
 
-If your cluster is x86-only and you want official images, override repositories:
+If your cluster is x86-only and you want this fork's prebuilt images, override repositories:
 
 ```bash
 HELM_NO_PLUGINS=1 helm upgrade firecrawl . \
   -f values.yaml \
   -f overlays/prod/values.yaml \
-  --set image.repository=ghcr.io/firecrawl/firecrawl \
-  --set playwright.repository=ghcr.io/firecrawl/playwright-service \
-  --set nuqPostgres.image.repository=ghcr.io/firecrawl/nuq-postgres \
+  --set image.repository=ghcr.io/tekgnosis-net/firecrawl \
+  --set playwright.repository=ghcr.io/tekgnosis-net/playwright-service \
+  --set nuqPostgres.image.repository=ghcr.io/tekgnosis-net/nuq-postgres \
   -n firecrawl \
   --install \
   --create-namespace

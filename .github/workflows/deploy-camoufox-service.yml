@@ -1,12 +1,12 @@
-name: Deploy Images to GHCR
+name: Deploy Camoufox Service to GHCR
 
 on:
   push:
     branches:
       - main
     paths:
-      - apps/api/**
-      - .github/workflows/deploy-image.yml
+      - apps/camoufox-service-ts/**
+      - .github/workflows/deploy-camoufox-service.yml
   workflow_dispatch:
 
 jobs:
@@ -40,8 +40,8 @@ jobs:
       - name: 'Build and Push Multi-Arch Image'
         uses: docker/build-push-action@v6
         with:
-          context: ./apps/api
+          context: ./apps/camoufox-service-ts
           push: true
-          tags: ghcr.io/${{ env.REPO_OWNER }}/firecrawl:latest
+          tags: ghcr.io/${{ env.REPO_OWNER }}/camoufox-service:latest
           platforms: linux/amd64,linux/arm64
           provenance: false

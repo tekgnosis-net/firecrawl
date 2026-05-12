@@ -1,9 +1,10 @@
 name: firecrawl
 
 x-common-service: &common-service
-  # NOTE: If you don't want to build the service locally,
-  # comment out the build: statement and uncomment the image: statement
-  # image: ghcr.io/firecrawl/firecrawl
+  # Default: pull the image from this fork's GHCR. Falls back to local build
+  # if the image is not available (first run, before CI has pushed). Force a
+  # local build with: docker compose build api worker ...
+  image: ${FIRECRAWL_IMAGE:-ghcr.io/tekgnosis-net/firecrawl:latest}
   build: apps/api
 
   ulimits:
@@ -25,6 +26,12 @@ x-common-env: &common-env
   REDIS_URL: ${REDIS_URL:-redis://redis:6379}
   REDIS_RATE_LIMIT_URL: ${REDIS_URL:-redis://redis:6379}
   PLAYWRIGHT_MICROSERVICE_URL: ${PLAYWRIGHT_MICROSERVICE_URL:-http://playwright-service:3000/scrape}
+  # Stealth fallback engine. Points at the in-compose camoufox-service by default.
+  # Firecrawl registers a "camoufox" engine (quality: -3, stealthProxy: true)
+  # that is selected when a scrape requests proxy: "stealth" or when playwright
+  # returns 401/403/429 with proxy: "auto" (auto-escalation via AddFeatureError).
+  # To disable: set CAMOUFOX_MICROSERVICE_URL= (empty) in your .env.
+  CAMOUFOX_MICROSERVICE_URL: ${CAMOUFOX_MICROSERVICE_URL:-http://camoufox-service:3001/scrape}
   POSTGRES_USER: ${POSTGRES_USER:-postgres}
   POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
   POSTGRES_DB: ${POSTGRES_DB:-postgres}
@@ -58,9 +65,7 @@ x-common-env: &common-env
 
 services:
   playwright-service:
-    # NOTE: If you don't want to build the service locally,
-    # comment out the build: statement and uncomment the image: statement
-    # image: ghcr.io/firecrawl/playwright-service:latest
+    image: ${PLAYWRIGHT_SERVICE_IMAGE:-ghcr.io/tekgnosis-net/playwright-service:latest}
     build: apps/playwright-service-ts
     environment:
       PORT: 3000
@@ -77,6 +82,41 @@ services:
     cpus: 2.0
     mem_limit: 4G
     memswap_limit: 4G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+    tmpfs:
+      - /tmp/.cache:noexec,nosuid,size=1g
+
+  # ----- Optional: Camoufox stealth fallback -----
+  # The camoufox-service container runs Camoufox (a Firefox fork patched at the
+  # C++ level for anti-bot fingerprint resistance) in-process via Playwright.
+  # The Camoufox binary is bundled into the image at build time.
+  #
+  # To enable: set CAMOUFOX_MICROSERVICE_URL=http://camoufox-service:3001/scrape
+  # in the api service's environment (already wired via common-env).
+  # To disable: leave CAMOUFOX_MICROSERVICE_URL unset and skip this service:
+  #   docker compose up --scale camoufox-service=0
+  # or just bring up the services you want explicitly.
+  camoufox-service:
+    image: ${CAMOUFOX_SERVICE_IMAGE:-ghcr.io/tekgnosis-net/camoufox-service:latest}
+    build: apps/camoufox-service-ts
+    environment:
+      PORT: 3001
+      PROXY_SERVER: ${PROXY_SERVER}
+      PROXY_USERNAME: ${PROXY_USERNAME}
+      PROXY_PASSWORD: ${PROXY_PASSWORD}
+      ALLOW_LOCAL_WEBHOOKS: ${ALLOW_LOCAL_WEBHOOKS}
+      BLOCK_MEDIA: ${BLOCK_MEDIA}
+      MAX_CONCURRENT_PAGES: ${CRAWL_CONCURRENT_REQUESTS:-5}
+    networks:
+      - backend
+    cpus: 2.0
+    mem_limit: 3G
+    memswap_limit: 3G
     logging:
       driver: "json-file"
       options:
@@ -149,9 +189,7 @@ services:
         compress: "true"
   
   nuq-postgres:
-    # NOTE: If you don't want to build the image locally,
-    # comment out the build: statement and uncomment the image: statement
-    # image: ghcr.io/firecrawl/nuq-postgres:latest
+    image: ${NUQ_POSTGRES_IMAGE:-ghcr.io/tekgnosis-net/nuq-postgres:latest}
     build: apps/nuq-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}

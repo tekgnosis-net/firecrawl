@@ -1,8 +1,5 @@
 name: Deploy Redis to GHCR
 
-env:
-  DOTNET_VERSION: '6.0.x'
-
 on:
   push:
     branches:
@@ -12,23 +9,31 @@ on:
   workflow_dispatch:
 
 jobs:
-      push-app-image:
-        runs-on: blacksmith-4vcpu-ubuntu-2404
-        defaults:
-          run:
-            working-directory: './apps/redis'
-        steps:
-          - name: 'Checkout GitHub Action'
-            uses: actions/checkout@main
+  push-app-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: './apps/redis'
+    steps:
+      - name: 'Checkout GitHub Action'
+        uses: actions/checkout@v4
 
-          - name: 'Login to GitHub Container Registry'
-            uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-            with:
-              registry: ghcr.io
-              username: ${{github.actor}}
-              password: ${{secrets.GITHUB_TOKEN}}
+      - name: 'Login to GitHub Container Registry'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-          - name: 'Build Inventory Image'
-            run: |
-              docker build . --tag ghcr.io/firecrawl/firecrawl-redis:latest
-              docker push ghcr.io/firecrawl/firecrawl-redis:latest
+      - name: Lowercase Repo Owner
+        env:
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: echo "REPO_OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> "${GITHUB_ENV}"
+
+      - name: 'Build and Push Redis Image'
+        run: |
+          docker build . --tag "ghcr.io/${REPO_OWNER}/firecrawl-redis:latest"
+          docker push "ghcr.io/${REPO_OWNER}/firecrawl-redis:latest"

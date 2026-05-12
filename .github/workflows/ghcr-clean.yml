@@ -6,13 +6,20 @@ on:
 jobs:
   delete-untagged-images:
     name: Delete Untagged Images
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
     steps:
+      - name: Lowercase Repo Owner
+        env:
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: echo "REPO_OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> "${GITHUB_ENV}"
+
       - uses: bots-house/ghcr-delete-image-action@3827559c68cb4dcdf54d813ea9853be6d468d3a4 # v1.1.0
         with:
-          owner: firecrawl
+          owner: ${{ env.REPO_OWNER }}
           name: firecrawl
           # NOTE: using Personal Access Token
-          token: ${{secrets.GITHUB_TOKEN}}
+          token: ${{ secrets.GITHUB_TOKEN }}
           # Keep latest N untagged images
           untagged-keep-latest: 5

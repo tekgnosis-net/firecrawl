@@ -24,7 +24,7 @@ spec:
         - name: docker-registry-secret
       containers:
         - name: playwright-service
-          image: ghcr.io/firecrawl/playwright-service:latest
+          image: ghcr.io/tekgnosis-net/playwright-service:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 3000

@@ -13,6 +13,10 @@ import {
   playwrightMaxReasonableTime,
   scrapeURLWithPlaywright,
 } from "./playwright";
+import {
+  camoufoxMaxReasonableTime,
+  scrapeURLWithCamoufox,
+} from "./camoufox";
 import { indexMaxReasonableTime, scrapeURLWithIndex } from "./index/index";
 import {
   scrapeURLWithWikipedia,
@@ -39,6 +43,7 @@ export type Engine =
   | "fire-engine;tlsclient"
   | "fire-engine;tlsclient;stealth"
   | "playwright"
+  | "camoufox"
   | "fetch"
   | "pdf"
   | "document"
@@ -53,6 +58,9 @@ const useFireEngine =
 const usePlaywright =
   config.PLAYWRIGHT_MICROSERVICE_URL !== "" &&
   config.PLAYWRIGHT_MICROSERVICE_URL !== undefined;
+const useCamoufox =
+  config.CAMOUFOX_MICROSERVICE_URL !== "" &&
+  config.CAMOUFOX_MICROSERVICE_URL !== undefined;
 const useWikipedia =
   config.WIKIPEDIA_ENTERPRISE_USERNAME !== undefined &&
   config.WIKIPEDIA_ENTERPRISE_USERNAME !== "" &&
@@ -77,6 +85,7 @@ const engines: Engine[] = [
       ]
     : []),
   ...(usePlaywright ? ["playwright" as const] : []),
+  ...(useCamoufox ? ["camoufox" as const] : []),
   "fetch",
   "pdf",
   "document",
@@ -173,6 +182,7 @@ const engineHandlers: {
   "fire-engine;tlsclient": scrapeURLWithFireEngineTLSClient,
   "fire-engine;tlsclient;stealth": scrapeURLWithFireEngineTLSClient,
   playwright: scrapeURLWithPlaywright,
+  camoufox: scrapeURLWithCamoufox,
   fetch: scrapeURLWithFetch,
   pdf: scrapePDF,
   document: scrapeDocument,
@@ -198,6 +208,7 @@ const engineMRTs: {
   "fire-engine;tlsclient;stealth": meta =>
     fireEngineMaxReasonableTime(meta, "tlsclient"),
   playwright: playwrightMaxReasonableTime,
+  camoufox: camoufoxMaxReasonableTime,
   fetch: fetchMaxReasonableTime,
   pdf: pdfMaxReasonableTime,
   document: documentMaxReasonableTime,
@@ -354,6 +365,30 @@ const engineOptions: {
       disableAdblock: false,
     },
     quality: 20,
+  },
+  camoufox: {
+    // Camoufox is a Firefox fork patched at the C++ level for anti-fingerprint.
+    // We declare it as a specialty stealth engine: only used when something
+    // requests stealthProxy (e.g. after playwright returns 401/403/429 and
+    // the scrape loop escalates via AddFeatureError).
+    features: {
+      actions: false,
+      waitFor: true,
+      screenshot: false,
+      "screenshot@fullScreen": false,
+      pdf: false,
+      document: false,
+      audio: false,
+      atsv: false,
+      location: false,
+      mobile: false,
+      skipTlsVerification: true,
+      useFastMode: false,
+      stealthProxy: true,
+      branding: false,
+      disableAdblock: false,
+    },
+    quality: -3,
   },
   "fire-engine;tlsclient": {
     features: {
