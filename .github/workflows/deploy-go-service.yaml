@@ -43,3 +43,5 @@ jobs:
           context: ./apps/go-html-to-md-service
           push: true
           tags: ghcr.io/${{ env.REPO_OWNER }}/go-html-to-md-service:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -19,9 +19,6 @@ jobs:
       - name: 'Checkout GitHub Action'
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -37,11 +34,13 @@ jobs:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: echo "REPO_OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> "${GITHUB_ENV}"
 
-      - name: 'Build and Push Multi-Arch Image'
+      - name: 'Build and Push Image (amd64)'
         uses: docker/build-push-action@v6
         with:
           context: ./apps/camoufox-service-ts
           push: true
           tags: ghcr.io/${{ env.REPO_OWNER }}/camoufox-service:latest
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
