@@ -5,6 +5,12 @@ set -e
 sysctl vm.overcommit_memory=1 || true
 sysctl net.core.somaxconn=1024 || true
 
+# Raise the soft file-descriptor limit up to whatever hard cap the container
+# runtime granted us. Redis defaults to maxclients=10000 which requires ~10032
+# fds; the default 1024 soft limit would force redis to silently lower it.
+# Best-effort (|| true) so we don't fail if the hard cap is below 65535.
+ulimit -n 65535 || true
+
 PW_ARG=""
 if [[ ! -z "${REDIS_PASSWORD}" ]]; then
   PW_ARG="--requirepass $REDIS_PASSWORD"

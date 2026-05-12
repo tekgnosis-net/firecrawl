@@ -160,6 +160,15 @@ services:
     image: redis:alpine
     # image: valkey/valkey:alpine
 
+    # Raise the file-descriptor limit so redis doesn't print
+    # "You requested maxclients of 10000 requiring at least 10032 max file
+    #  descriptors. Current maximum open files is 1024" on every start.
+    # The x-common-service anchor's ulimits don't reach this service because
+    # it doesn't merge in <<: *common-service.
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     networks:
       - backend
     command: redis-server --bind 0.0.0.0
@@ -169,7 +178,7 @@ services:
         max-size: "5m"
         max-file: "2"
         compress: "true"
-    
+
   rabbitmq:
     image: rabbitmq:3-management
     networks:
