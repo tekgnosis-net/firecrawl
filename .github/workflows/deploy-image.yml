@@ -4,8 +4,17 @@ on:
   push:
     branches:
       - main
+    # Only trigger on inputs that affect the runtime image (dist/, native/,
+    # node_modules, Go .so). Doc/spec/test-config changes are skipped.
     paths:
-      - apps/api/**
+      - apps/api/src/**
+      - apps/api/native/**
+      - apps/api/sharedLibs/**
+      - apps/api/package.json
+      - apps/api/pnpm-lock.yaml
+      - apps/api/pnpm-workspace.yaml
+      - apps/api/tsconfig.json
+      - apps/api/Dockerfile
       - .github/workflows/deploy-image.yml
   workflow_dispatch:
 

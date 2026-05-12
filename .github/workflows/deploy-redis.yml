@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - apps/redis/**
+      - .github/workflows/deploy-redis.yml
   workflow_dispatch:
 
 jobs:

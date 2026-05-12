@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - apps/nuq-postgres/**
+      - .github/workflows/deploy-nuq-postgres.yml
   workflow_dispatch:
 
 jobs:
