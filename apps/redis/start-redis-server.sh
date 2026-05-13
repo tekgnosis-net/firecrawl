@@ -18,6 +18,7 @@ fi
 
 : ${MAXMEMORY_POLICY:="noeviction"}
 : ${APPENDONLY:="no"}
+: ${MAXCLIENTS:="50000"}
 : ${FLY_VM_MEMORY_MB:=$(($(grep MemTotal /proc/meminfo | awk '{print $2}') / 1024))}
 if [ "${NOSAVE}" = "" ] ; then
   : ${SAVE:="3600 1 300 100 60 10000"}
@@ -33,4 +34,5 @@ redis-server $PW_ARG \
   --maxmemory-policy $MAXMEMORY_POLICY \
   --appendonly $APPENDONLY \
   --save "$SAVE" \
+  --maxclients "$MAXCLIENTS" \
   --protected-mode no

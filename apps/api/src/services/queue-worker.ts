@@ -265,6 +265,15 @@ const workerFun = async (
     maxStalledCount: 10, // 10 times
   });
 
+  // BullMQ Worker internally duplicates the connection for its blocking
+  // client and pub/sub subscriber; those duplicates start with no event
+  // listeners. Without this hook, every ioredis reply error (e.g. "ERR
+  // max number of clients reached") surfaces as a noisy stderr line
+  // "[ioredis] Unhandled error event: ..." with no actionable context.
+  worker.on("error", err =>
+    logger.warn("BullMQ worker error", { err, queue: queue.name }),
+  );
+
   worker.startStalledCheckTimer();
 
   const monitor = await systemMonitor;

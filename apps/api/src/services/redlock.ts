@@ -1,11 +1,23 @@
 import Redlock from "redlock";
 import { config } from "../config";
 import Client from "ioredis";
+import { logger } from "../lib/logger";
+
+// Redlock holds its own ioredis Client. Like every other ioredis instance,
+// it needs an 'error' listener — without one, ioredis reply errors surface
+// as "[ioredis] Unhandled error event: ..." stderr spam (and on Node >= 15,
+// an unhandled 'error' event throws on the next tick).
+const redlockClient = new Client(config.REDIS_RATE_LIMIT_URL!);
+redlockClient.on("error", err => {
+  try {
+    logger.error("Redlock Redis client error", { err });
+  } catch {}
+});
 
 export const redlock = new Redlock(
   // You should have one client for each independent redis node
   // or cluster.
-  [new Client(config.REDIS_RATE_LIMIT_URL!)],
+  [redlockClient],
   {
     // The expected clock drift; for more details see:
     // http://redis.io/topics/distlock

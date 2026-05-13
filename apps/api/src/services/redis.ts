@@ -76,3 +76,12 @@ const redisEvictURL = config.REDIS_EVICT_URL ?? config.REDIS_RATE_LIMIT_URL;
 export const redisEvictConnection = new IORedis(redisEvictURL!, {
   enableAutoPipelining: true,
 });
+
+// Without this listener, every ioredis reply error on the evict connection
+// would surface as "[ioredis] Unhandled error event: ..." in stderr (and on
+// Node >= 15, an unhandled 'error' event throws on the next tick).
+redisEvictConnection.on("error", err => {
+  try {
+    logger.error("Redis evict connection error", { err });
+  } catch {}
+});

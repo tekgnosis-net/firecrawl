@@ -154,24 +154,31 @@ services:
     memswap_limit: 8G
 
   redis:
-    # NOTE: If you want to use Valkey (open source) instead of Redis (source available),
-    # uncomment the Valkey statement and comment out the Redis statement.
-    # Using Valkey with Firecrawl is untested and not guaranteed to work. Use with caution.
-    image: redis:alpine
-    # image: valkey/valkey:alpine
-
-    # Raise the file-descriptor limit so redis doesn't print
-    # "You requested maxclients of 10000 requiring at least 10032 max file
-    #  descriptors. Current maximum open files is 1024" on every start.
-    # The x-common-service anchor's ulimits don't reach this service because
-    # it doesn't merge in <<: *common-service.
+    # Use this fork's purpose-built Redis image. It ships start-redis-server.sh
+    # which raises the in-container ulimit AND launches redis-server with an
+    # explicit --maxclients flag (default 50000). The upstream redis:alpine
+    # image leaves maxclients at the 10000 default, which Firecrawl's
+    # multi-process worker harness can exhaust in normal operation.
+    #
+    # To use Valkey or upstream Redis instead, override the REDIS_IMAGE env
+    # var (e.g. REDIS_IMAGE=valkey/valkey:alpine) — but you will lose the
+    # bundled start-up tuning.
+    image: ${REDIS_IMAGE:-ghcr.io/tekgnosis-net/firecrawl-redis:latest}
+    build: apps/redis
+    environment:
+      # Override the default 50000 if you need more headroom; the container
+      # ulimit (below) caps the practical maximum near 65000.
+      MAXCLIENTS: ${REDIS_MAXCLIENTS:-50000}
+    # Raise the file-descriptor limit so redis can actually allocate the
+    # MAXCLIENTS sockets it was told to. The x-common-service anchor's
+    # ulimits don't reach this service because it doesn't merge in
+    # <<: *common-service.
     ulimits:
       nofile:
         soft: 65535
         hard: 65535
     networks:
       - backend
-    command: redis-server --bind 0.0.0.0
     logging:
       driver: "json-file"
       options:
