@@ -186,11 +186,10 @@ async function aggregateHistoricalPeriodsByApiKeyMonth(
 export async function getTeamBalance(
   teamId: string,
 ): Promise<TeamBalance | null> {
-  if (!autumnClient) {
-    throw new Error(
-      "Autumn client is not configured (AUTUMN_SECRET_KEY missing)",
-    );
-  }
+  // Self-host installs typically run without Autumn (cloud-only billing).
+  // Return null and let the controllers respond with a clean 404 instead
+  // of spamming the error log with a stack trace on every poll.
+  if (!autumnClient) return null;
 
   const orgId = await lookupOrgId(teamId);
 
@@ -346,11 +345,9 @@ interface HistoricalPeriodByApiKey {
 export async function getTeamHistoricalUsage(
   teamId: string,
 ): Promise<HistoricalPeriod[]> {
-  if (!autumnClient) {
-    throw new Error(
-      "Autumn client is not configured (AUTUMN_SECRET_KEY missing)",
-    );
-  }
+  // Self-host: no Autumn → no historical data. Empty list keeps the
+  // controllers' shape contract intact and avoids error-log spam.
+  if (!autumnClient) return [];
 
   const orgId = await lookupOrgId(teamId);
 
@@ -388,11 +385,9 @@ export async function getTeamHistoricalUsage(
 export async function getTeamHistoricalUsageByApiKey(
   teamId: string,
 ): Promise<HistoricalPeriodByApiKey[]> {
-  if (!autumnClient) {
-    throw new Error(
-      "Autumn client is not configured (AUTUMN_SECRET_KEY missing)",
-    );
-  }
+  // Self-host: no Autumn → no historical data. Empty list keeps the
+  // controllers' shape contract intact and avoids error-log spam.
+  if (!autumnClient) return [];
 
   const orgId = await lookupOrgId(teamId);
 
