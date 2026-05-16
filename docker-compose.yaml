@@ -7,6 +7,7 @@ x-common-service: &common-service
   image: ${FIRECRAWL_IMAGE:-ghcr.io/tekgnosis-net/firecrawl:latest}
   build: apps/api
 
+  restart: unless-stopped
   ulimits:
     nofile:
       soft: 65535
@@ -78,6 +79,7 @@ services:
       MAX_CONCURRENT_PAGES: ${CRAWL_CONCURRENT_REQUESTS:-10}
     networks:
       - backend
+    restart: unless-stopped
     # Resource limits for Docker Compose (not Swarm)
     cpus: 2.0
     mem_limit: 4G
@@ -114,6 +116,7 @@ services:
       MAX_CONCURRENT_PAGES: ${CRAWL_CONCURRENT_REQUESTS:-5}
     networks:
       - backend
+    restart: unless-stopped
     cpus: 2.0
     mem_limit: 3G
     memswap_limit: 3G
@@ -179,6 +182,7 @@ services:
         hard: 65535
     networks:
       - backend
+    restart: unless-stopped
     logging:
       driver: "json-file"
       options:
@@ -190,6 +194,7 @@ services:
     image: rabbitmq:3-management
     networks:
       - backend
+    restart: unless-stopped
     command: rabbitmq-server
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
@@ -213,6 +218,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-postgres}
     networks:
       - backend
+    restart: unless-stopped
     logging:
       driver: "json-file"
       options:
