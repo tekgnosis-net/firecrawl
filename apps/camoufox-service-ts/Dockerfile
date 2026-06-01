@@ -1,9 +1,12 @@
 FROM node:20-slim
 
-# ca-certificates is needed for the HTTPS download of the Camoufox binary
-# (`npx camoufox-js fetch`, below) — node:*-slim ships without it.
+# ca-certificates: HTTPS download of the Camoufox binary (`camoufox-js fetch`).
+# build-essential + python3: node-gyp needs them to compile better-sqlite3 (a
+# transitive camoufox-js dep) from source — node:*-slim has no toolchain, and
+# no prebuilt binary is published for this platform/node combo, so npm install
+# falls back to a source build.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates \
+  && apt-get install -y --no-install-recommends ca-certificates build-essential python3 \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
