@@ -1,10 +1,9 @@
 FROM node:20-slim
 
-# `git` is required because we pull camoufox-js directly from GitHub
-# (`github:apify/camoufox-js` in package.json) — npm spawns `git clone`
-# under the hood, which is missing from the slim base image.
+# ca-certificates is needed for the HTTPS download of the Camoufox binary
+# (`npx camoufox-js fetch`, below) — node:*-slim ships without it.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends git ca-certificates \
+  && apt-get install -y --no-install-recommends ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
