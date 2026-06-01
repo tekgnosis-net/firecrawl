@@ -1,0 +1,93 @@
+name: Camoufox Auto-bump
+
+# Weekly check for a newer camoufox-js release. On a new release this opens (or
+# refreshes) a PR that bumps the pin + regenerates package-lock.json. It never
+# merges: the PR is the human review surface, and the smoke-gated deploy
+# workflow runs on it automatically — so the reviewer sees a green/red
+# browser-launch + real-scrape result before approving. Merging the PR (a push
+# to main) is what publishes the new :latest image.
+#
+# Supersedes the old issue-based release-check: a PR is a better gate than an
+# issue (a concrete, CI-tested diff). Detection logic is shared with
+# .github/scripts/check-camoufox-release.sh.
+
+on:
+  schedule:
+    - cron: "0 7 * * 1" # Mondays 07:00 UTC (after upstream-sync at 06:00)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: camoufox-autobump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Check for a newer camoufox-js release
+        id: chk
+        run: bash .github/scripts/check-camoufox-release.sh
+
+      - name: Set up Node
+        if: steps.chk.outputs.update == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Bump pin + lockfile and open/refresh PR
+        if: steps.chk.outputs.update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PINNED: ${{ steps.chk.outputs.pinned }}
+          LATEST: ${{ steps.chk.outputs.latest }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="automation/camoufox-js-${LATEST}"
+          git switch -C "$BRANCH" "origin/main"
+
+          ( cd apps/camoufox-service-ts \
+            && npm pkg set "dependencies.camoufox-js=${LATEST}" \
+            && npm install --package-lock-only )
+
+          if git diff --quiet; then
+            echo "No changes produced by the bump — nothing to do."
+            exit 0
+          fi
+
+          git add apps/camoufox-service-ts/package.json apps/camoufox-service-ts/package-lock.json
+          git commit -m "chore(camoufox): bump camoufox-js ${PINNED} -> ${LATEST}"
+          git push -u origin "$BRANCH" --force-with-lease
+
+          if gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number' | grep -q .; then
+            echo "PR already open for ${BRANCH} — refreshed."
+          else
+            gh pr create --base main --head "$BRANCH" \
+              --title "chore(camoufox): bump camoufox-js to ${LATEST}" \
+              --body "$(printf '%s\n' \
+                "Automated bump of \`camoufox-js\` ${PINNED} -> ${LATEST} (apps/camoufox-service-ts)." \
+                "" \
+                "The **smoke-gated deploy** runs on this PR: it builds the image, boots it," \
+                "confirms the Camoufox browser launches, scrapes a real page, and checks the" \
+                "SSRF guard. **Do not merge unless that check is green.**" \
+                "" \
+                "camoufox-js is 0.x — skim the diff and the changelog before merging:" \
+                "https://github.com/apify/camoufox-js/releases" \
+                "" \
+                "Merging publishes \`camoufox-service:latest\` (+ a \`sha-<commit>\` tag)." \
+                "" \
+                "_Opened by .github/workflows/camoufox-autobump.yml._")"
+          fi
