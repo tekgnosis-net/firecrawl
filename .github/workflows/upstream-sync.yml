@@ -42,7 +42,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - uses: pnpm/action-setup@v4
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # This monorepo has no root package.json, so action-setup can't find
+          # the packageManager field (it lives in apps/api/package.json). Pin it
+          # explicitly — keep in sync with apps/api/package.json "packageManager".
+          version: 10.16.1
 
       - name: Set up Node
         uses: actions/setup-node@v4
