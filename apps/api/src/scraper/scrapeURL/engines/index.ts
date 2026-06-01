@@ -112,6 +112,15 @@ const featureFlags = [
 
 export type FeatureFlag = (typeof featureFlags)[number];
 
+// Baseline with every feature flag disabled, derived from the flag list itself.
+// Fork-maintained engines (e.g. camoufox, which upstream does not know about)
+// spread this so that when upstream adds a new FeatureFlag, our engine inherits
+// `false` automatically instead of breaking the build on the
+// `features: { [F in FeatureFlag]: boolean }` mapped type below.
+const allFeaturesFalse = Object.fromEntries(
+  featureFlags.map(f => [f, false]),
+) as { [F in FeatureFlag]: boolean };
+
 const featureFlagOptions: {
   [F in FeatureFlag]: {
     priority: number;
@@ -380,22 +389,13 @@ const engineOptions: {
     // We declare it as a specialty stealth engine: only used when something
     // requests stealthProxy (e.g. after playwright returns 401/403/429 and
     // the scrape loop escalates via AddFeatureError).
+    // Spread allFeaturesFalse so upstream-added flags default off without a
+    // build break; only declare the capabilities camoufox actually supports.
     features: {
-      actions: false,
+      ...allFeaturesFalse,
       waitFor: true,
-      screenshot: false,
-      "screenshot@fullScreen": false,
-      pdf: false,
-      document: false,
-      audio: false,
-      atsv: false,
-      location: false,
-      mobile: false,
       skipTlsVerification: true,
-      useFastMode: false,
       stealthProxy: true,
-      branding: false,
-      disableAdblock: false,
     },
     quality: -3,
   },
