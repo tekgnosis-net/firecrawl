@@ -40,6 +40,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Durable record in the run summary, independent of Issues being
+          # enabled (forks disable Issues by default — don't lose the signal).
+          {
+            echo "## camoufox-js ${LATEST} available (pinned ${PINNED})"
+            echo ""
+            echo "Bump \`apps/camoufox-service-ts/package.json\` to \`${LATEST}\`, run \`pnpm install\`, push."
+          } >> "$GITHUB_STEP_SUMMARY"
+
           # Ensure the tracking label exists (idempotent).
           gh label create camoufox-release \
             --color 1d76db --description "Tracks new camoufox-js upstream releases" \
