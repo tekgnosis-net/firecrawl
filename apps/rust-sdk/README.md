@@ -1,5 +1,5 @@
 # Firecrawl Rust SDK
-The Firecrawl Rust SDK is a library that allows you to easily search, scrape, and interact with the web, and output the data in a format ready for use with language models (LLMs). It provides a simple and intuitive interface for the Firecrawl API.
+The Firecrawl Rust SDK is a library that lets you easily search, scrape, and interact with the web for AI agents — returning clean Markdown or structured data your agents can ship with. It provides a simple and intuitive interface for the Firecrawl API.
 
 ## Installation
 
@@ -7,7 +7,7 @@ To install the Firecrawl Rust SDK, add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-firecrawl = "2.1.0"
+firecrawl = "2.5.0"
 tokio = { version = "^1", features = ["full"] }
 ```
 
@@ -38,6 +38,24 @@ match scrape_result {
     Ok(data) => println!("Scrape result:\n{}", data.markdown),
     Err(e) => eprintln!("Scrape failed: {}", e),
 }
+```
+
+### Video extraction
+
+Use `Format::Video` on supported video URLs, including YouTube and TikTok. The returned `video` field is a signed URL to the extracted video file.
+
+```rust
+use firecrawl::{Format, ScrapeOptions};
+
+let options = ScrapeOptions {
+    formats: Some(vec![Format::Video]),
+    ..Default::default()
+};
+
+let doc = client
+    .scrape("https://www.youtube.com/watch?v=dQw4w9WgXcQ", options)
+    .await?;
+println!("{:?}", doc.video);
 ```
 
 ### Parsing uploaded files (v2)

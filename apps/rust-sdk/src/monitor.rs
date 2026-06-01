@@ -23,6 +23,12 @@ pub struct CreateMonitorRequest {
     pub webhook: Option<Value>,
     pub notification: Option<Value>,
     pub retention_days: Option<u32>,
+    /// Optional natural-language description of what the monitor is
+    /// watching for (max 2000 chars). When `goal` is set and
+    /// `judge_enabled` is left as `None`, the API automatically enables
+    /// judging for this monitor.
+    pub goal: Option<String>,
+    pub judge_enabled: Option<bool>,
 }
 
 #[serde_with::skip_serializing_none]
@@ -36,6 +42,10 @@ pub struct UpdateMonitorRequest {
     pub webhook: Option<Value>,
     pub notification: Option<Value>,
     pub retention_days: Option<u32>,
+    /// Same semantics as on [`CreateMonitorRequest`]; leave as `None` to
+    /// keep the existing values.
+    pub goal: Option<String>,
+    pub judge_enabled: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Default, Clone)]
@@ -65,6 +75,9 @@ pub struct Monitor {
     pub retention_days: u32,
     pub estimated_credits_per_month: Option<u32>,
     pub last_check_summary: Option<MonitorSummary>,
+    pub goal: Option<String>,
+    #[serde(default)]
+    pub judge_enabled: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -91,6 +104,54 @@ pub struct MonitorCheck {
     pub updated_at: String,
 }
 
+/// Per-field diff entry returned for monitors that requested JSON extraction.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct MonitorJsonFieldDiff {
+    pub previous: Value,
+    pub current: Value,
+}
+
+/// Diff payload returned alongside a monitor page when its scrape produced
+/// a change. The shape depends on what the monitor's formats asked for:
+///
+/// - markdown-only monitors  → `text` is the unified diff and `json` is
+///   the `parseDiff` AST (a `{ "files": [...] }` object).
+/// - JSON-extraction monitors → `json` is the per-field
+///   `{ previous, current }` map and `text` is absent.
+/// - mixed (JSON + git-diff) monitors → both `text` (markdown sidecar)
+///   and `json` (field-level diff) are present.
+///
+/// `json` is kept as a raw [`serde_json::Value`] so callers can decode it
+/// into either shape (`HashMap<String, MonitorJsonFieldDiff>` for the
+/// field-diff case, or a `{ files: [...] }` struct for the parseDiff AST).
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct MonitorPageDiff {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json: Option<Value>,
+}
+
+/// Snapshot of the current JSON extraction at this run. Present on JSON
+/// and mixed-mode monitors; absent for markdown-only.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct MonitorPageSnapshot {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json: Option<Value>,
+}
+
+/// Judge's verdict on whether a page change is meaningful. Populated on
+/// monitor check pages when the monitor has a `goal` set and judging is
+/// enabled.
+#[derive(Deserialize, Serialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitorPageJudgment {
+    pub meaningful: bool,
+    pub confidence: String,
+    pub reason: String,
+    pub fields: Vec<String>,
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct MonitorCheckPage {
@@ -103,7 +164,9 @@ pub struct MonitorCheckPage {
     pub status_code: Option<u16>,
     pub error: Option<String>,
     pub metadata: Option<Value>,
-    pub diff: Option<Value>,
+    pub diff: Option<MonitorPageDiff>,
+    pub snapshot: Option<MonitorPageSnapshot>,
+    pub judgment: Option<MonitorPageJudgment>,
     pub created_at: String,
 }
 

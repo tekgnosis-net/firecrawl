@@ -13,6 +13,7 @@ from .types import (
     CrawlRequest,
     WebhookConfig,
     AgentWebhookConfig,
+    MonitorWebhookConfig,
     SearchRequest,
     SearchData,
     SourceOption,
@@ -60,6 +61,7 @@ from .methods.aio import agent as async_agent  # type: ignore[attr-defined]
 from .methods.aio import browser as async_browser  # type: ignore[attr-defined]
 from .methods.aio import monitor as async_monitor  # type: ignore[attr-defined]
 
+from .client import _SCRAPE_OPTION_KEYS
 from .watcher_async import AsyncWatcher
 
 class AsyncFirecrawlClient:
@@ -157,6 +159,46 @@ class AsyncFirecrawlClient:
         """Deprecated alias for stop_interaction()."""
         return await self.stop_interaction(job_id)
 
+    async def scrape_url(self, url: str, **kwargs):
+        """V1 compatibility alias for agent recovery. Prefer scrape()."""
+        return await self.scrape(url, **kwargs)
+
+    async def crawl_url(self, url: str, **kwargs):
+        """V1 compatibility alias for agent recovery. Prefer crawl()."""
+        return await self.crawl(url=url, **kwargs)
+
+    async def map_url(self, url: str, **kwargs):
+        """V1 compatibility alias for agent recovery. Prefer map()."""
+        return await self.map(url, **kwargs)
+
+    async def async_crawl_url(self, url: str, **kwargs):
+        """V1 compatibility alias for agent recovery. Prefer start_crawl()."""
+        return await self.start_crawl(url, **kwargs)
+
+    async def check_crawl_status(self, id: str, **kwargs):
+        """V1 compatibility alias for agent recovery. Prefer get_crawl_status()."""
+        return await self.get_crawl_status(id, **kwargs)
+
+    async def check_crawl_errors(self, id: str):
+        """V1 compatibility alias for agent recovery. Prefer get_crawl_errors()."""
+        return await self.get_crawl_errors(id)
+
+    async def batch_scrape_urls(self, urls, **kwargs):
+        """V1 compatibility alias for agent recovery. Prefer batch_scrape()."""
+        return await self.batch_scrape(urls, **kwargs)
+
+    async def async_batch_scrape_urls(self, urls, **kwargs):
+        """V1 compatibility alias for agent recovery. Prefer start_batch_scrape()."""
+        return await self.start_batch_scrape(urls, **kwargs)
+
+    async def check_batch_scrape_status(self, id: str, **kwargs):
+        """V1 compatibility alias for agent recovery. Prefer get_batch_scrape_status()."""
+        return await self.get_batch_scrape_status(id, **kwargs)
+
+    async def check_batch_scrape_errors(self, id: str):
+        """V1 compatibility alias for agent recovery. Prefer get_batch_scrape_errors()."""
+        return await self.get_batch_scrape_errors(id)
+
     async def parse(
         self,
         file: Union[str, Path, bytes, bytearray, BinaryIO],
@@ -184,6 +226,15 @@ class AsyncFirecrawlClient:
         return await async_search.search(self.async_http_client, request)
 
     async def start_crawl(self, url: str, **kwargs) -> CrawlResponse:
+        if kwargs.get("scrape_options") is None:
+            scrape_kwargs = {k: kwargs.pop(k) for k in list(kwargs) if k in _SCRAPE_OPTION_KEYS and kwargs[k] is not None}
+            if scrape_kwargs:
+                kwargs["scrape_options"] = ScrapeOptions(**scrape_kwargs)
+        else:
+            for k in list(kwargs):
+                if k in _SCRAPE_OPTION_KEYS:
+                    kwargs.pop(k)
+
         sitemap = kwargs.pop("sitemap", None)
         ignore_sitemap = kwargs.pop("ignore_sitemap", None)
         if sitemap is None and ignore_sitemap is not None:
@@ -347,9 +398,11 @@ class AsyncFirecrawlClient:
         schedule: Union[MonitorSchedule, Dict[str, Any]],
         targets: List[Union[MonitorTarget, Dict[str, Any]]],
         *,
-        webhook: Optional[WebhookConfig] = None,
+        webhook: Optional[Union[MonitorWebhookConfig, Dict[str, Any]]] = None,
         notification: Optional[MonitorNotification] = None,
         retention_days: Optional[int] = None,
+        goal: Optional[str] = None,
+        judge_enabled: Optional[bool] = None,
     ) -> Monitor:
         if isinstance(schedule, dict):
             schedule = MonitorSchedule(**schedule)
@@ -360,6 +413,8 @@ class AsyncFirecrawlClient:
             webhook=webhook,
             notification=notification,
             retention_days=retention_days,
+            goal=goal,
+            judge_enabled=judge_enabled,
         )
         return await async_monitor.create_monitor(self.async_http_client, request)
 
@@ -385,10 +440,12 @@ class AsyncFirecrawlClient:
         name: Optional[str] = None,
         status: Optional[Literal["active", "paused"]] = None,
         schedule: Optional[Union[MonitorSchedule, Dict[str, Any]]] = None,
-        webhook: Optional[Union[WebhookConfig, Dict[str, Any]]] = None,
+        webhook: Optional[Union[MonitorWebhookConfig, Dict[str, Any]]] = None,
         notification: Optional[Union[MonitorNotification, Dict[str, Any]]] = None,
         targets: Optional[List[Union[MonitorTarget, Dict[str, Any]]]] = None,
         retention_days: Optional[int] = None,
+        goal: Optional[str] = None,
+        judge_enabled: Optional[bool] = None,
     ) -> Monitor:
         if isinstance(schedule, dict):
             schedule = MonitorSchedule(**schedule)
@@ -400,6 +457,8 @@ class AsyncFirecrawlClient:
             notification=notification,
             targets=targets,
             retention_days=retention_days,
+            goal=goal,
+            judge_enabled=judge_enabled,
         )
         return await async_monitor.update_monitor(
             self.async_http_client,

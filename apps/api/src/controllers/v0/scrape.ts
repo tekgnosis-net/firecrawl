@@ -26,6 +26,7 @@ import { scrapeQueue } from "../../services/worker/nuq";
 import { getErrorContactMessage } from "../../lib/deployment";
 import { logRequest } from "../../services/logging/log_job";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
+import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
 
 async function scrapeHelper(
   jobId: string,
@@ -62,7 +63,12 @@ async function scrapeHelper(
     return { success: false, error: "Url is required", returnCode: 400 };
   }
 
-  if (isUrlBlocked(url, flags)) {
+  if (
+    isUrlBlocked(url, flags, {
+      team_id,
+      origin: req.body?.origin ?? null,
+    })
+  ) {
     return {
       success: false,
       error: UNSUPPORTED_SITE_MESSAGE,
@@ -181,6 +187,7 @@ export async function scrapeController(req: Request, res: Response) {
     // make sure to authenticate user first, Bearer <token>
     const auth = await authenticateUser(req, res, RateLimiterMode.Scrape);
     if (!auth.success) {
+      if (auth.status === 401) applyAgentAuthDiscoveryHeader(res);
       return res.status(auth.status).json({ error: auth.error });
     }
 

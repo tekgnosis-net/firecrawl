@@ -60,6 +60,24 @@ describe("V2 Types Validation", () => {
       expect(result.formats).toEqual([{ type: "markdown" }, { type: "html" }]);
     });
 
+    it("should accept video format as string and object", () => {
+      const stringInput: ScrapeRequestInput = {
+        url: "https://example.com",
+        formats: ["video"],
+      };
+      const objectInput: ScrapeRequestInput = {
+        url: "https://example.com",
+        formats: [{ type: "video" }],
+      };
+
+      expect(scrapeRequestSchema.parse(stringInput).formats).toEqual([
+        { type: "video" },
+      ]);
+      expect(scrapeRequestSchema.parse(objectInput).formats).toEqual([
+        { type: "video" },
+      ]);
+    });
+
     it("should accept valid scrape request with json format options", () => {
       const input: ScrapeRequestInput = {
         url: "https://example.com",
@@ -1295,6 +1313,38 @@ describe("V2 Types Validation", () => {
         cron: "7-59/15 * * * *",
         timezone: "UTC",
       });
+    });
+
+    it("should accept daily am/pm schedule text", () => {
+      const cases = [
+        ["daily at 9am", "0 9 * * *"],
+        ["daily at 9:30am", "30 9 * * *"],
+        ["daily at 5pm", "0 17 * * *"],
+        ["daily at 5:30 pm", "30 17 * * *"],
+        ["daily at 12am", "0 0 * * *"],
+        ["daily at 12pm", "0 12 * * *"],
+      ] as const;
+
+      for (const [text, cron] of cases) {
+        const result = updateMonitorSchema.parse({
+          schedule: { text },
+        });
+
+        expect(result.schedule).toEqual({
+          cron,
+          timezone: "UTC",
+        });
+      }
+    });
+
+    it("should reject invalid daily am/pm hours", () => {
+      expect(() =>
+        updateMonitorSchema.parse({
+          schedule: {
+            text: "daily at 13pm",
+          },
+        }),
+      ).toThrow("Daily schedule hour with am/pm must be between 1 and 12");
     });
 
     it("should reject ambiguous schedule definitions", () => {

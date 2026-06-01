@@ -1,0 +1,81 @@
+name: Upstream Sync
+
+# Periodically merge upstream firecrawl/firecrawl into this fork and open a PR.
+#
+# This fork carries local enhancements (camoufox stealth engine, GHCR/Redis
+# infra, OpenAI support, autumn hardening). The sync script auto-resolves only
+# the deterministic "workflows we deleted" conflict class and gates on a clean
+# `tsc` build before pushing a branch. A human reviews and merges the PR — the
+# workflow never writes to main directly.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (full history for merge)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - uses: pnpm/action-setup@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: apps/api/pnpm-lock.yaml
+
+      - name: Set up Rust (native crate build gate)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run upstream sync
+        id: sync
+        continue-on-error: true
+        run: bash .github/scripts/sync-upstream.sh
+
+      - name: Open PR or escalate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Bind step outputs to env vars (data, not inlined into shell syntax).
+          RESULT: ${{ steps.sync.outputs.result }}
+          BRANCH: ${{ steps.sync.outputs.branch }}
+        run: |
+          set -euo pipefail
+          case "$RESULT" in
+            ready)
+              if ! gh pr list --head "$BRANCH" --json number --jq '.[0].number' | grep -q .; then
+                gh pr create --base main --head "$BRANCH" \
+                  --title "chore(sync): merge upstream firecrawl ($(date +%Y-%m-%d))" \
+                  --body $'Automated upstream merge.\n\n- `tsc` build gate passed\n- only deterministic (deleted-workflow) conflicts auto-resolved\n- fork enhancements expected intact\n\nReview the diff before merging.'
+              fi
+              ;;
+            uptodate)
+              echo "Already up to date with upstream — nothing to do."
+              ;;
+            *)
+              gh issue create \
+                --title "Upstream sync needs manual resolution ($(date +%Y-%m-%d))" \
+                --body "$(printf 'sync-upstream.sh stopped with result=%s (non-deterministic conflict or build failure).\n\nRun it locally to resolve:\n\n    bash .github/scripts/sync-upstream.sh\n\nSee the workflow run logs for the conflicting paths.' "$RESULT")"
+              ;;
+          esac
