@@ -1,0 +1,82 @@
+name: Camoufox Release Check
+
+# Weekly check for a newer camoufox-js release than the one pinned in
+# apps/camoufox-service-ts/package.json. On a new release it opens (or updates)
+# a single tracking issue for a human to review the 0.x changelog and decide
+# whether to bump — it never bumps automatically. Bumping the pin + pushing is
+# what rebuilds the Camoufox GHCR image (and re-fetches the matching browser
+# binary), so a human stays in the loop for this stealth-critical dependency.
+
+on:
+  schedule:
+    - cron: "0 7 * * 1" # Mondays 07:00 UTC (after upstream-sync at 06:00)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: camoufox-release-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for a newer camoufox-js release
+        id: chk
+        run: bash .github/scripts/check-camoufox-release.sh
+
+      - name: Open or update tracking issue
+        if: steps.chk.outputs.update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PINNED: ${{ steps.chk.outputs.pinned }}
+          LATEST: ${{ steps.chk.outputs.latest }}
+        run: |
+          set -euo pipefail
+
+          # Ensure the tracking label exists (idempotent).
+          gh label create camoufox-release \
+            --color 1d76db --description "Tracks new camoufox-js upstream releases" \
+            2>/dev/null || true
+
+          TITLE="chore(camoufox): camoufox-js ${LATEST} available (pinned ${PINNED})"
+          BODY="$(printf '%s\n' \
+            "A newer **camoufox-js** release is available." \
+            "" \
+            "| | version |" \
+            "|---|---|" \
+            "| Pinned (apps/camoufox-service-ts/package.json) | \`${PINNED}\` |" \
+            "| Latest on npm | \`${LATEST}\` |" \
+            "" \
+            "### Review before bumping (camoufox-js is 0.x — minor bumps may break)" \
+            "- Changelog / releases: https://github.com/apify/camoufox-js/releases" \
+            "- npm: https://www.npmjs.com/package/camoufox-js" \
+            "- Camoufox browser releases (binary follows the library): https://github.com/daijro/camoufox/releases" \
+            "" \
+            "### To apply (manual)" \
+            "\`\`\`bash" \
+            "cd apps/camoufox-service-ts" \
+            "# set \"camoufox-js\": \"${LATEST}\" in package.json" \
+            "pnpm install            # regenerate pnpm-lock.yaml" \
+            "git commit -am 'chore(camoufox): bump camoufox-js to ${LATEST}' && git push" \
+            "\`\`\`" \
+            "Pushing rebuilds \`camoufox-service:latest\` via Deploy Camoufox Service, re-running" \
+            "\`camoufox-js fetch\` to bake in the matching browser binary." \
+            "" \
+            "_Opened automatically by .github/workflows/camoufox-release-check.yml._")"
+
+          existing="$(gh issue list --label camoufox-release --state open \
+            --json number --jq '.[0].number')"
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --title "$TITLE" --body "$BODY"
+            echo "Updated existing tracking issue #${existing}."
+          else
+            gh issue create --title "$TITLE" --body "$BODY" --label camoufox-release
+            echo "Opened new tracking issue."
+          fi
