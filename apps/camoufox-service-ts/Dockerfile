@@ -10,8 +10,11 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
+# Reproducible install: npm ci installs exactly from the committed
+# package-lock.json (COPYed by the package*.json glob above) and fails if the
+# lock and package.json drift — no more silent dependency re-resolution.
 COPY package*.json ./
-RUN npm install
+RUN npm ci
 
 # Install system dependencies for Firefox (Camoufox is a Firefox fork).
 # We use Playwright's install-deps subcommand to grab the right packages
