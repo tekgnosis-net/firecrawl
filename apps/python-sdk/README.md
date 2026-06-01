@@ -1,6 +1,6 @@
 # Firecrawl Python SDK
 
-The Firecrawl Python SDK is a library that allows you to easily search, scrape, and interact with the web, and output the data in a format ready for use with language models (LLMs). It provides a simple and intuitive interface for the Firecrawl API.
+The Firecrawl Python SDK is a library that lets you easily search, scrape, and interact with the web for AI agents — returning clean Markdown or structured data your agents can ship with. It provides a simple and intuitive interface for the Firecrawl API.
 
 ## Installation
 
@@ -49,10 +49,19 @@ scrape_result = firecrawl.scrape('https://firecrawl.dev', formats=['markdown', '
 print(scrape_result)
 ```
 
+### Video extraction
+
+Use the `video` format on supported video URLs, including YouTube and TikTok. The returned `video` field is a signed URL to the extracted video file.
+
+```python
+doc = firecrawl.scrape('https://www.youtube.com/watch?v=dQw4w9WgXcQ', formats=['video'])
+print(doc.video)
+```
+
 ### Parsing uploaded files
 
 Use `parse` to upload local bytes/files (`html`, `pdf`, `docx`, etc.) as multipart form data and return the parsed document.
-`parse` does not support change tracking or browser-only options (actions, wait_for, location, mobile, screenshot, branding).
+`parse` does not support change tracking or browser-only options (actions, wait_for, location, mobile, screenshot, branding, audio, video).
 
 ```python
 from firecrawl import Firecrawl

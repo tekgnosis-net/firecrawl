@@ -14,6 +14,7 @@ type Document struct {
 	Images         []string                 `json:"images,omitempty"`
 	Screenshot     string                   `json:"screenshot,omitempty"`
 	Audio          string                   `json:"audio,omitempty"`
+	Video          string                   `json:"video,omitempty"`
 	Attributes     []map[string]interface{} `json:"attributes,omitempty"`
 	Actions        map[string]interface{}   `json:"actions,omitempty"`
 	Answer         string                   `json:"answer,omitempty"`
@@ -109,6 +110,10 @@ type MonitorSchedule struct {
 }
 
 // MonitorCreateRequest creates a scheduled monitor.
+//
+// Goal is an optional natural-language description of what the monitor is
+// watching for (max 2000 chars). When set with JudgeEnabled left nil, the
+// API auto-enables judging for this monitor.
 type MonitorCreateRequest struct {
 	Name          string                   `json:"name"`
 	Schedule      MonitorSchedule          `json:"schedule"`
@@ -116,9 +121,14 @@ type MonitorCreateRequest struct {
 	Webhook       map[string]interface{}   `json:"webhook,omitempty"`
 	Notification  map[string]interface{}   `json:"notification,omitempty"`
 	RetentionDays *int                     `json:"retentionDays,omitempty"`
+	Goal          *string                  `json:"goal,omitempty"`
+	JudgeEnabled  *bool                    `json:"judgeEnabled,omitempty"`
 }
 
 // MonitorUpdateRequest updates a scheduled monitor.
+//
+// Goal and JudgeEnabled follow the same semantics as MonitorCreateRequest;
+// leave them nil to keep the existing values.
 type MonitorUpdateRequest struct {
 	Name          string                   `json:"name,omitempty"`
 	Status        string                   `json:"status,omitempty"`
@@ -127,6 +137,8 @@ type MonitorUpdateRequest struct {
 	Webhook       map[string]interface{}   `json:"webhook,omitempty"`
 	Notification  map[string]interface{}   `json:"notification,omitempty"`
 	RetentionDays *int                     `json:"retentionDays,omitempty"`
+	Goal          *string                  `json:"goal,omitempty"`
+	JudgeEnabled  *bool                    `json:"judgeEnabled,omitempty"`
 }
 
 // Monitor represents a scheduled monitor.
@@ -144,6 +156,8 @@ type Monitor struct {
 	RetentionDays            int                      `json:"retentionDays"`
 	EstimatedCreditsPerMonth *int                     `json:"estimatedCreditsPerMonth,omitempty"`
 	LastCheckSummary         *MonitorSummary          `json:"lastCheckSummary,omitempty"`
+	Goal                     *string                  `json:"goal,omitempty"`
+	JudgeEnabled             bool                     `json:"judgeEnabled"`
 	CreatedAt                string                   `json:"createdAt,omitempty"`
 	UpdatedAt                string                   `json:"updatedAt,omitempty"`
 }
@@ -179,19 +193,74 @@ type MonitorCheck struct {
 	UpdatedAt          string         `json:"updatedAt,omitempty"`
 }
 
+// MonitorJsonFieldDiff is a single field-level diff returned for monitors
+// that requested JSON extraction. Keys are field paths in the extracted
+// JSON; values describe what changed between the previous and current run.
+type MonitorJsonFieldDiff struct {
+	Previous interface{} `json:"previous"`
+	Current  interface{} `json:"current"`
+}
+
+// MonitorPageDiff is the diff payload returned alongside a monitor page
+// when its scrape produced a change. The shape depends on what the
+// monitor's formats asked for:
+//
+//   - markdown-only monitors  → Text holds the unified diff and JSON
+//     holds the parseDiff AST (a {"files": [...]} object).
+//   - JSON-extraction monitors → JSON holds the per-field
+//     map[string]MonitorJsonFieldDiff and Text is empty.
+//   - mixed (JSON + git-diff) monitors → both fields are populated:
+//     JSON is the per-field diff and Text is the markdown sidecar.
+//
+// JSON is left as interface{} so callers can decode into either of the
+// two possible shapes; use json.Unmarshal with a concrete target when
+// the monitor's mode is known.
+type MonitorPageDiff struct {
+	Text string      `json:"text,omitempty"`
+	JSON interface{} `json:"json,omitempty"`
+}
+
+// MonitorPageSnapshot is the snapshot of the current JSON extraction at
+// this run. It is present on JSON and mixed-mode monitors and absent
+// for markdown-only monitors.
+type MonitorPageSnapshot struct {
+	JSON map[string]interface{} `json:"json,omitempty"`
+}
+
+// MonitorMeaningfulChange is a single goal-relevant change selected by the
+// monitor judge.
+type MonitorMeaningfulChange struct {
+	Type   string  `json:"type"`
+	Before *string `json:"before"`
+	After  *string `json:"after"`
+	Reason string  `json:"reason"`
+}
+
+// MonitorPageJudgment is the judge's verdict on whether a page change is
+// meaningful. Populated on monitor check pages when the monitor has a
+// goal set and judging is enabled.
+type MonitorPageJudgment struct {
+	Meaningful        bool                      `json:"meaningful"`
+	Confidence        string                    `json:"confidence"`
+	Reason            string                    `json:"reason"`
+	MeaningfulChanges []MonitorMeaningfulChange `json:"meaningfulChanges"`
+}
+
 // MonitorCheckPage is a single page result in a monitor check.
 type MonitorCheckPage struct {
-	ID               string      `json:"id"`
-	TargetID         string      `json:"targetId"`
-	URL              string      `json:"url"`
-	Status           string      `json:"status"`
-	PreviousScrapeID string      `json:"previousScrapeId,omitempty"`
-	CurrentScrapeID  string      `json:"currentScrapeId,omitempty"`
-	StatusCode       *int        `json:"statusCode,omitempty"`
-	Error            string      `json:"error,omitempty"`
-	Metadata         interface{} `json:"metadata,omitempty"`
-	Diff             interface{} `json:"diff,omitempty"`
-	CreatedAt        string      `json:"createdAt,omitempty"`
+	ID               string               `json:"id"`
+	TargetID         string               `json:"targetId"`
+	URL              string               `json:"url"`
+	Status           string               `json:"status"`
+	PreviousScrapeID string               `json:"previousScrapeId,omitempty"`
+	CurrentScrapeID  string               `json:"currentScrapeId,omitempty"`
+	StatusCode       *int                 `json:"statusCode,omitempty"`
+	Error            string               `json:"error,omitempty"`
+	Metadata         interface{}          `json:"metadata,omitempty"`
+	Diff             *MonitorPageDiff     `json:"diff,omitempty"`
+	Snapshot         *MonitorPageSnapshot `json:"snapshot,omitempty"`
+	Judgment         *MonitorPageJudgment `json:"judgment,omitempty"`
+	CreatedAt        string               `json:"createdAt,omitempty"`
 }
 
 // MonitorCheckDetail includes paginated page results and inline diffs.

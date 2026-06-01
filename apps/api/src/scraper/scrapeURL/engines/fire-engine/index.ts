@@ -16,6 +16,7 @@ import {
 } from "./checkStatus";
 import {
   ActionError,
+  AddFeatureError,
   EngineError,
   DNSResolutionError,
   SiteError,
@@ -137,7 +138,8 @@ async function performFireEngineScrape<
             error instanceof ActionError ||
             error instanceof UnsupportedFileError ||
             error instanceof FEPageLoadFailed ||
-            error instanceof ProxySelectionError
+            error instanceof ProxySelectionError ||
+            error instanceof AddFeatureError
           ) {
             fireEngineDelete(
               logger.child({
@@ -265,6 +267,7 @@ export async function scrapeURLWithFireEngineChromeCDP(
     });
     const hasBranding = hasFormatOfType(meta.options.formats, "branding");
     const hasAudio = hasFormatOfType(meta.options.formats, "audio");
+    const hasVideo = hasFormatOfType(meta.options.formats, "video");
     const shouldRunYoutubePostprocessor = youtubePostprocessor.shouldRun(
       meta,
       new URL(meta.rewrittenUrl ?? meta.url),
@@ -321,7 +324,7 @@ export async function scrapeURLWithFireEngineChromeCDP(
             },
           ]
         : []),
-      ...(hasAudio || shouldRunYoutubePostprocessor
+      ...(hasAudio || hasVideo || shouldRunYoutubePostprocessor
         ? ([
             {
               type: "getCookies",
@@ -464,7 +467,9 @@ export async function scrapeURLWithFireEngineChromeCDP(
       proxyUsed: response.usedMobileProxy ? "stealth" : "basic",
       youtubeTranscriptContent: response.youtubeTranscriptContent,
       timezone: response.timezone,
-      ...(hasAudio || shouldRunYoutubePostprocessor ? { audioCookies } : {}),
+      ...(hasAudio || hasVideo || shouldRunYoutubePostprocessor
+        ? { audioCookies }
+        : {}),
     };
   });
 }

@@ -36,11 +36,13 @@ import { isSelfHosted } from "../../lib/deployment";
 import { crawlGroup } from "../../services/worker/nuq";
 import { logRequest } from "../../services/logging/log_job";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
+import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
 
 export async function crawlController(req: Request, res: Response) {
   try {
     const auth = await authenticateUser(req, res, RateLimiterMode.Crawl);
     if (!auth.success) {
+      if (auth.status === 401) applyAgentAuthDiscoveryHeader(res);
       return res.status(auth.status).json({ error: auth.error });
     }
 
@@ -155,7 +157,12 @@ export async function crawlController(req: Request, res: Response) {
         .json({ error: e.message ?? e });
     }
 
-    if (isUrlBlocked(url, auth.chunk?.flags ?? null)) {
+    if (
+      isUrlBlocked(url, auth.chunk?.flags ?? null, {
+        team_id: auth.chunk?.team_id ?? team_id,
+        origin: req.body?.origin ?? null,
+      })
+    ) {
       return res.status(403).json({
         error: UNSUPPORTED_SITE_MESSAGE,
       });

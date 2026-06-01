@@ -14,7 +14,7 @@ import { isUrlBlocked } from "../scraper/WebScraper/utils/blocklist";
 const creditsPerPDFPage = 1;
 const stealthProxyCostBonus = 4;
 const unblockedDomainCostBonus = 4;
-const xTwitterCostBonus = 9;
+const xTwitterCostBonus = 29;
 
 export async function calculateCreditsToBeBilled(
   options: ScrapeOptions,
@@ -87,6 +87,10 @@ export async function calculateCreditsToBeBilled(
   }
 
   if (hasFormatOfType(options.formats, "audio")) {
+    creditsToBeBilled += 4;
+  }
+
+  if (hasFormatOfType(options.formats, "video")) {
     creditsToBeBilled += 4;
   }
 

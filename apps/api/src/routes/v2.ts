@@ -4,6 +4,7 @@ import { config } from "../config";
 import { RateLimiterMode } from "../types";
 import expressWs from "express-ws";
 import { searchController } from "../controllers/v2/search";
+import { searchFeedbackController } from "../controllers/v2/search-feedback";
 import { x402SearchController } from "../controllers/v2/x402-search";
 import { scrapeController } from "../controllers/v2/scrape";
 import {
@@ -58,16 +59,16 @@ import {
 } from "../controllers/v2/browser";
 import { activityController } from "../controllers/v1/activity";
 import { supportProxyController } from "../controllers/v2/support-proxy";
-import { agentSignupController } from "../controllers/v2/agent-signup";
 import {
-  agentSignupConfirmController,
-  agentSignupBlockController,
-} from "../controllers/v2/agent-signup-confirm";
+  researchFlagMiddleware,
+  researchProxyController,
+} from "../controllers/v2/research-proxy";
 import {
   scrapeInteractController,
   scrapeStopInteractiveBrowserController,
 } from "../controllers/v2/scrape-browser";
 import {
+  confirmMonitorEmailController,
   createMonitorController,
   deleteMonitorController,
   getMonitorCheckController,
@@ -75,6 +76,7 @@ import {
   listMonitorChecksController,
   listMonitorsController,
   runMonitorController,
+  unsubscribeMonitorEmailController,
   updateMonitorController,
 } from "../controllers/v2/monitor";
 
@@ -238,6 +240,13 @@ v2Router.post(
   checkCreditsMiddleware(),
   blocklistMiddleware,
   wrap(searchController),
+);
+
+v2Router.post(
+  "/search/:jobId/feedback",
+  authMiddleware(RateLimiterMode.Account),
+  validateJobIdParam,
+  wrap(searchFeedbackController),
 );
 
 v2Router.post(
@@ -477,6 +486,14 @@ v2Router.get(
   wrap(listMonitorsController),
 );
 
+// Public, unauthenticated — token in body is the credential. Registered
+// before /monitor/:monitorId so "email" isn't parsed as a monitor UUID.
+v2Router.post("/monitor/email/confirm", wrap(confirmMonitorEmailController));
+v2Router.post(
+  "/monitor/email/unsubscribe",
+  wrap(unsubscribeMonitorEmailController),
+);
+
 v2Router.get(
   "/monitor/:monitorId",
   authMiddleware(RateLimiterMode.CrawlStatus),
@@ -562,10 +579,14 @@ v2Router.post(
   wrap(supportProxyController),
 );
 
-// Agent signup routes (public, no auth required — rate limiting is handled inside the controller)
-// v2Router.post("/agent-signup", wrap(agentSignupController));
-v2Router.post("/agent-signup/confirm", wrap(agentSignupConfirmController));
-v2Router.post("/agent-signup/block", wrap(agentSignupBlockController));
+if (config.RESEARCH_PROXY_URL) {
+  v2Router.all(
+    "/research/*",
+    authMiddleware(RateLimiterMode.Research),
+    researchFlagMiddleware,
+    wrap(researchProxyController),
+  );
+}
 
 // Only register x402 routes if X402_PAY_TO_ADDRESS is configured
 if (isX402Enabled()) {

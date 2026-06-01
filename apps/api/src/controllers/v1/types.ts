@@ -1267,6 +1267,7 @@ export type AuthCreditUsageChunk = {
     account?: number;
     supportAsk?: number;
     supportDocsSearch?: number;
+    research?: number;
   };
   concurrency: number;
   flags: TeamFlags;
@@ -1299,6 +1300,9 @@ export type TeamFlags = {
   bypassCreditChecks?: boolean;
   debugBranding?: boolean;
   maxBrowserSessions?: number;
+  // POST /v2/search/:jobId/feedback returns 403 TEAM_OPTED_OUT when true.
+  searchFeedbackOptOut?: boolean;
+  researchBeta?: boolean;
 } | null;
 
 export type AuthCreditUsageChunkFromTeam = Omit<
