@@ -15,16 +15,19 @@
 # Exit codes / GITHUB_OUTPUT `result`:
 #   0  result=uptodate  nothing to merge
 #   0  result=ready     merged (auto-resolved if needed) + build passed, pushed
+#   0  result=dryrun    DRY_RUN=1: merge + build exercised, push/PR skipped
 #   2  result=conflict  non-deterministic conflict — human needed
 #   2  result=buildfail merge applied but tsc failed — human needed
 #
-# Env overrides: UPSTREAM_URL, UPSTREAM_BRANCH, BASE_BRANCH, RUN_BUILD (0 to skip).
+# Env overrides: UPSTREAM_URL, UPSTREAM_BRANCH, BASE_BRANCH, RUN_BUILD (0 to skip),
+#                DRY_RUN (1 = run merge + build gate but skip push/PR; for testing).
 set -euo pipefail
 
 UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/firecrawl/firecrawl.git}"
 UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-main}"
 BASE_BRANCH="${BASE_BRANCH:-main}"
 RUN_BUILD="${RUN_BUILD:-1}"
+DRY_RUN="${DRY_RUN:-0}"
 
 emit() { echo "$1=$2" >> "${GITHUB_OUTPUT:-/dev/stdout}"; }
 
@@ -35,11 +38,15 @@ git fetch origin --prune
 UP_SHA="$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")"
 BRANCH="automation/upstream-sync-${UP_SHA}"
 
-# Already integrated? Then there is nothing to do.
+# Already integrated? Then there is nothing to do — unless DRY_RUN, which still
+# exercises the toolchain + build gate so the workflow can be tested any time.
 if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" "origin/${BASE_BRANCH}"; then
-  echo "Already up to date with upstream ${UP_SHA}."
-  emit result uptodate
-  exit 0
+  if [ "$DRY_RUN" != "1" ]; then
+    echo "Already up to date with upstream ${UP_SHA}."
+    emit result uptodate
+    exit 0
+  fi
+  echo "Already up to date, but DRY_RUN=1: proceeding to exercise merge + build gate."
 fi
 
 git switch -C "$BRANCH" "origin/${BASE_BRANCH}"
@@ -65,6 +72,12 @@ fi
 # Build gate — the only automated correctness signal on this fork.
 if [ "$RUN_BUILD" = "1" ]; then
   ( cd apps/api && pnpm install --frozen-lockfile && pnpm build ) || { emit result buildfail; exit 2; }
+fi
+
+if [ "$DRY_RUN" = "1" ]; then
+  echo "DRY_RUN=1: merge + build validated; skipping push and PR."
+  emit result dryrun
+  exit 0
 fi
 
 git push -u origin "$BRANCH" --force-with-lease

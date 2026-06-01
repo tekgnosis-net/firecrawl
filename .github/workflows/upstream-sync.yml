@@ -12,6 +12,11 @@ on:
   schedule:
     - cron: "0 6 * * 1" # Mondays 06:00 UTC
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run merge + build gate but skip push/PR (for testing the workflow)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -52,11 +57,17 @@ jobs:
       - name: Run upstream sync
         id: sync
         continue-on-error: true
+        env:
+          DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
         run: bash .github/scripts/sync-upstream.sh
 
       - name: Open PR or escalate
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pin gh to this fork: a bare `gh` resolves the base repo from git
+          # remotes, and the sync script adds an `upstream` remote that would
+          # otherwise misdirect PR/issue creation to firecrawl/firecrawl.
+          GH_REPO: ${{ github.repository }}
           # Bind step outputs to env vars (data, not inlined into shell syntax).
           RESULT: ${{ steps.sync.outputs.result }}
           BRANCH: ${{ steps.sync.outputs.branch }}
@@ -72,6 +83,9 @@ jobs:
               ;;
             uptodate)
               echo "Already up to date with upstream — nothing to do."
+              ;;
+            dryrun)
+              echo "Dry run complete — merge + build gate exercised, no PR opened."
               ;;
             *)
               gh issue create \
