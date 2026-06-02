@@ -1,0 +1,56 @@
+# Prometheus alerting rules for Camoufox stealth-efficacy regressions.
+#
+# The deploy smoke gate (.github/workflows/deploy-camoufox-service.yml) proves a
+# new camoufox-service image *launches and renders*, but it cannot prove the
+# patched browser still *evades bot protection* from a real target's
+# perspective. This rule watches that in production via the engine metric
+# firecrawl_camoufox_scrape_total (apps/api/src/scraper/scrapeURL/engines/camoufox/metrics.ts).
+#
+# Requires the Prometheus Operator (PrometheusRule CRD) and that Prometheus
+# scrapes the firecrawl worker /metrics endpoints (nuq-worker / extract-worker),
+# where the firecrawl_* prom-client metrics are exposed. Adjust `namespace`,
+# the `release`/label selector your Prometheus uses to discover rules, and the
+# thresholds to your traffic.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: camoufox-stealth
+  namespace: monitoring
+  labels:
+    release: prometheus # match your kube-prometheus-stack ruleSelector
+spec:
+  groups:
+    - name: camoufox-stealth
+      rules:
+        # Recording rule: blocked (401/403/429) share of Camoufox scrapes over 1h.
+        # clamp_min avoids divide-by-zero when there is no recent Camoufox traffic.
+        - record: camoufox:blocked_ratio:1h
+          expr: |
+            sum(rate(firecrawl_camoufox_scrape_total{outcome="blocked"}[1h]))
+              /
+            clamp_min(sum(rate(firecrawl_camoufox_scrape_total[1h])), 1)
+
+        - alert: CamoufoxStealthRegression
+          expr: camoufox:blocked_ratio:1h > 0.4
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Camoufox stealth block rate high ({{ $value | humanizePercentage }})"
+            description: >-
+              Camoufox is returning 401/403/429 on >40% of scrapes for 30m —
+              likely a stealth regression after a camoufox-js/browser bump.
+              Check the most recent camoufox-service:sha-<commit> deploy and
+              consider rolling :latest back to the prior sha- tag.
+
+        - alert: CamoufoxStealthRegressionCritical
+          expr: camoufox:blocked_ratio:1h > 0.7
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Camoufox almost fully blocked ({{ $value | humanizePercentage }})"
+            description: >-
+              Camoufox is returning 401/403/429 on >70% of scrapes for 15m — the
+              stealth path is effectively down. Roll camoufox-service:latest back
+              to the last known-good sha- tag.

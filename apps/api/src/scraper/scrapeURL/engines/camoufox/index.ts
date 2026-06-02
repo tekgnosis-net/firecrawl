@@ -4,6 +4,7 @@ import { EngineScrapeResult } from "..";
 import { Meta } from "../..";
 import { robustFetch } from "../../lib/fetch";
 import { getInnerJson } from "@mendable/firecrawl-rs";
+import { camoufoxScrapeTotal, classifyCamoufoxOutcome } from "./metrics";
 
 export async function scrapeURLWithCamoufox(
   meta: Meta,
@@ -35,6 +36,12 @@ export async function scrapeURLWithCamoufox(
   if (response.contentType?.includes("application/json")) {
     response.content = await getInnerJson(response.content);
   }
+
+  // Record the stealth outcome — a rising "blocked" rate flags a regression.
+  camoufoxScrapeTotal.inc({
+    outcome: classifyCamoufoxOutcome(response.pageStatusCode),
+    status_code: String(response.pageStatusCode),
+  });
 
   return {
     url: meta.rewrittenUrl ?? meta.url,
