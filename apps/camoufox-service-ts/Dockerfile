@@ -1,32 +1,50 @@
-FROM node:20-slim
+# ---------- build stage: toolchain + compile native deps + tsc ----------
+FROM node:20-slim AS build
 
-# ca-certificates: HTTPS download of the Camoufox binary (`camoufox-js fetch`).
-# build-essential + python3: node-gyp needs them to compile better-sqlite3 (a
-# transitive camoufox-js dep) from source — node:*-slim has no toolchain, and
-# no prebuilt binary is published for this platform/node combo, so npm install
-# falls back to a source build.
+# build-essential + python3: node-gyp compiles better-sqlite3 (a transitive
+# camoufox-js dep with no prebuilt for this platform). They live ONLY in this
+# stage and never reach the runtime image.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates build-essential python3 \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
-# Reproducible install: npm ci installs exactly from the committed
-# package-lock.json (COPYed by the package*.json glob above) and fails if the
-# lock and package.json drift — no more silent dependency re-resolution.
+
+# Reproducible install from the committed package-lock.json.
 COPY package*.json ./
 RUN npm ci
 
-# Install system dependencies for Firefox (Camoufox is a Firefox fork).
-# We use Playwright's install-deps subcommand to grab the right packages
-# without downloading Playwright's own firefox binary.
+# Compile TypeScript -> dist/, then strip dev dependencies so only the runtime
+# closure (incl. the compiled better-sqlite3 .node) carries to the next stage.
+COPY . .
+RUN npm run build \
+  && npm prune --omit=dev
+
+# ---------- runtime stage: slim, no compiler toolchain ----------
+FROM node:20-slim
+
+# ca-certificates: HTTPS download of the Camoufox binary (`camoufox-js fetch`).
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src/app
+
+# Production dependencies only (with the compiled better-sqlite3) from the build
+# stage — no build-essential/python3, no dev deps, no TypeScript sources.
+COPY --from=build /usr/src/app/node_modules ./node_modules
+
+# Firefox system libraries (Camoufox is a Firefox fork). Playwright's
+# install-deps grabs them without downloading Playwright's own browser binary.
 RUN npx playwright install-deps firefox
 
-# Download the Camoufox patched Firefox binary into the image so first
-# launch doesn't have to fetch ~200 MB over the network.
+# Bundle the Camoufox patched Firefox so first launch is offline (~200 MB).
 RUN npx camoufox-js fetch
 
-COPY . .
-RUN npm run build
+# Compiled app + manifest last, so editing source doesn't bust the heavy
+# apt/fetch layers above.
+COPY --from=build /usr/src/app/dist ./dist
+COPY package.json ./
 
 ARG PORT
 ENV PORT=${PORT}
