@@ -1,43 +1,45 @@
+import type { MockedFunction } from "vitest";
 import type { NextFunction } from "express";
 
-jest.mock("../../services/autumn/autumn.service", () => ({
+vi.mock("../../services/autumn/autumn.service", () => ({
   autumnService: {
-    checkCredits: jest.fn(),
+    checkCredits: vi.fn(),
   },
+  CREDITS_FEATURE_ID: "CREDITS",
 }));
 
-jest.mock("../../services/supabase", () => ({
-  supabase_service: { rpc: jest.fn() },
+vi.mock("../../services/autumn/usage", () => ({
+  getTeamBalance: vi.fn(),
 }));
 
-jest.mock("../../lib/http-metrics", () => ({
-  httpRequestDurationSeconds: { observe: jest.fn() },
-  getRoutePattern: jest.fn(() => "/v1/crawl"),
+vi.mock("../../lib/http-metrics", () => ({
+  httpRequestDurationSeconds: { observe: vi.fn() },
+  getRoutePattern: vi.fn(() => "/v1/crawl"),
 }));
 
-jest.mock("../../controllers/auth", () => ({
-  authenticateUser: jest.fn(),
+vi.mock("../../controllers/auth", () => ({
+  authenticateUser: vi.fn(),
 }));
 
-jest.mock("../../services/idempotency/create", () => ({
-  createIdempotencyKey: jest.fn(),
+vi.mock("../../services/idempotency/create", () => ({
+  createIdempotencyKey: vi.fn(),
 }));
 
-jest.mock("../../services/idempotency/validate", () => ({
-  validateIdempotencyKey: jest.fn(),
+vi.mock("../../services/idempotency/validate", () => ({
+  validateIdempotencyKey: vi.fn(),
 }));
 
-jest.mock("uuid", () => ({ validate: jest.fn(() => true) }));
-
-jest.mock("geoip-country", () => ({ lookup: jest.fn(() => null) }), {
-  virtual: true,
-});
+vi.mock("geoip-country", () => ({ lookup: vi.fn(() => null) }));
 
 import { checkCreditsMiddleware } from "../../routes/shared";
 import { autumnService } from "../../services/autumn/autumn.service";
+import { getTeamBalance } from "../../services/autumn/usage";
 
-const checkCreditsMock = autumnService.checkCredits as jest.MockedFunction<
+const checkCreditsMock = autumnService.checkCredits as MockedFunction<
   typeof autumnService.checkCredits
+>;
+const getTeamBalanceMock = getTeamBalance as MockedFunction<
+  typeof getTeamBalance
 >;
 
 function buildReq(overrides: any = {}): any {
@@ -60,12 +62,12 @@ function runMiddleware(req: any): Promise<{ res: any; nextErr?: any }> {
     };
 
     const res: any = {
-      status: jest.fn((..._args: any[]) => {
+      status: vi.fn((..._args: any[]) => {
         // 402 / 403 paths terminate via res.status(...).json(...) without next()
         setImmediate(() => settle({ res }));
         return res;
       }),
-      json: jest.fn().mockReturnThis(),
+      json: vi.fn().mockReturnThis(),
       headersSent: false,
     };
 
@@ -76,7 +78,7 @@ function runMiddleware(req: any): Promise<{ res: any; nextErr?: any }> {
 
 describe("checkCreditsMiddleware – Autumn overage handling", () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
   });
 
   it("does not clamp the crawl limit when Autumn allows overage with 0 remaining", async () => {
@@ -108,5 +110,65 @@ describe("checkCreditsMiddleware – Autumn overage handling", () => {
 
     expect(res.status).not.toHaveBeenCalled();
     expect(req.body.limit).toBe(5);
+  });
+});
+
+describe("checkCreditsMiddleware – unverified agent-key 50-credit cap", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function buildUnverifiedReq(overrides: any = {}) {
+    return buildReq({
+      acuc: {
+        adjusted_credits_used: 0,
+        _agentSponsor: {
+          status: "pending",
+          verification_deadline: new Date(
+            Date.now() + 86_400_000,
+          ).toISOString(),
+        },
+      },
+      ...overrides,
+    });
+  }
+
+  it("blocks with 402 when Autumn usage has reached the 50-credit cap", async () => {
+    getTeamBalanceMock.mockResolvedValue({ usage: 50 } as any);
+
+    const req = buildUnverifiedReq();
+    const { res } = await runMiddleware(req);
+
+    expect(res.status).toHaveBeenCalledWith(402);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        error: "unverified_credit_limit_reached",
+        credits_used: 50,
+      }),
+    );
+    // The main Autumn credit check must not run once the cap is hit.
+    expect(checkCreditsMock).not.toHaveBeenCalled();
+  });
+
+  it("allows the request when Autumn usage is under the cap", async () => {
+    getTeamBalanceMock.mockResolvedValue({ usage: 10 } as any);
+    checkCreditsMock.mockResolvedValue({ allowed: true, remaining: 100 });
+
+    const req = buildUnverifiedReq();
+    const { res, nextErr } = await runMiddleware(req);
+
+    expect(res.status).not.toHaveBeenCalled();
+    expect(nextErr).toBeUndefined();
+    expect(req.agentIndexOnly).toBe(true);
+  });
+
+  it("fails open (does not block) when the Autumn balance lookup throws", async () => {
+    getTeamBalanceMock.mockRejectedValue(new Error("autumn down"));
+    checkCreditsMock.mockResolvedValue({ allowed: true, remaining: 100 });
+
+    const req = buildUnverifiedReq();
+    const { res } = await runMiddleware(req);
+
+    expect(res.status).not.toHaveBeenCalled();
   });
 });

@@ -1,11 +1,13 @@
 import { logger } from "../../lib/logger";
-import { config } from "../../config";
 import { getRedisConnection } from "../queue-service";
-import { supabase_service } from "../supabase";
+import { billTeam6 } from "../../db/rpc";
 import * as Sentry from "@sentry/node";
 import { withAuth } from "../../lib/withAuth";
 import { setCachedACUC, setCachedACUCTeam } from "../../controllers/auth";
-import { autumnService } from "../autumn/autumn.service";
+import {
+  autumnService,
+  featureIdForBillingEndpoint,
+} from "../autumn/autumn.service";
 import {
   resolveBillingMetadata,
   toAutumnBillingProperties,
@@ -80,6 +82,7 @@ async function refundRequestTrackedCredits(group: GroupedBillingOperation) {
         apiKeyId: group.api_key_id,
         subscriptionId: group.subscription_id,
       },
+      featureId: featureIdForBillingEndpoint(group.billing.endpoint),
     });
   } catch (error) {
     logger.warn("Failed to refund Autumn request-tracked credits", {
@@ -176,10 +179,6 @@ export async function processBillingBatch() {
         continue;
       }
 
-      const batchTrackedCredits = group.operations
-        .filter(op => !op.autumnTrackInRequest)
-        .reduce((sum, op) => sum + op.credits, 0);
-
       try {
         // Execute the actual billing
         const billingResult = await withAuth(supaBillTeam, {
@@ -211,19 +210,7 @@ export async function processBillingBatch() {
           `✅ Successfully billed team ${group.team_id} for ${group.total_credits} credits`,
         );
 
-        if (batchTrackedCredits > 0) {
-          await autumnService.trackCredits({
-            teamId: group.team_id,
-            value: batchTrackedCredits,
-            properties: {
-              source: "processBillingBatch",
-              ...toAutumnBillingProperties(group.billing),
-              apiKeyId: group.api_key_id,
-              subscriptionId: group.subscription_id,
-            },
-          });
-        }
-
+        // Ledger commit only — usage is tracked to Autumn at request time, not here.
       } catch (error) {
         await refundRequestTrackedCredits(group);
         logger.error(`❌ Failed to bill team ${group.team_id}`, {
@@ -402,16 +389,17 @@ async function supaBillTeam(
   _logger.info(`Batch billing team ${team_id} for ${credits} credits`);
 
   // Perform the actual database operation
-  const { data, error } = await supabase_service.rpc("bill_team_6", {
-    _team_id: team_id,
-    sub_id: subscription_id ?? null,
-    fetch_subscription: subscription_id === undefined,
-    credits,
-    i_api_key_id: api_key_id ?? null,
-    is_extract_param: is_extract,
-  });
-
-  if (error) {
+  let data: { api_key: string }[];
+  try {
+    data = await billTeam6({
+      team_id,
+      subscription_id: subscription_id ?? null,
+      fetch_subscription: subscription_id === undefined,
+      credits,
+      api_key_id: api_key_id ?? null,
+      is_extract,
+    });
+  } catch (error) {
     Sentry.captureException(error);
     _logger.error("Failed to bill team.", { error });
     return { success: false, error };

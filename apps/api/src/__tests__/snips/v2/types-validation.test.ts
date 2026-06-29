@@ -38,6 +38,29 @@ describe("V2 Types Validation", () => {
       expect(result.url).toBe("https://example.com");
       expect(result.origin).toBe("api");
       expect(result.formats).toEqual([{ type: "markdown" }]);
+      expect(result.skipTlsVerification).toBe(true);
+    });
+
+    it("should preserve explicit skipTlsVerification false", () => {
+      const input: ScrapeRequestInput = {
+        url: "https://example.com",
+        skipTlsVerification: false,
+      };
+
+      const result = scrapeRequestSchema.parse(input);
+      expect(result.skipTlsVerification).toBe(false);
+    });
+
+    it("should default skipTlsVerification to false when custom headers are used", () => {
+      const input: ScrapeRequestInput = {
+        url: "https://example.com",
+        headers: {
+          "x-test": "true",
+        },
+      };
+
+      const result = scrapeRequestSchema.parse(input);
+      expect(result.skipTlsVerification).toBe(false);
     });
 
     it("should accept valid scrape request with format objects", () => {
@@ -767,7 +790,7 @@ describe("V2 Types Validation", () => {
         deduplicateSimilarURLs: false,
         ignoreQueryParameters: true,
         regexOnFullURL: true,
-        delay: 1000,
+        delay: 1,
         prompt: "Extract blog posts",
         scrapeOptions: {
           formats: [{ type: "markdown" }],
@@ -1391,6 +1414,68 @@ describe("V2 Types Validation", () => {
           },
         }),
       ).toThrow();
+    });
+  });
+
+  describe("monitor search target goal validation", () => {
+    const searchTargets = [
+      { type: "search" as const, queries: ["firecrawl launch"] },
+    ];
+
+    it("create rejects a search target without a goal", () => {
+      expect(() =>
+        createMonitorSchema.parse({
+          name: "Search monitor",
+          schedule: { text: "every 30 minutes" },
+          targets: searchTargets,
+        }),
+      ).toThrow("A search target requires a non-empty goal");
+    });
+
+    it("update accepts a patch adding a search target without restating the goal", () => {
+      // The monitor may already carry a goal; the controller validates the
+      // merged state.
+      const result = updateMonitorSchema.parse({ targets: searchTargets });
+      expect(result.targets).toHaveLength(1);
+    });
+
+    it("update rejects a patch that adds search targets while clearing the goal", () => {
+      for (const goal of [null, "", "   "]) {
+        expect(() =>
+          updateMonitorSchema.parse({ targets: searchTargets, goal }),
+        ).toThrow("A search target requires a non-empty goal");
+      }
+    });
+
+    it("update allows clearing the goal when the patch has no targets (merged state is checked in the controller)", () => {
+      const result = updateMonitorSchema.parse({ goal: null });
+      expect(result.goal).toBeNull();
+    });
+
+    it("create allows a raw search target (judgeEnabled:false) without a goal", () => {
+      const result = createMonitorSchema.parse({
+        name: "Raw search monitor",
+        schedule: { text: "every 30 minutes" },
+        targets: searchTargets,
+        judgeEnabled: false,
+      });
+      expect(result.targets).toHaveLength(1);
+      expect(result.judgeEnabled).toBe(false);
+    });
+
+    it("create still defaults judgeEnabled true when a goal is present", () => {
+      const result = createMonitorSchema.parse({
+        name: "Judged search monitor",
+        schedule: { text: "every 30 minutes" },
+        targets: searchTargets,
+        goal: "Alert when Firecrawl launches",
+      });
+      expect(result.judgeEnabled).toBe(true);
+    });
+
+    it("update with just { goal } does NOT silently enable judging", () => {
+      const result = updateMonitorSchema.parse({ goal: "Alert when X ships" });
+      expect(result.judgeEnabled).toBeUndefined();
     });
   });
 

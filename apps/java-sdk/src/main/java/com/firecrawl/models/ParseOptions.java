@@ -1,6 +1,7 @@
 package com.firecrawl.models;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -11,7 +12,7 @@ import java.util.Map;
  * Options for parsing uploaded files via /v2/parse.
  *
      * <p>Parse does not support browser-rendering formats/options such as
-     * change tracking, screenshot, branding, audio, video, actions, waitFor, location, or mobile.
+     * change tracking, screenshot, branding, product, menu, audio, video, actions, waitFor, location, or mobile.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public class ParseOptions {
@@ -28,6 +29,8 @@ public class ParseOptions {
     private Boolean blockAds;
     private String proxy;
     private String integration;
+    @JsonProperty("redactPII")
+    private Boolean redactPII;
 
     private ParseOptions() {}
 
@@ -43,6 +46,8 @@ public class ParseOptions {
     public Boolean getBlockAds() { return blockAds; }
     public String getProxy() { return proxy; }
     public String getIntegration() { return integration; }
+    @JsonProperty("redactPII")
+    public Boolean getRedactPII() { return redactPII; }
 
     public static Builder builder() { return new Builder(); }
 
@@ -60,6 +65,7 @@ public class ParseOptions {
         b.blockAds = this.blockAds;
         b.proxy = this.proxy;
         b.integration = this.integration;
+        b.redactPII = this.redactPII;
         return b;
     }
 
@@ -87,6 +93,8 @@ public class ParseOptions {
                 || normalized.equals("screenshot")
                 || normalized.equals("screenshot@fullPage")
                 || normalized.equals("branding")
+                || normalized.equals("product")
+                || normalized.equals("menu")
                 || normalized.equals("audio")
                 || normalized.equals("video");
     }
@@ -104,6 +112,7 @@ public class ParseOptions {
         private Boolean blockAds;
         private String proxy;
         private String integration;
+        private Boolean redactPII;
 
         private Builder() {}
 
@@ -119,6 +128,7 @@ public class ParseOptions {
         public Builder blockAds(Boolean blockAds) { this.blockAds = blockAds; return this; }
         public Builder proxy(String proxy) { this.proxy = proxy; return this; }
         public Builder integration(String integration) { this.integration = integration; return this; }
+        public Builder redactPII(Boolean redactPII) { this.redactPII = redactPII; return this; }
 
         public ParseOptions build() {
             if (timeout != null && timeout <= 0) {
@@ -151,6 +161,7 @@ public class ParseOptions {
             o.blockAds = this.blockAds;
             o.proxy = this.proxy;
             o.integration = this.integration;
+            o.redactPII = this.redactPII;
             return o;
         }
     }

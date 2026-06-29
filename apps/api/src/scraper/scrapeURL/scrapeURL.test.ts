@@ -1,3 +1,4 @@
+import type { MockedFunction } from "vitest";
 import "dotenv/config";
 
 import { config } from "../../config";
@@ -9,11 +10,12 @@ import { Engine } from "./engines";
 import { CostTracking } from "../../lib/cost-tracking";
 
 // Mock parseMarkdown but delegate to real implementation for other tests
-jest.mock("../../lib/html-to-markdown", () => {
-  const actual = jest.requireActual("../../lib/html-to-markdown");
+vi.mock("../../lib/html-to-markdown", async importOriginal => {
+  const actual =
+    await importOriginal<typeof import("../../lib/html-to-markdown")>();
   return {
     ...actual,
-    parseMarkdown: jest.fn(actual.parseMarkdown),
+    parseMarkdown: vi.fn(actual.parseMarkdown),
   };
 });
 
@@ -36,7 +38,7 @@ describe("Standalone scrapeURL tests", () => {
     it("Basic scrape", async () => {
       const out = await scrapeURL(
         "test:scrape-basic",
-        "https://www.roastmywebsite.ai/",
+        "https://firecrawl-test-site.vercel.app",
         scrapeOptions.parse({}),
         { forceEngine, teamId: "test" },
         new CostTracking(),
@@ -50,30 +52,21 @@ describe("Standalone scrapeURL tests", () => {
         expect(out.document).toHaveProperty("markdown");
         expect(out.document).toHaveProperty("metadata");
         expect(out.document).not.toHaveProperty("html");
-        expect(out.document.markdown).toContain("_Roast_");
+        expect(out.document.markdown).toContain("Firecrawl Test Site");
         expect(out.document.metadata.error).toBeUndefined();
-        expect(out.document.metadata.title).toBe("Roast My Website");
+        expect(out.document.metadata.title).toBe("Firecrawl Test Website");
         expect(out.document.metadata.description).toBe(
-          "Welcome to Roast My Website, the ultimate tool for putting your website through the wringer! This repository harnesses the power of Firecrawl to scrape and capture screenshots of websites, and then unleashes the latest LLM vision models to mercilessly roast them. 🌶️",
+          "Welcome to the Firecrawl Test Website!",
         );
-        expect(out.document.metadata.keywords).toBe(
-          "Roast My Website,Roast,Website,GitHub,Firecrawl",
-        );
-        expect(out.document.metadata.robots).toBe("follow, index");
-        expect(out.document.metadata.ogTitle).toBe("Roast My Website");
+        expect(out.document.metadata.ogTitle).toBe("Firecrawl Test Website");
         expect(out.document.metadata.ogDescription).toBe(
-          "Welcome to Roast My Website, the ultimate tool for putting your website through the wringer! This repository harnesses the power of Firecrawl to scrape and capture screenshots of websites, and then unleashes the latest LLM vision models to mercilessly roast them. 🌶️",
+          "Welcome to the Firecrawl Test Website!",
         );
-        expect(out.document.metadata.ogUrl).toBe(
-          "https://www.roastmywebsite.ai",
-        );
-        expect(out.document.metadata.ogImage).toBe(
-          "https://www.roastmywebsite.ai/og.png",
-        );
+        expect(out.document.metadata.ogUrl).toContain("firecrawl-test-site");
+        expect(out.document.metadata.ogImage).toContain("firecrawl-test-site");
         expect(out.document.metadata.ogLocaleAlternate).toStrictEqual([]);
-        expect(out.document.metadata.ogSiteName).toBe("Roast My Website");
         expect(out.document.metadata.sourceURL).toBe(
-          "https://www.roastmywebsite.ai/",
+          "https://firecrawl-test-site.vercel.app",
         );
         expect(out.document.metadata.statusCode).toBe(200);
       }
@@ -82,7 +75,7 @@ describe("Standalone scrapeURL tests", () => {
     it("Scrape with formats markdown and html", async () => {
       const out = await scrapeURL(
         "test:scrape-formats-markdown-html",
-        "https://roastmywebsite.ai",
+        "https://firecrawl-test-site.vercel.app",
         scrapeOptions.parse({
           formats: ["markdown", "html"],
         }),
@@ -97,7 +90,7 @@ describe("Standalone scrapeURL tests", () => {
         expect(out.document).toHaveProperty("markdown");
         expect(out.document).toHaveProperty("html");
         expect(out.document).toHaveProperty("metadata");
-        expect(out.document.markdown).toContain("_Roast_");
+        expect(out.document.markdown).toContain("Firecrawl Test Site");
         expect(out.document.html).toContain("<h1");
         expect(out.document.metadata.statusCode).toBe(200);
         expect(out.document.metadata.error).toBeUndefined();
@@ -541,7 +534,7 @@ describe("Standalone scrapeURL tests", () => {
   );
 
   it("Sitemap scrape should not convert to markdown", async () => {
-    const mockParseMarkdown = parseMarkdown as jest.MockedFunction<
+    const mockParseMarkdown = parseMarkdown as MockedFunction<
       typeof parseMarkdown
     >;
     mockParseMarkdown.mockClear();

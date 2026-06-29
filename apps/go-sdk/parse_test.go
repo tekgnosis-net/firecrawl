@@ -2,6 +2,7 @@ package firecrawl
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -74,6 +75,7 @@ func TestParseSendsMultipartRequest(t *testing.T) {
 	doc, err := client.Parse(context.Background(), file, &ParseOptions{
 		Formats:         []string{"markdown"},
 		OnlyMainContent: Bool(true),
+		RedactPII:       Bool(true),
 	})
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
@@ -87,6 +89,9 @@ func TestParseSendsMultipartRequest(t *testing.T) {
 	}
 	if !strings.Contains(gotOptions, `"onlyMainContent":true`) {
 		t.Errorf("options missing onlyMainContent: %q", gotOptions)
+	}
+	if !strings.Contains(gotOptions, `"redactPII":true`) {
+		t.Errorf("options missing redactPII: %q", gotOptions)
 	}
 	if gotFilename != "upload.html" {
 		t.Errorf("filename = %q, want upload.html", gotFilename)
@@ -126,5 +131,65 @@ func TestParseRejectsEmptyContent(t *testing.T) {
 	_, err = client.Parse(context.Background(), &ParseFile{Filename: "doc.pdf"}, nil)
 	if err == nil {
 		t.Fatalf("expected error for empty content")
+	}
+}
+
+func TestDocumentUnmarshalsMenu(t *testing.T) {
+	raw := []byte(`{
+		"markdown": "# Cafe",
+		"menu": {
+			"isMenu": true,
+			"confidence": 0.92,
+			"merchant": {"name": "Test Cafe", "type": "restaurant"},
+			"currency": "USD",
+			"sourceUrl": "https://example.com/menu",
+			"sections": [
+				{
+					"id": "drinks",
+					"name": "Drinks",
+					"items": [
+						{
+							"id": "latte",
+							"name": "Latte",
+							"availability": {"inStock": true},
+							"price": {"amount": 4.5, "currency": "USD"},
+							"identifiers": {"merchantItemId": "sku-1"},
+							"sourceUrl": "https://example.com/menu"
+						}
+					]
+				}
+			]
+		}
+	}`)
+
+	var doc Document
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+
+	if doc.Menu == nil {
+		t.Fatalf("expected menu, got nil")
+	}
+	if !doc.Menu.IsMenu {
+		t.Errorf("isMenu = false, want true")
+	}
+	if doc.Menu.Confidence != 0.92 {
+		t.Errorf("confidence = %v, want 0.92", doc.Menu.Confidence)
+	}
+	if doc.Menu.Merchant.Name != "Test Cafe" {
+		t.Errorf("merchant.name = %q, want %q", doc.Menu.Merchant.Name, "Test Cafe")
+	}
+	if len(doc.Menu.Sections) != 1 {
+		t.Fatalf("sections = %d, want 1", len(doc.Menu.Sections))
+	}
+	items := doc.Menu.Sections[0].Items
+	if len(items) != 1 {
+		t.Fatalf("items = %d, want 1", len(items))
+	}
+	if items[0].Name != "Latte" {
+		t.Errorf("item name = %q, want %q", items[0].Name, "Latte")
+	}
+	if !items[0].Availability.InStock {
+		t.Errorf("item availability inStock = false, want true")
 	}
 }

@@ -34,7 +34,10 @@ import {
   resolveBillingMetadata,
   toAutumnBillingProperties,
 } from "../billing/types";
-import { autumnService } from "../autumn/autumn.service";
+import {
+  autumnService,
+  featureIdForBillingEndpoint,
+} from "../autumn/autumn.service";
 import {
   _addScrapeJobToBullMQ,
   addScrapeJob,
@@ -49,6 +52,7 @@ import { createWebhookSender, WebhookEvent } from "../webhook/index";
 import { CustomError } from "../../lib/custom-error";
 import { startWebScraperPipeline } from "../../main/runWebScraper";
 import { CostTracking } from "../../lib/cost-tracking";
+import { chargeKeylessCredits } from "../../lib/keyless";
 import { normalizeUrlOnlyHostname } from "../../lib/canonical-url";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
 import { UNSUPPORTED_SITE_MESSAGE } from "../../lib/strings";
@@ -87,6 +91,7 @@ import {
   recordMonitorScrapeFailure,
   recordMonitorScrapeSuccess,
 } from "../monitoring/results";
+import type { DataLayerScrapeMetadata } from "../../lib/data-layer";
 
 configDotenv();
 
@@ -106,6 +111,7 @@ async function billScrapeJob(
   flags: TeamFlags,
   error?: Error | null,
   unsupportedFeatures?: Set<FeatureFlag>,
+  dataLayer?: DataLayerScrapeMetadata,
 ) {
   let creditsToBeBilled: number | null = null;
   const billing = resolveBillingMetadata({
@@ -118,6 +124,10 @@ async function billScrapeJob(
     ...toAutumnBillingProperties(billing),
     apiKeyId: job.data.apiKeyId,
   };
+  // Scrapes initiated by a search (billing.endpoint === "search", e.g. search +
+  // scrapeOptions) are metered against SEARCH_CREDITS, matching the search
+  // request's own credits. Standalone scrapes stay on CREDITS.
+  const featureId = featureIdForBillingEndpoint(billing.endpoint);
   let trackedInRequest = false;
 
   if (job.data.is_scrape !== true && !job.data.internalOptions?.bypassBilling) {
@@ -129,7 +139,14 @@ async function billScrapeJob(
       flags,
       error,
       unsupportedFeatures,
+      dataLayer,
     );
+
+    // Charge the keyless free tier's per-IP daily credit budget unless this
+    // request reserved credits in the controller and will reconcile there.
+    if (!job.data.keylessReserved) {
+      await chargeKeylessCredits(job.data.team_id, creditsToBeBilled);
+    }
 
     if (
       job.data.team_id !== config.BACKGROUND_INDEX_TEAM_ID! &&
@@ -140,7 +157,7 @@ async function billScrapeJob(
           teamId: job.data.team_id,
           value: creditsToBeBilled,
           properties: autumnProperties,
-          requestScoped: true,
+          featureId,
         });
         const billingJobId = uuidv7();
         logger.debug(
@@ -184,6 +201,7 @@ async function billScrapeJob(
             teamId: job.data.team_id,
             value: creditsToBeBilled,
             properties: autumnProperties,
+            featureId,
           });
         }
         captureExceptionWithZdrCheck(error, {
@@ -313,6 +331,21 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
       },
       document: doc,
     };
+
+    // Ensure the parent `requests` row is committed before any child
+    // `scrapes`/`parses` insert, to avoid a request_id FK violation. Runs on
+    // both the crawl and single-scrape paths; only single scrapes actually
+    // carry a logRequestPromise.
+    if (job.data.logRequestPromise) {
+      const start = Date.now();
+      await job.data.logRequestPromise;
+      const waited = Date.now() - start;
+      if (waited > 0) {
+        logger.warn("Had to wait for log request promise to complete", {
+          timeMs: waited,
+        });
+      }
+    }
 
     if (job.data.crawl_id) {
       const sc = (await getCrawl(job.data.crawl_id)) as StoredCrawl;
@@ -496,6 +529,9 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
               [doc.metadata.url ?? doc.metadata.sourceURL!],
               1,
               sc.crawlerOptions?.maxDepth ?? 10,
+              false,
+              false,
+              true,
             );
             if (filterResult.links.length === 0) {
               const url = doc.metadata.url ?? doc.metadata.sourceURL!;
@@ -522,6 +558,7 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
         (await getACUCTeam(job.data.team_id))?.flags ?? null,
         undefined,
         pipeline.unsupportedFeatures,
+        pipeline.dataLayer,
       );
 
       doc.metadata.creditsUsed = credits_billed ?? undefined;
@@ -539,6 +576,7 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
           options: job.data.scrapeOptions,
           cost_tracking: costTracking.toJSON(),
           pdf_num_pages: doc.metadata.numPages,
+          content_type: doc.metadata.contentType,
           credits_cost: credits_billed ?? 0,
           zeroDataRetention: job.data.zeroDataRetention,
           skipNuq: job.data.skipNuq ?? false,
@@ -611,6 +649,7 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
         (await getACUCTeam(job.data.team_id))?.flags ?? null,
         undefined,
         pipeline.unsupportedFeatures,
+        pipeline.dataLayer,
       );
 
       doc.metadata.creditsUsed = credits_billed ?? undefined;
@@ -627,6 +666,7 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
           options: job.data.scrapeOptions,
           cost_tracking: costTracking.toJSON(),
           pdf_num_pages: doc.metadata.numPages,
+          content_type: doc.metadata.contentType,
           credits_cost: credits_billed ?? 0,
           zeroDataRetention: job.data.zeroDataRetention,
           skipNuq: job.data.skipNuq ?? false,
@@ -740,6 +780,23 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
             ? new Error(error)
             : new Error(JSON.stringify(error)),
     };
+
+    try {
+      // Ensure the parent `requests` row is committed before any child
+      // `scrapes`/`parses` insert, to avoid a request_id FK violation. Runs on
+      // both the crawl and single-scrape paths; only single scrapes actually
+      // carry a logRequestPromise.
+      if (job.data.logRequestPromise) {
+        const start = Date.now();
+        await job.data.logRequestPromise;
+        const waited = Date.now() - start;
+        if (waited > 0) {
+          logger.warn("Had to wait for log request promise to complete", {
+            timeMs: waited,
+          });
+        }
+      }
+    } catch {}
 
     if (job.data.crawl_id) {
       const sender = await createWebhookSender({
@@ -1264,10 +1321,14 @@ export const processJobInternal = async (job: NuQJob<ScrapeJobData>) => {
 };
 
 async function processJobWithTracing(job: NuQJob<ScrapeJobData>, logger: any) {
+  // FDB-backed jobs hold their concurrency slot through the queue lease; the
+  // Redis slot mirror and promotion-on-done below are PG-backend machinery
+  const isFdbJob = (job as any).backend === "fdb";
   try {
     try {
       let extendLockInterval: NodeJS.Timeout | null = null;
       if (
+        !isFdbJob &&
         job.data?.mode !== "kickoff" &&
         job.data?.team_id &&
         !job.data.skipNuq
@@ -1337,7 +1398,7 @@ async function processJobWithTracing(job: NuQJob<ScrapeJobData>, logger: any) {
         }
       }
     } finally {
-      if (!job.data.skipNuq) {
+      if (!job.data.skipNuq && !isFdbJob) {
         await concurrentJobDone(job);
       }
     }

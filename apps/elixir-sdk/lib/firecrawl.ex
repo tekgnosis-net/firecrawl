@@ -41,6 +41,7 @@ defmodule Firecrawl do
   @type response :: {:ok, Req.Response.t()} | {:error, Exception.t() | Firecrawl.Error.t()}
 
   @base_url "https://api.firecrawl.dev/v2"
+  @sdk_origin "elixir-sdk@1.6.1"
 
   defp client(opts) do
     api_key =
@@ -48,43 +49,29 @@ defmodule Firecrawl do
         Application.get_env(:firecrawl, :api_key)
       end)
 
+    # A nil/empty key is allowed: scrape, search, and interact fall back to the
+    # keyless free tier (rate-limited per IP). Other endpoints return 401 from the
+    # API until a key is provided.
     api_key =
       case api_key do
         key when is_binary(key) ->
           case String.trim(key) do
-            "" ->
-              raise """
-              Firecrawl API key not found or empty. Set it in your config:
-
-                  config :firecrawl, api_key: "fc-your-api-key"
-
-              Or pass it as an option:
-
-                  Firecrawl.scrape_and_extract_from_url([url: "..."], api_key: "fc-your-api-key")
-              """
-
-            trimmed ->
-              trimmed
+            "" -> nil
+            trimmed -> trimmed
           end
 
         _ ->
-          raise """
-          Firecrawl API key not found or empty. Set it in your config:
-
-              config :firecrawl, api_key: "fc-your-api-key"
-
-          Or pass it as an option:
-
-              Firecrawl.scrape_and_extract_from_url([url: "..."], api_key: "fc-your-api-key")
-          """
+          nil
       end
 
     {base_url, opts} = Keyword.pop(opts, :base_url, @base_url)
     opts = Keyword.delete(opts, :api_key)
 
+    headers = if api_key, do: [{"authorization", "Bearer #{api_key}"}], else: []
+
     Req.new(
       base_url: base_url,
-      headers: [{"authorization", "Bearer #{api_key}"}]
+      headers: headers
     )
     |> Req.merge(opts)
     |> Req.Request.append_response_steps(firecrawl_error_handler: &handle_api_error/1)
@@ -97,10 +84,14 @@ defmodule Firecrawl do
   defp handle_api_error({request, response}), do: {request, response}
 
   defp to_body(validated_params, key_mapping) do
-    Map.new(validated_params, fn {k, v} ->
+    validated_params
+    |> Map.new(fn {k, v} ->
       json_key = Map.fetch!(key_mapping, k)
       {json_key, to_json_value(v)}
     end)
+    # Identify the SDK so the API can grant the keyless free tier; harmless
+    # telemetry on keyed requests.
+    |> Map.put_new("origin", @sdk_origin)
   end
 
   defp to_query(validated_params, key_mapping) do
@@ -935,13 +926,14 @@ defmodule Firecrawl do
     origin: [type: :string, doc: "Origin identifier for analytics and logging."],
     parsers: [type: {:list, :any}, doc: "Controls file parser behavior when relevant (for example PDF parser mode)."],
     proxy: [type: {:or, [{:in, [:basic, :auto]}, :string]}, doc: "Proxy mode for parse uploads. `/parse` supports only `basic` and `auto`."],
+    redact_pii: [type: :boolean, doc: "Redact personally identifiable information from returned content."],
     remove_base64_images: [type: :boolean, doc: "Remove base64-encoded images from output and keep alt text placeholders."],
     skip_tls_verification: [type: :boolean, doc: "Skip TLS certificate verification when making requests."],
     timeout: [type: :integer, doc: "Timeout in milliseconds for the request. Default is 30000 (30 seconds). Maximum is 300000 (300 seconds)."],
     zero_data_retention: [type: :boolean, doc: "If true, this will enable zero data retention for this parse. To enable this feature, please contact help@firecrawl.dev"]
   ])
 
-  @parse_file_key_mapping %{block_ads: "blockAds", exclude_tags: "excludeTags", formats: "formats", headers: "headers", include_tags: "includeTags", integration: "integration", only_main_content: "onlyMainContent", origin: "origin", parsers: "parsers", proxy: "proxy", remove_base64_images: "removeBase64Images", skip_tls_verification: "skipTlsVerification", timeout: "timeout", zero_data_retention: "zeroDataRetention"}
+  @parse_file_key_mapping %{block_ads: "blockAds", exclude_tags: "excludeTags", formats: "formats", headers: "headers", include_tags: "includeTags", integration: "integration", only_main_content: "onlyMainContent", origin: "origin", parsers: "parsers", proxy: "proxy", redact_pii: "redactPII", remove_base64_images: "removeBase64Images", skip_tls_verification: "skipTlsVerification", timeout: "timeout", zero_data_retention: "zeroDataRetention"}
 
   @doc """
   Upload and parse a file
@@ -1039,6 +1031,7 @@ defmodule Firecrawl do
     parsers: [type: {:list, :any}, doc: "Controls how files are processed during scraping. When \"pdf\" is included (default), the PDF content is extracted and converted to markdown format, with billing based on the number of pages (1 credit per page). When an empty array is passed, the PDF file is returned in base64 encoding with a flat rate of 1 credit for the entire PDF."],
     profile: [type: :keyword_list, doc: "Enable persistent browser storage across scrape and interact sessions. Pass a profile when scraping to preserve cookies, localStorage, and session data. Sessions with the same profile name share browser state."],
     proxy: [type: {:in, [:basic, :enhanced, :auto]}, doc: "Specifies the type of proxy to use.\n\n - **basic**: Proxies for scraping sites with none to basic anti-bot solutions. Fast and usually works.\n - **enhanced**: Enhanced proxies for scraping sites with advanced anti-bot solutions. Slower, but more reliable on certain sites. Costs up to 5 credits per request.\n - **auto**: Firecrawl will automatically retry scraping with enhanced proxies if the basic proxy fails. If the retry with enhanced is successful, 5 credits will be billed for the scrape. If the first attempt with basic is successful, only the regular cost will be billed."],
+    redact_pii: [type: :boolean, doc: "Redact personally identifiable information from returned content."],
     remove_base64_images: [type: :boolean, doc: "Removes all base 64 images from the markdown output, which may be overwhelmingly long. This does not affect html or rawHtml formats. The image's alt text remains in the output, but the URL is replaced with a placeholder."],
     skip_tls_verification: [type: :boolean, doc: "Skip TLS certificate verification when making requests."],
     store_in_cache: [type: :boolean, doc: "If true, the page will be stored in the Firecrawl index and cache. Setting this to false is useful if your scraping activity may have data protection concerns. Using some parameters associated with sensitive scraping (e.g. actions, headers) will force this parameter to be false."],
@@ -1048,7 +1041,7 @@ defmodule Firecrawl do
     zero_data_retention: [type: :boolean, doc: "If true, this will enable zero data retention for this scrape. To enable this feature, please contact help@firecrawl.dev"]
   ])
 
-  @scrape_and_extract_from_url_key_mapping %{url: "url", actions: "actions", block_ads: "blockAds", exclude_tags: "excludeTags", formats: "formats", headers: "headers", include_tags: "includeTags", location: "location", max_age: "maxAge", min_age: "minAge", mobile: "mobile", only_main_content: "onlyMainContent", parsers: "parsers", profile: "profile", proxy: "proxy", remove_base64_images: "removeBase64Images", skip_tls_verification: "skipTlsVerification", store_in_cache: "storeInCache", lockdown: "lockdown", timeout: "timeout", wait_for: "waitFor", zero_data_retention: "zeroDataRetention"}
+  @scrape_and_extract_from_url_key_mapping %{url: "url", actions: "actions", block_ads: "blockAds", exclude_tags: "excludeTags", formats: "formats", headers: "headers", include_tags: "includeTags", location: "location", max_age: "maxAge", min_age: "minAge", mobile: "mobile", only_main_content: "onlyMainContent", parsers: "parsers", profile: "profile", proxy: "proxy", redact_pii: "redactPII", remove_base64_images: "removeBase64Images", skip_tls_verification: "skipTlsVerification", store_in_cache: "storeInCache", lockdown: "lockdown", timeout: "timeout", wait_for: "waitFor", zero_data_retention: "zeroDataRetention"}
 
   @doc """
   Scrape a single URL and optionally extract information using an LLM
@@ -1104,6 +1097,7 @@ defmodule Firecrawl do
     parsers: [type: {:list, :any}, doc: "Controls how files are processed during scraping. When \"pdf\" is included (default), the PDF content is extracted and converted to markdown format, with billing based on the number of pages (1 credit per page). When an empty array is passed, the PDF file is returned in base64 encoding with a flat rate of 1 credit for the entire PDF."],
     profile: [type: :keyword_list, doc: "Enable persistent browser storage across scrape and interact sessions. Pass a profile when scraping to preserve cookies, localStorage, and session data. Sessions with the same profile name share browser state."],
     proxy: [type: {:in, [:basic, :enhanced, :auto]}, doc: "Specifies the type of proxy to use.\n\n - **basic**: Proxies for scraping sites with none to basic anti-bot solutions. Fast and usually works.\n - **enhanced**: Enhanced proxies for scraping sites with advanced anti-bot solutions. Slower, but more reliable on certain sites. Costs up to 5 credits per request.\n - **auto**: Firecrawl will automatically retry scraping with enhanced proxies if the basic proxy fails. If the retry with enhanced is successful, 5 credits will be billed for the scrape. If the first attempt with basic is successful, only the regular cost will be billed."],
+    redact_pii: [type: :boolean, doc: "Redact personally identifiable information from returned content."],
     remove_base64_images: [type: :boolean, doc: "Removes all base 64 images from the markdown output, which may be overwhelmingly long. This does not affect html or rawHtml formats. The image's alt text remains in the output, but the URL is replaced with a placeholder."],
     skip_tls_verification: [type: :boolean, doc: "Skip TLS certificate verification when making requests."],
     store_in_cache: [type: :boolean, doc: "If true, the page will be stored in the Firecrawl index and cache. Setting this to false is useful if your scraping activity may have data protection concerns. Using some parameters associated with sensitive scraping (e.g. actions, headers) will force this parameter to be false."],
@@ -1113,7 +1107,7 @@ defmodule Firecrawl do
     zero_data_retention: [type: :boolean, doc: "If true, this will enable zero data retention for this batch scrape. To enable this feature, please contact help@firecrawl.dev"]
   ])
 
-  @scrape_and_extract_from_urls_key_mapping %{ignore_invalid_urls: "ignoreInvalidURLs", max_concurrency: "maxConcurrency", urls: "urls", webhook: "webhook", actions: "actions", block_ads: "blockAds", exclude_tags: "excludeTags", formats: "formats", headers: "headers", include_tags: "includeTags", location: "location", max_age: "maxAge", min_age: "minAge", mobile: "mobile", only_main_content: "onlyMainContent", parsers: "parsers", profile: "profile", proxy: "proxy", remove_base64_images: "removeBase64Images", skip_tls_verification: "skipTlsVerification", store_in_cache: "storeInCache", lockdown: "lockdown", timeout: "timeout", wait_for: "waitFor", zero_data_retention: "zeroDataRetention"}
+  @scrape_and_extract_from_urls_key_mapping %{ignore_invalid_urls: "ignoreInvalidURLs", max_concurrency: "maxConcurrency", urls: "urls", webhook: "webhook", actions: "actions", block_ads: "blockAds", exclude_tags: "excludeTags", formats: "formats", headers: "headers", include_tags: "includeTags", location: "location", max_age: "maxAge", min_age: "minAge", mobile: "mobile", only_main_content: "onlyMainContent", parsers: "parsers", profile: "profile", proxy: "proxy", redact_pii: "redactPII", remove_base64_images: "removeBase64Images", skip_tls_verification: "skipTlsVerification", store_in_cache: "storeInCache", lockdown: "lockdown", timeout: "timeout", wait_for: "waitFor", zero_data_retention: "zeroDataRetention"}
 
   @doc """
   Scrape multiple URLs and optionally extract information using an LLM
@@ -1200,6 +1194,149 @@ defmodule Firecrawl do
   def search_and_scrape!(params \\ [], opts \\ []) do
     params = NimbleOptions.validate!(params, @search_and_scrape_schema)
     Req.post!(client(opts), url: "/search", json: to_body(params, @search_and_scrape_key_mapping))
+  end
+
+  @research_search_papers_schema NimbleOptions.new!([
+    authors: [type: {:list, :string}],
+    categories: [type: {:list, :string}],
+    from: [type: :string],
+    k: [type: :integer],
+    query: [type: :string, required: true],
+    to: [type: :string]
+  ])
+
+  @research_search_papers_key_mapping %{authors: "authors", categories: "categories", from: "from", k: "k", query: "query", to: "to"}
+
+  @doc """
+  Search research papers.
+
+  `GET /search/research/papers`
+  """
+  @spec search_papers(keyword(), keyword()) :: response()
+  def search_papers(params \\ [], opts \\ []) do
+    with {:ok, params} <- NimbleOptions.validate(params, @research_search_papers_schema) do
+      Req.get(client(opts), url: "/search/research/papers", params: [{"origin", @sdk_origin} | to_query(params, @research_search_papers_key_mapping)])
+    end
+  end
+
+  @doc """
+  Bang variant of `search_papers`. Raises on error.
+  """
+  @spec search_papers!(keyword(), keyword()) :: Req.Response.t()
+  def search_papers!(params \\ [], opts \\ []) do
+    params = NimbleOptions.validate!(params, @research_search_papers_schema)
+    Req.get!(client(opts), url: "/search/research/papers", params: [{"origin", @sdk_origin} | to_query(params, @research_search_papers_key_mapping)])
+  end
+
+  @doc """
+  Inspect paper metadata.
+
+  `GET /search/research/papers/{id}`
+  """
+  @spec inspect_paper(String.t(), keyword()) :: response()
+  def inspect_paper(id, opts \\ []) do
+    Req.get(client(opts),
+      url: "/search/research/papers/#{URI.encode_www_form(id)}",
+      params: [{"origin", @sdk_origin}]
+    )
+  end
+
+  @doc """
+  Bang variant of `inspect_paper`. Raises on error.
+  """
+  @spec inspect_paper!(String.t(), keyword()) :: Req.Response.t()
+  def inspect_paper!(id, opts \\ []) do
+    Req.get!(client(opts),
+      url: "/search/research/papers/#{URI.encode_www_form(id)}",
+      params: [{"origin", @sdk_origin}]
+    )
+  end
+
+  @research_read_paper_schema NimbleOptions.new!([
+    k: [type: :integer],
+    query: [type: :string, required: true]
+  ])
+
+  @research_read_paper_key_mapping %{k: "k", query: "query"}
+
+  @doc """
+  Read a paper with query-guided passages.
+
+  `GET /search/research/papers/{id}`
+  """
+  @spec read_paper(String.t(), keyword(), keyword()) :: response()
+  def read_paper(id, params \\ [], opts \\ []) do
+    with {:ok, params} <- NimbleOptions.validate(params, @research_read_paper_schema) do
+      Req.get(client(opts), url: "/search/research/papers/#{URI.encode_www_form(id)}", params: [{"origin", @sdk_origin} | to_query(params, @research_read_paper_key_mapping)])
+    end
+  end
+
+  @doc """
+  Bang variant of `read_paper`. Raises on error.
+  """
+  @spec read_paper!(String.t(), keyword(), keyword()) :: Req.Response.t()
+  def read_paper!(id, params \\ [], opts \\ []) do
+    params = NimbleOptions.validate!(params, @research_read_paper_schema)
+    Req.get!(client(opts), url: "/search/research/papers/#{URI.encode_www_form(id)}", params: [{"origin", @sdk_origin} | to_query(params, @research_read_paper_key_mapping)])
+  end
+
+  @research_related_papers_schema NimbleOptions.new!([
+    anchor: [type: {:list, :string}],
+    intent: [type: :string, required: true],
+    k: [type: :integer],
+    mode: [type: {:in, [:similar, :citers, :references, "similar", "citers", "references"]}],
+    rerank: [type: :boolean]
+  ])
+
+  @research_related_papers_key_mapping %{anchor: "anchor", intent: "intent", k: "k", mode: "mode", rerank: "rerank"}
+
+  @doc """
+  Find papers related to a paper.
+
+  `GET /search/research/papers/{id}/similar`
+  """
+  @spec related_papers(String.t(), keyword(), keyword()) :: response()
+  def related_papers(id, params \\ [], opts \\ []) do
+    with {:ok, params} <- NimbleOptions.validate(params, @research_related_papers_schema) do
+      Req.get(client(opts), url: "/search/research/papers/#{URI.encode_www_form(id)}/similar", params: [{"origin", @sdk_origin} | to_query(params, @research_related_papers_key_mapping)])
+    end
+  end
+
+  @doc """
+  Bang variant of `related_papers`. Raises on error.
+  """
+  @spec related_papers!(String.t(), keyword(), keyword()) :: Req.Response.t()
+  def related_papers!(id, params \\ [], opts \\ []) do
+    params = NimbleOptions.validate!(params, @research_related_papers_schema)
+    Req.get!(client(opts), url: "/search/research/papers/#{URI.encode_www_form(id)}/similar", params: [{"origin", @sdk_origin} | to_query(params, @research_related_papers_key_mapping)])
+  end
+
+  @research_search_github_schema NimbleOptions.new!([
+    k: [type: :integer],
+    query: [type: :string, required: true]
+  ])
+
+  @research_search_github_key_mapping %{k: "k", query: "query"}
+
+  @doc """
+  Search GitHub research content.
+
+  `GET /search/research/github`
+  """
+  @spec search_github(keyword(), keyword()) :: response()
+  def search_github(params \\ [], opts \\ []) do
+    with {:ok, params} <- NimbleOptions.validate(params, @research_search_github_schema) do
+      Req.get(client(opts), url: "/search/research/github", params: [{"origin", @sdk_origin} | to_query(params, @research_search_github_key_mapping)])
+    end
+  end
+
+  @doc """
+  Bang variant of `search_github`. Raises on error.
+  """
+  @spec search_github!(keyword(), keyword()) :: Req.Response.t()
+  def search_github!(params \\ [], opts \\ []) do
+    params = NimbleOptions.validate!(params, @research_search_github_schema)
+    Req.get!(client(opts), url: "/search/research/github", params: [{"origin", @sdk_origin} | to_query(params, @research_search_github_key_mapping)])
   end
 
 
@@ -1328,6 +1465,22 @@ defmodule Firecrawl do
   Create a scheduled monitor.
 
   `POST /monitor`
+
+  ## Targets
+
+  `targets` is a list of maps/keyword lists. Each target is sent as-is (keys are
+  camelCased), so the supported target shapes are:
+
+    * Scrape: `[type: "scrape", url: "https://example.com", ...]`
+    * Crawl: `[type: "crawl", url: "https://example.com", ...]`
+    * Search:
+      `[type: "search", queries: ["term"], search_window: "24h",
+        include_domains: ["example.com"], exclude_domains: [],
+        max_results: 10]`
+      (`search_window` is one of `"5m"`, `"15m"`, `"1h"`, `"6h"`, `"24h"`,
+      `"7d"`; only `queries` is required.)
+
+  Optionally pass `goal` and `judge_enabled: true` to enable AI judging.
   """
   @spec create_monitor(keyword(), keyword()) :: response()
   def create_monitor(params \\ [], opts \\ []) do

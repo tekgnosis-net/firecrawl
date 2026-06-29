@@ -77,7 +77,6 @@ if (config.EXPRESS_TRUST_PROXY) {
 }
 
 const serverAdapter = new ExpressAdapter();
-serverAdapter.setBasePath(`/admin/${config.BULL_AUTH_KEY}/queues`);
 
 const { addQueue, removeQueue, setQueues, replaceQueues } = createBullBoard({
   queues: [
@@ -89,7 +88,12 @@ const { addQueue, removeQueue, setQueues, replaceQueues } = createBullBoard({
   serverAdapter: serverAdapter,
 });
 
-app.use(`/admin/${config.BULL_AUTH_KEY}/queues`, serverAdapter.getRouter());
+if (config.BULL_AUTH_KEY) {
+  serverAdapter.setBasePath(`/admin/${config.BULL_AUTH_KEY}/queues`);
+  app.use(`/admin/${config.BULL_AUTH_KEY}/queues`, serverAdapter.getRouter());
+} else {
+  logger.warn("BULL_AUTH_KEY is not set; admin routes are disabled.");
+}
 
 app.get("/", (_, res) => {
   res.json({
@@ -116,7 +120,7 @@ async function startServer(port = DEFAULT_PORT) {
     await initializeBlocklist();
     initializeEngineForcing();
   } catch (error) {
-    logger.error("Failed to initialize blocklist and engine forcing", {
+    logger.error("Failed to initialize API startup dependencies", {
       error,
     });
     throw error;
@@ -125,7 +129,12 @@ async function startServer(port = DEFAULT_PORT) {
   // Attach WebSocket proxy to the Express app
   attachWsProxy(app);
 
-  const server = app.listen(Number(port), HOST, () => {
+  const server = app.listen(Number(port), HOST, (error?: Error) => {
+    if (error) {
+      logger.error("Failed to start HTTP server", { error, port, host: HOST });
+      throw error;
+    }
+
     logger.info(`Worker ${process.pid} listening on port ${port}`);
   });
 

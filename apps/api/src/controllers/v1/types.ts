@@ -17,6 +17,8 @@ import { integrationSchema } from "../../utils/integration";
 import { includesFormat } from "../../lib/format-utils";
 import { webhookSchema } from "../../services/webhook/schema";
 import { BrandingProfile } from "../../types/branding";
+import { ProductProfile } from "../../types/product";
+import { MenuProfile } from "../../types/menu";
 
 type Format =
   | "markdown"
@@ -29,7 +31,9 @@ type Format =
   | "json"
   | "summary"
   | "changeTracking"
-  | "branding";
+  | "branding"
+  | "product"
+  | "menu";
 
 export const url = z.preprocess(
   x => {
@@ -429,6 +433,8 @@ const baseScrapeOptions = z.strictObject({
       "summary",
       "changeTracking",
       "branding",
+      "product",
+      "menu",
     ])
     .array()
     .optional()
@@ -856,7 +862,14 @@ const crawlerOptions = z.strictObject({
   deduplicateSimilarURLs: z.boolean().prefault(true),
   ignoreQueryParameters: z.boolean().prefault(false),
   regexOnFullURL: z.boolean().prefault(false),
-  delay: z.number().positive().optional(),
+  delay: z
+    .number()
+    .positive()
+    .max(
+      60,
+      "The delay parameter is measured in seconds and cannot exceed 60 seconds.",
+    )
+    .optional(),
 });
 
 // export type CrawlerOptions = {
@@ -985,6 +998,8 @@ export type Document = {
   json?: any;
   summary?: string;
   branding?: BrandingProfile;
+  product?: ProductProfile;
+  menu?: MenuProfile;
   warning?: string;
   actions?: {
     screenshots?: string[];
@@ -1290,7 +1305,7 @@ export type TeamFlags = {
   forceZDR?: boolean;
   allowZDR?: boolean;
   scrapeZDR?: "disabled" | "allowed" | "forced";
-  searchZDR?: "disabled" | "allowed" | "forced";
+  searchZDR?: "disabled" | "allowed" | "forced" | "forced-zdr" | "forced-anon";
   zdrCost?: number;
   checkRobotsOnScrape?: boolean;
   crawlTtlHours?: number;
@@ -1303,6 +1318,10 @@ export type TeamFlags = {
   // POST /v2/search/:jobId/feedback returns 403 TEAM_OPTED_OUT when true.
   searchFeedbackOptOut?: boolean;
   researchBeta?: boolean;
+  highlightsBeta?: boolean;
+  enrichBeta?: boolean;
+  // routes the team's new queue work to the FoundationDB backend
+  nuqFdb?: boolean;
 } | null;
 
 export type AuthCreditUsageChunkFromTeam = Omit<
@@ -1548,6 +1567,8 @@ export const searchRequestSchema = z
               "screenshot@fullPage",
               "extract",
               "json",
+              "product",
+              "menu",
             ]),
           )
           .prefault([]),

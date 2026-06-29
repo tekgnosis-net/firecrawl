@@ -1,11 +1,19 @@
 import { createHash } from "crypto";
 import { v7 as uuidv7 } from "uuid";
-import { supabase_rr_service, supabase_service } from "../supabase";
+import { and, asc, count, desc, eq, isNull, ne, sql } from "drizzle-orm";
+import { db, dbRr } from "../../db/connection";
+import * as schema from "../../db/schema";
+import { monitoringClaimDueMonitors } from "../../db/rpc";
+import { shouldParsePDF } from "../../controllers/v2/types";
 import {
   getNextMonitorRunAt,
   estimateRunsPerMonth,
   validateMonitorCron,
 } from "./cron";
+import {
+  searchCreditsForResultCount,
+  judgeCreditsForJudgedCount,
+} from "./search/billing";
 import type {
   CreateMonitorRequest,
   MonitorCheckPageInsert,
@@ -17,8 +25,8 @@ import type {
   UpdateMonitorRequest,
 } from "./types";
 
-export function hashMonitorUrl(url: string): string {
-  return `\\x${createHash("sha256").update(url).digest("hex")}`;
+export function hashMonitorUrl(url: string): Buffer {
+  return createHash("sha256").update(url).digest();
 }
 
 function ensureTargetIds(targets: Array<Record<string, any>>): MonitorTarget[] {
@@ -28,15 +36,164 @@ function ensureTargetIds(targets: Array<Record<string, any>>): MonitorTarget[] {
   })) as MonitorTarget[];
 }
 
-function estimateTargetCredits(target: MonitorTarget): number {
+const BASE_SCRAPE_CREDITS_PER_PAGE = 1;
+const JSON_SCRAPE_CREDITS_PER_PAGE = 5;
+const DETERMINISTIC_JSON_SCRAPE_CREDITS_PER_PAGE = 7;
+const SCRAPE_OPTION_CREDIT_BONUS = 4;
+const JUDGE_CREDITS_PER_PAGE = 1;
+const REMOVED_PAGE_CREDITS = 0;
+const X_TWITTER_POSTPROCESSOR_CREDIT_BONUS = 29;
+const DEFAULT_CRAWL_LIMIT_FOR_ESTIMATE = 10000;
+const MONITOR_CHECK_PAGE_BATCH_SIZE = 1000;
+
+type MonitorCreditMetadata = {
+  creditsUsed?: unknown;
+  numPages?: unknown;
+  proxyUsed?: unknown;
+  postprocessorsUsed?: unknown;
+};
+
+function formatType(format: unknown): string | null {
+  if (typeof format === "string") return format;
+  if (
+    format &&
+    typeof format === "object" &&
+    "type" in format &&
+    typeof format.type === "string"
+  ) {
+    return format.type;
+  }
+  return null;
+}
+
+function hasFormatOfType(formats: unknown, type: string): boolean {
+  return (
+    Array.isArray(formats) &&
+    formats.some(format => formatType(format) === type)
+  );
+}
+
+function hasAnyFormatOfType(formats: unknown, types: string[]): boolean {
+  return types.some(type => hasFormatOfType(formats, type));
+}
+
+function requestsJsonChangeTracking(formats: unknown): boolean {
+  if (!Array.isArray(formats)) return false;
+  return formats.some(format => {
+    if (
+      !format ||
+      typeof format !== "object" ||
+      !("type" in format) ||
+      format.type !== "changeTracking"
+    ) {
+      return false;
+    }
+    const modes = "modes" in format ? format.modes : undefined;
+    return Array.isArray(modes) && modes.includes("json");
+  });
+}
+
+function estimateBaseCreditsPerPage(
+  options: MonitorTarget["scrapeOptions"],
+  params: { includeProxy?: boolean } = {},
+): number {
+  const formats = options?.formats;
+  const includeProxy = params.includeProxy ?? true;
+  const usesDeterministicJson = hasFormatOfType(formats, "deterministicJson");
+  const usesJsonCredits =
+    hasFormatOfType(formats, "json") || requestsJsonChangeTracking(formats);
+  let credits = BASE_SCRAPE_CREDITS_PER_PAGE;
+
+  if (options?.lockdown) {
+    credits += SCRAPE_OPTION_CREDIT_BONUS;
+  }
+
+  // Deterministic JSON costs more than plain JSON; both override the base scrape credit.
+  if (usesDeterministicJson) {
+    credits = DETERMINISTIC_JSON_SCRAPE_CREDITS_PER_PAGE;
+  } else if (usesJsonCredits) {
+    credits = JSON_SCRAPE_CREDITS_PER_PAGE;
+  }
+
+  if (hasAnyFormatOfType(formats, ["question", "query"])) {
+    credits += SCRAPE_OPTION_CREDIT_BONUS;
+  }
+
+  if (hasFormatOfType(formats, "highlights")) {
+    credits += SCRAPE_OPTION_CREDIT_BONUS;
+  }
+
+  if (hasFormatOfType(formats, "audio")) {
+    credits += SCRAPE_OPTION_CREDIT_BONUS;
+  }
+
+  if (hasFormatOfType(formats, "video")) {
+    credits += SCRAPE_OPTION_CREDIT_BONUS;
+  }
+
+  if (
+    includeProxy &&
+    (options?.proxy === "stealth" || options?.proxy === "enhanced")
+  ) {
+    credits += SCRAPE_OPTION_CREDIT_BONUS;
+  }
+
+  return credits;
+}
+
+function estimateSearchJudgedResults(
+  target: Extract<MonitorTarget, { type: "search" }>,
+): number {
+  return Math.max(1, target.maxResults);
+}
+
+function estimateSearchTargetCredits(
+  target: Extract<MonitorTarget, { type: "search" }>,
+  judgeEnabled: boolean,
+): number {
+  const rawResults =
+    Math.max(1, target.maxResults) * Math.max(1, target.queries.length);
+  const searchCallCredits = searchCreditsForResultCount(rawResults, false);
+  if (target.depth === "raw" || !judgeEnabled) {
+    return searchCallCredits;
+  }
+  return (
+    searchCallCredits +
+    judgeCreditsForJudgedCount(estimateSearchJudgedResults(target))
+  );
+}
+
+function estimateTargetBaseCredits(
+  target: MonitorTarget,
+  judgeEnabled: boolean = false,
+): number {
+  const creditsPerPage = estimateBaseCreditsPerPage(target.scrapeOptions);
   if (target.type === "scrape") {
-    return target.urls.length;
+    return target.urls.length * creditsPerPage;
+  }
+  if (target.type === "search") {
+    return estimateSearchTargetCredits(target, judgeEnabled);
   }
 
   const limit =
     typeof target.crawlOptions?.limit === "number"
       ? target.crawlOptions.limit
-      : 10000;
+      : DEFAULT_CRAWL_LIMIT_FOR_ESTIMATE;
+  return Math.max(1, limit) * creditsPerPage;
+}
+
+function estimateTargetPageCount(target: MonitorTarget): number {
+  if (target.type === "scrape") {
+    return target.urls.length;
+  }
+  if (target.type === "search") {
+    return target.maxResults;
+  }
+
+  const limit =
+    typeof target.crawlOptions?.limit === "number"
+      ? target.crawlOptions.limit
+      : DEFAULT_CRAWL_LIMIT_FOR_ESTIMATE;
   return Math.max(1, limit);
 }
 
@@ -44,11 +201,146 @@ export function estimateMonitorCreditsPerRun(
   targets: MonitorTarget[],
   judgeEnabled: boolean = false,
 ): number {
-  const scrapeCredits = targets.reduce(
-    (sum, target) => sum + estimateTargetCredits(target),
+  const baseCredits = targets.reduce(
+    (sum, target) => sum + estimateTargetBaseCredits(target, judgeEnabled),
     0,
   );
-  return judgeEnabled ? scrapeCredits * 2 : scrapeCredits;
+  // Per-page judge allowance is scrape/crawl only; search judging is folded in above.
+  const judgeCredits = judgeEnabled
+    ? targets.reduce(
+        (sum, target) =>
+          target.type === "search"
+            ? sum
+            : sum + estimateTargetPageCount(target) * JUDGE_CREDITS_PER_PAGE,
+        0,
+      )
+    : 0;
+  return baseCredits + judgeCredits;
+}
+
+export function calculateMonitorCheckActualCreditsFromPages(
+  pages: Array<{
+    target_id?: string | null;
+    metadata?: unknown;
+    judgment?: unknown;
+    status?: string;
+  }>,
+  targets: MonitorTarget[] = [],
+): number {
+  const baseCreditsByTarget = new Map(
+    targets.map(target => [
+      target.id,
+      estimateBaseCreditsPerPage(target.scrapeOptions, {
+        includeProxy: false,
+      }),
+    ]),
+  );
+  const targetsById = new Map(targets.map(target => [target.id, target]));
+
+  function fallbackBaseCreditsForPage(page: (typeof pages)[number]): number {
+    if (page.status === "removed") {
+      return REMOVED_PAGE_CREDITS;
+    }
+
+    if (page.status === "error") {
+      return BASE_SCRAPE_CREDITS_PER_PAGE;
+    }
+
+    const metadata = page.metadata as MonitorCreditMetadata | null;
+    const target = targetsById.get(page.target_id ?? "");
+    let credits =
+      baseCreditsByTarget.get(page.target_id ?? "") ??
+      BASE_SCRAPE_CREDITS_PER_PAGE;
+
+    // Fallback when metadata.creditsUsed is missing: use retained metadata to avoid
+    // undercounting PDFs and special postprocessors.
+    if (
+      target &&
+      shouldParsePDF(target.scrapeOptions?.parsers as any) &&
+      typeof metadata?.numPages === "number" &&
+      metadata.numPages > 1
+    ) {
+      credits += metadata.numPages - 1;
+    }
+
+    const requestedPremiumProxy =
+      target?.scrapeOptions?.proxy === "stealth" ||
+      target?.scrapeOptions?.proxy === "enhanced";
+    const usedPremiumProxy =
+      metadata?.proxyUsed === "stealth" || metadata?.proxyUsed === "enhanced";
+    if (
+      usedPremiumProxy ||
+      (metadata?.proxyUsed == null && requestedPremiumProxy)
+    ) {
+      credits += SCRAPE_OPTION_CREDIT_BONUS;
+    }
+
+    if (
+      Array.isArray(metadata?.postprocessorsUsed) &&
+      metadata.postprocessorsUsed.includes("x-twitter")
+    ) {
+      credits += X_TWITTER_POSTPROCESSOR_CREDIT_BONUS;
+    }
+
+    return credits;
+  }
+
+  function judgeCreditsForPage(page: (typeof pages)[number]): number {
+    if (page.judgment == null) {
+      return 0;
+    }
+
+    // Search is billed at the check level (see flatSearchTargetCredits).
+    const target = targetsById.get(page.target_id ?? "");
+    if (target?.type === "search") {
+      return 0;
+    }
+    return JUDGE_CREDITS_PER_PAGE;
+  }
+
+  return pages.reduce((total, page) => {
+    // Search pages carry no per-page credit; billed at check level.
+    const target = targetsById.get(page.target_id ?? "");
+    if (target?.type === "search") {
+      return total;
+    }
+
+    const metadata = page.metadata as MonitorCreditMetadata | null;
+    const recordedCredits = metadata?.creditsUsed;
+    let baseCredits = fallbackBaseCreditsForPage(page);
+
+    if (
+      typeof recordedCredits === "number" &&
+      Number.isFinite(recordedCredits)
+    ) {
+      baseCredits = recordedCredits;
+    }
+
+    const judgeCredits = judgeCreditsForPage(page);
+    return total + baseCredits + judgeCredits;
+  }, 0);
+}
+
+export function flatSearchTargetCredits(targetResults: unknown): number {
+  if (!Array.isArray(targetResults)) return 0;
+  return targetResults.reduce((total: number, run: unknown) => {
+    if (!run || typeof run !== "object") return total;
+    const r = run as {
+      type?: unknown;
+      searchCredits?: unknown;
+      judgeCredits?: unknown;
+    };
+    if (r.type !== "search") return total;
+    const searchCredits =
+      typeof r.searchCredits === "number" && Number.isFinite(r.searchCredits)
+        ? r.searchCredits
+        : 0;
+    const judgeCredits =
+      typeof r.judgeCredits === "number" && Number.isFinite(r.judgeCredits)
+        ? r.judgeCredits
+        : 0;
+    return total + searchCredits + judgeCredits;
+  }, 0);
 }
 
 function toMonitorSummary(check: MonitorCheckRow): MonitorSummary {
@@ -62,9 +354,13 @@ function toMonitorSummary(check: MonitorCheckRow): MonitorSummary {
   };
 }
 
-function throwIfError(error: any, message: string): void {
-  if (error) {
-    throw new Error(`${message}: ${error.message ?? JSON.stringify(error)}`);
+async function run<T>(fn: () => Promise<T>, message: string): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    throw new Error(
+      `${message}: ${error instanceof Error ? error.message : JSON.stringify(error)}`,
+    );
   }
 }
 
@@ -91,9 +387,8 @@ export async function createMonitor(params: {
   const estimatedCreditsPerMonth =
     estimatedCreditsPerRun * estimateRunsPerMonth(params.intervalMs);
 
-  // Omit goal/judge_enabled keys when undefined so a pre-migration DB
-  // doesn't reject the insert. Migration lives in a separate repo.
-  const insert: Record<string, unknown> = {
+  // Omit goal/judge_enabled when undefined so a pre-migration DB doesn't reject the insert.
+  const insert: typeof schema.monitors.$inferInsert = {
     id: uuidv7(),
     team_id: params.teamId,
     name: params.input.name,
@@ -112,13 +407,11 @@ export async function createMonitor(params: {
   if (params.input.judgeEnabled !== undefined) {
     insert.judge_enabled = params.input.judgeEnabled;
   }
-  const { data, error } = await supabase_service
-    .from("monitors")
-    .insert(insert)
-    .select("*")
-    .single();
+  const [data] = await run(
+    () => db.insert(schema.monitors).values(insert).returning(),
+    "Failed to create monitor",
+  );
 
-  throwIfError(error, "Failed to create monitor");
   return data as MonitorRow;
 }
 
@@ -127,48 +420,67 @@ export async function listMonitors(params: {
   limit: number;
   offset: number;
 }): Promise<MonitorRow[]> {
-  const { data, error } = await supabase_rr_service
-    .from("monitors")
-    .select("*")
-    .eq("team_id", params.teamId)
-    .neq("status", "deleted")
-    .order("created_at", { ascending: false })
-    .range(params.offset, params.offset + params.limit - 1);
-
-  throwIfError(error, "Failed to list monitors");
-  return (data ?? []) as MonitorRow[];
+  const data = await run(
+    () =>
+      dbRr
+        .select()
+        .from(schema.monitors)
+        .where(
+          and(
+            eq(schema.monitors.team_id, params.teamId),
+            ne(schema.monitors.status, "deleted"),
+          ),
+        )
+        .orderBy(desc(schema.monitors.created_at))
+        .limit(params.limit)
+        .offset(params.offset),
+    "Failed to list monitors",
+  );
+  return data as MonitorRow[];
 }
 
 export async function getMonitor(
   teamId: string,
   monitorId: string,
 ): Promise<MonitorRow | null> {
-  const { data, error } = await supabase_rr_service
-    .from("monitors")
-    .select("*")
-    .eq("id", monitorId)
-    .eq("team_id", teamId)
-    .neq("status", "deleted")
-    .maybeSingle();
-
-  throwIfError(error, "Failed to get monitor");
-  return data as MonitorRow | null;
+  const [data] = await run(
+    () =>
+      dbRr
+        .select()
+        .from(schema.monitors)
+        .where(
+          and(
+            eq(schema.monitors.id, monitorId),
+            eq(schema.monitors.team_id, teamId),
+            ne(schema.monitors.status, "deleted"),
+          ),
+        )
+        .limit(1),
+    "Failed to get monitor",
+  );
+  return (data ?? null) as MonitorRow | null;
 }
 
 export async function getMonitorForUpdate(
   teamId: string,
   monitorId: string,
 ): Promise<MonitorRow | null> {
-  const { data, error } = await supabase_service
-    .from("monitors")
-    .select("*")
-    .eq("id", monitorId)
-    .eq("team_id", teamId)
-    .neq("status", "deleted")
-    .maybeSingle();
-
-  throwIfError(error, "Failed to get monitor");
-  return data as MonitorRow | null;
+  const [data] = await run(
+    () =>
+      db
+        .select()
+        .from(schema.monitors)
+        .where(
+          and(
+            eq(schema.monitors.id, monitorId),
+            eq(schema.monitors.team_id, teamId),
+            ne(schema.monitors.status, "deleted"),
+          ),
+        )
+        .limit(1),
+    "Failed to get monitor",
+  );
+  return (data ?? null) as MonitorRow | null;
 }
 
 export async function updateMonitor(params: {
@@ -178,7 +490,7 @@ export async function updateMonitor(params: {
   nextRunAt?: Date;
   intervalMs?: number;
 }): Promise<MonitorRow | null> {
-  const patch: Record<string, unknown> = {
+  const patch: Partial<typeof schema.monitors.$inferInsert> = {
     updated_at: new Date().toISOString(),
   };
 
@@ -186,8 +498,14 @@ export async function updateMonitor(params: {
   if (params.input.status !== undefined) patch.status = params.input.status;
   if (params.input.webhook !== undefined)
     patch.webhook = params.input.webhook ?? null;
-  if (params.input.notification !== undefined) {
-    patch.notification = params.input.notification ?? null;
+  // Only write when the caller sent config; treat empty {} (legacy default) as
+  // "leave unchanged" rather than clobbering stored email settings.
+  if (
+    params.input.notification !== undefined &&
+    params.input.notification !== null &&
+    Object.keys(params.input.notification).length > 0
+  ) {
+    patch.notification = params.input.notification;
   }
   if (params.input.retentionDays !== undefined) {
     patch.retention_days = params.input.retentionDays;
@@ -207,10 +525,8 @@ export async function updateMonitor(params: {
     patch.next_run_at = params.nextRunAt?.toISOString() ?? null;
   }
 
-  // Re-estimate whenever any cost input changed. Merge the patch with the
-  // current monitor row so a goal/judge-only update still recalculates
-  // against the existing targets + schedule, and a targets-only update
-  // preserves an already-enabled judge.
+  // Re-estimate whenever any cost input changed, merging the patch with the current
+  // row so partial updates recalculate against existing targets/schedule/judge.
   const costInputsChanged =
     params.input.targets !== undefined ||
     params.input.judgeEnabled !== undefined ||
@@ -243,39 +559,49 @@ export async function updateMonitor(params: {
     }
   }
 
-  const { data, error } = await supabase_service
-    .from("monitors")
-    .update(patch)
-    .eq("id", params.monitorId)
-    .eq("team_id", params.teamId)
-    .neq("status", "deleted")
-    .select("*")
-    .maybeSingle();
-
-  throwIfError(error, "Failed to update monitor");
-  return data as MonitorRow | null;
+  const [data] = await run(
+    () =>
+      db
+        .update(schema.monitors)
+        .set(patch)
+        .where(
+          and(
+            eq(schema.monitors.id, params.monitorId),
+            eq(schema.monitors.team_id, params.teamId),
+            ne(schema.monitors.status, "deleted"),
+          ),
+        )
+        .returning(),
+    "Failed to update monitor",
+  );
+  return (data ?? null) as MonitorRow | null;
 }
 
 export async function deleteMonitor(params: {
   teamId: string;
   monitorId: string;
 }): Promise<boolean> {
-  const { data, error } = await supabase_service
-    .from("monitors")
-    .update({
-      status: "deleted",
-      deleted_at: new Date().toISOString(),
-      next_run_at: null,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", params.monitorId)
-    .eq("team_id", params.teamId)
-    .neq("status", "deleted")
-    .select("id")
-    .maybeSingle();
-
-  throwIfError(error, "Failed to delete monitor");
-  return !!data;
+  const data = await run(
+    () =>
+      db
+        .update(schema.monitors)
+        .set({
+          status: "deleted",
+          deleted_at: new Date().toISOString(),
+          next_run_at: null,
+          updated_at: new Date().toISOString(),
+        })
+        .where(
+          and(
+            eq(schema.monitors.id, params.monitorId),
+            eq(schema.monitors.team_id, params.teamId),
+            ne(schema.monitors.status, "deleted"),
+          ),
+        )
+        .returning({ id: schema.monitors.id }),
+    "Failed to delete monitor",
+  );
+  return data.length > 0;
 }
 
 export async function createMonitorCheck(params: {
@@ -288,21 +614,22 @@ export async function createMonitorCheck(params: {
     params.monitor.targets,
     Boolean(params.monitor.judge_enabled) && Boolean(params.monitor.goal),
   );
-  const { data, error } = await supabase_service
-    .from("monitor_checks")
-    .insert({
-      id: uuidv7(),
-      monitor_id: params.monitor.id,
-      team_id: params.monitor.team_id,
-      trigger: params.trigger,
-      status: params.status ?? "queued",
-      scheduled_for: params.scheduledFor ?? null,
-      estimated_credits: estimated,
-    })
-    .select("*")
-    .single();
-
-  throwIfError(error, "Failed to create monitor check");
+  const [data] = await run(
+    () =>
+      db
+        .insert(schema.monitor_checks)
+        .values({
+          id: uuidv7(),
+          monitor_id: params.monitor.id,
+          team_id: params.monitor.team_id,
+          trigger: params.trigger,
+          status: params.status ?? "queued",
+          scheduled_for: params.scheduledFor ?? null,
+          estimated_credits: estimated,
+        })
+        .returning(),
+    "Failed to create monitor check",
+  );
   return data as MonitorCheckRow;
 }
 
@@ -310,16 +637,22 @@ export async function markMonitorRunning(params: {
   monitorId: string;
   checkId: string;
 }): Promise<void> {
-  const { error } = await supabase_service
-    .from("monitors")
-    .update({
-      current_check_id: params.checkId,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", params.monitorId)
-    .is("current_check_id", null);
-
-  throwIfError(error, "Failed to mark monitor running");
+  await run(
+    () =>
+      db
+        .update(schema.monitors)
+        .set({
+          current_check_id: params.checkId,
+          updated_at: new Date().toISOString(),
+        })
+        .where(
+          and(
+            eq(schema.monitors.id, params.monitorId),
+            isNull(schema.monitors.current_check_id),
+          ),
+        ),
+    "Failed to mark monitor running",
+  );
 }
 
 export async function dispatchScheduledMonitorCheck(params: {
@@ -335,22 +668,27 @@ export async function dispatchScheduledMonitorCheck(params: {
         ).toISOString()
       : null;
 
-  const { data, error } = await supabase_service
-    .from("monitors")
-    .update({
-      current_check_id: params.checkId,
-      locked_at: null,
-      locked_until: null,
-      next_run_at: nextRunAt,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", params.monitor.id)
-    .is("current_check_id", null)
-    .select("id")
-    .maybeSingle();
-
-  throwIfError(error, "Failed to dispatch scheduled monitor check");
-  return !!data;
+  const data = await run(
+    () =>
+      db
+        .update(schema.monitors)
+        .set({
+          current_check_id: params.checkId,
+          locked_at: null,
+          locked_until: null,
+          next_run_at: nextRunAt,
+          updated_at: new Date().toISOString(),
+        })
+        .where(
+          and(
+            eq(schema.monitors.id, params.monitor.id),
+            isNull(schema.monitors.current_check_id),
+          ),
+        )
+        .returning({ id: schema.monitors.id }),
+    "Failed to dispatch scheduled monitor check",
+  );
+  return data.length > 0;
 }
 
 export async function updateMonitorScheduleAfterRun(params: {
@@ -366,21 +704,23 @@ export async function updateMonitorScheduleAfterRun(params: {
           params.monitor.schedule_timezone,
         ).toISOString()
       : null;
-  const { error } = await supabase_service
-    .from("monitors")
-    .update({
-      current_check_id: null,
-      locked_at: null,
-      locked_until: null,
-      last_run_at: params.check.finished_at ?? new Date().toISOString(),
-      last_check_id: params.check.id,
-      next_run_at: nextRunAt,
-      last_check_summary: params.summary ?? toMonitorSummary(params.check),
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", params.monitor.id);
-
-  throwIfError(error, "Failed to update monitor after run");
+  await run(
+    () =>
+      db
+        .update(schema.monitors)
+        .set({
+          current_check_id: null,
+          locked_at: null,
+          locked_until: null,
+          last_run_at: params.check.finished_at ?? new Date().toISOString(),
+          last_check_id: params.check.id,
+          next_run_at: nextRunAt,
+          last_check_summary: params.summary ?? toMonitorSummary(params.check),
+          updated_at: new Date().toISOString(),
+        })
+        .where(eq(schema.monitors.id, params.monitor.id)),
+    "Failed to update monitor after run",
+  );
 }
 
 export async function advanceMonitorAfterSkippedCheck(params: {
@@ -395,20 +735,22 @@ export async function advanceMonitorAfterSkippedCheck(params: {
           params.monitor.schedule_timezone,
         ).toISOString()
       : null;
-  const { error } = await supabase_service
-    .from("monitors")
-    .update({
-      locked_at: null,
-      locked_until: null,
-      last_run_at: params.check.finished_at ?? new Date().toISOString(),
-      last_check_id: params.check.id,
-      next_run_at: nextRunAt,
-      last_check_summary: toMonitorSummary(params.check),
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", params.monitor.id);
-
-  throwIfError(error, "Failed to advance monitor after skipped check");
+  await run(
+    () =>
+      db
+        .update(schema.monitors)
+        .set({
+          locked_at: null,
+          locked_until: null,
+          last_run_at: params.check.finished_at ?? new Date().toISOString(),
+          last_check_id: params.check.id,
+          next_run_at: nextRunAt,
+          last_check_summary: toMonitorSummary(params.check),
+          updated_at: new Date().toISOString(),
+        })
+        .where(eq(schema.monitors.id, params.monitor.id)),
+    "Failed to advance monitor after skipped check",
+  );
 }
 
 export async function getMonitorCheck(
@@ -416,30 +758,38 @@ export async function getMonitorCheck(
   monitorId: string,
   checkId: string,
 ): Promise<MonitorCheckRow | null> {
-  const { data, error } = await supabase_rr_service
-    .from("monitor_checks")
-    .select("*")
-    .eq("id", checkId)
-    .eq("monitor_id", monitorId)
-    .eq("team_id", teamId)
-    .maybeSingle();
-
-  throwIfError(error, "Failed to get monitor check");
-  return data as MonitorCheckRow | null;
+  const [data] = await run(
+    () =>
+      dbRr
+        .select()
+        .from(schema.monitor_checks)
+        .where(
+          and(
+            eq(schema.monitor_checks.id, checkId),
+            eq(schema.monitor_checks.monitor_id, monitorId),
+            eq(schema.monitor_checks.team_id, teamId),
+          ),
+        )
+        .limit(1),
+    "Failed to get monitor check",
+  );
+  return (data ?? null) as MonitorCheckRow | null;
 }
 
 export async function listRunningMonitorChecks(
   limit: number = 100,
 ): Promise<MonitorCheckRow[]> {
-  const { data, error } = await supabase_service
-    .from("monitor_checks")
-    .select("*")
-    .eq("status", "running")
-    .order("created_at", { ascending: true })
-    .limit(limit);
-
-  throwIfError(error, "Failed to list running monitor checks");
-  return (data ?? []) as MonitorCheckRow[];
+  const data = await run(
+    () =>
+      db
+        .select()
+        .from(schema.monitor_checks)
+        .where(eq(schema.monitor_checks.status, "running"))
+        .orderBy(asc(schema.monitor_checks.created_at))
+        .limit(limit),
+    "Failed to list running monitor checks",
+  );
+  return data as MonitorCheckRow[];
 }
 
 export async function listMonitorChecks(params: {
@@ -449,42 +799,73 @@ export async function listMonitorChecks(params: {
   offset: number;
   status?: MonitorCheckRow["status"];
 }): Promise<MonitorCheckRow[]> {
-  let query = supabase_rr_service
-    .from("monitor_checks")
-    .select("*")
-    .eq("monitor_id", params.monitorId)
-    .eq("team_id", params.teamId)
-    .order("created_at", { ascending: false });
-
+  const conditions = [
+    eq(schema.monitor_checks.monitor_id, params.monitorId),
+    eq(schema.monitor_checks.team_id, params.teamId),
+  ];
   if (params.status) {
-    query = query.eq("status", params.status);
+    conditions.push(eq(schema.monitor_checks.status, params.status));
   }
 
-  const { data, error } = await query.range(
-    params.offset,
-    params.offset + params.limit - 1,
+  const data = await run(
+    () =>
+      dbRr
+        .select()
+        .from(schema.monitor_checks)
+        .where(and(...conditions))
+        .orderBy(desc(schema.monitor_checks.created_at))
+        .limit(params.limit)
+        .offset(params.offset),
+    "Failed to list monitor checks",
   );
-
-  throwIfError(error, "Failed to list monitor checks");
-  return (data ?? []) as MonitorCheckRow[];
+  return data as MonitorCheckRow[];
 }
 
 export async function updateMonitorCheck(
   checkId: string,
   patch: Partial<MonitorCheckRow>,
 ): Promise<MonitorCheckRow> {
-  const { data, error } = await supabase_service
-    .from("monitor_checks")
-    .update({
-      ...patch,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", checkId)
-    .select("*")
-    .single();
-
-  throwIfError(error, "Failed to update monitor check");
+  const [data] = await run(
+    () =>
+      db
+        .update(schema.monitor_checks)
+        .set({
+          ...patch,
+          updated_at: new Date().toISOString(),
+        })
+        .where(eq(schema.monitor_checks.id, checkId))
+        .returning(),
+    "Failed to update monitor check",
+  );
   return data as MonitorCheckRow;
+}
+
+// Atomic variant of updateMonitorCheck that only writes while the check is still
+// running. A late finalize write that lost the race to the catch path (which marks
+// the check failed) becomes a no-op instead of stamping results/searchCompleted onto
+// an already-terminal check. Returns the row if it applied, else null.
+export async function updateMonitorCheckIfRunning(
+  checkId: string,
+  patch: Partial<MonitorCheckRow>,
+): Promise<MonitorCheckRow | null> {
+  const [data] = await run(
+    () =>
+      db
+        .update(schema.monitor_checks)
+        .set({
+          ...patch,
+          updated_at: new Date().toISOString(),
+        })
+        .where(
+          and(
+            eq(schema.monitor_checks.id, checkId),
+            eq(schema.monitor_checks.status, "running"),
+          ),
+        )
+        .returning(),
+    "Failed to update monitor check",
+  );
+  return (data as MonitorCheckRow) ?? null;
 }
 
 export async function insertMonitorCheckPages(
@@ -492,15 +873,42 @@ export async function insertMonitorCheckPages(
 ): Promise<void> {
   if (pages.length === 0) return;
 
-  const { error } = await supabase_service.from("monitor_check_pages").insert(
-    pages.map(page => ({
-      id: uuidv7(),
-      ...page,
-      url_hash: page.url_hash ?? hashMonitorUrl(page.url),
-    })),
+  await run(
+    () =>
+      db.insert(schema.monitor_check_pages).values(
+        pages.map(page => ({
+          id: uuidv7(),
+          ...page,
+          url_hash: page.url_hash ?? hashMonitorUrl(page.url),
+        })),
+      ),
+    "Failed to insert monitor check pages",
   );
+}
 
-  throwIfError(error, "Failed to insert monitor check pages");
+// Makes an inline write idempotent: a redelivered check clears its prior rows
+// before re-inserting, so crash-and-redeliver can't duplicate pages. Pass `url`
+// to scope the clear to a single page so the per-URL scrape path replaces only
+// its own row without clobbering sibling pages of the same target. Partition-safe
+// (no unique constraint needed).
+export async function deleteMonitorCheckPages(params: {
+  checkId: string;
+  targetId: string;
+  url?: string;
+}): Promise<void> {
+  const conditions = [
+    eq(schema.monitor_check_pages.check_id, params.checkId),
+    eq(schema.monitor_check_pages.target_id, params.targetId),
+  ];
+  if (params.url !== undefined) {
+    conditions.push(
+      eq(schema.monitor_check_pages.url_hash, hashMonitorUrl(params.url)),
+    );
+  }
+  await run(
+    () => db.delete(schema.monitor_check_pages).where(and(...conditions)),
+    "Failed to delete monitor check pages",
+  );
 }
 
 export async function listMonitorCheckPages(params: {
@@ -511,25 +919,27 @@ export async function listMonitorCheckPages(params: {
   skip: number;
   status?: string;
 }): Promise<any[]> {
-  let query = supabase_rr_service
-    .from("monitor_check_pages")
-    .select("*")
-    .eq("check_id", params.checkId)
-    .eq("monitor_id", params.monitorId)
-    .eq("team_id", params.teamId)
-    .order("created_at", { ascending: true });
-
+  const conditions = [
+    eq(schema.monitor_check_pages.check_id, params.checkId),
+    eq(schema.monitor_check_pages.monitor_id, params.monitorId),
+    eq(schema.monitor_check_pages.team_id, params.teamId),
+  ];
   if (params.status) {
-    query = query.eq("status", params.status);
+    conditions.push(eq(schema.monitor_check_pages.status, params.status));
   }
 
-  const { data, error } = await query.range(
-    params.skip,
-    params.skip + params.limit - 1,
+  const data = await run(
+    () =>
+      dbRr
+        .select()
+        .from(schema.monitor_check_pages)
+        .where(and(...conditions))
+        .orderBy(asc(schema.monitor_check_pages.created_at))
+        .limit(params.limit)
+        .offset(params.skip),
+    "Failed to list monitor check pages",
   );
-
-  throwIfError(error, "Failed to list monitor check pages");
-  return data ?? [];
+  return data;
 }
 
 export async function countMonitorCheckPages(params: {
@@ -537,30 +947,56 @@ export async function countMonitorCheckPages(params: {
   targetId?: string;
   status?: string;
 }): Promise<number> {
-  const pageSize = 1000;
-  let total = 0;
+  const conditions = [eq(schema.monitor_check_pages.check_id, params.checkId)];
+  if (params.targetId) {
+    conditions.push(eq(schema.monitor_check_pages.target_id, params.targetId));
+  }
+  if (params.status) {
+    conditions.push(eq(schema.monitor_check_pages.status, params.status));
+  }
+
+  const [row] = await run(
+    () =>
+      dbRr
+        .select({ value: count() })
+        .from(schema.monitor_check_pages)
+        .where(and(...conditions)),
+    "Failed to count monitor check pages",
+  );
+
+  return row?.value ?? 0;
+}
+
+export async function calculateMonitorCheckActualCredits(params: {
+  checkId: string;
+  targets: MonitorTarget[];
+  targetResults?: unknown;
+}): Promise<number> {
+  let total = flatSearchTargetCredits(params.targetResults);
   let offset = 0;
 
   while (true) {
-    let query = supabase_rr_service
-      .from("monitor_check_pages")
-      .select("id")
-      .eq("check_id", params.checkId);
+    const batch = await run(
+      () =>
+        dbRr
+          .select({
+            target_id: schema.monitor_check_pages.target_id,
+            metadata: schema.monitor_check_pages.metadata,
+            judgment: schema.monitor_check_pages.judgment,
+            status: schema.monitor_check_pages.status,
+          })
+          .from(schema.monitor_check_pages)
+          .where(eq(schema.monitor_check_pages.check_id, params.checkId))
+          .orderBy(asc(schema.monitor_check_pages.id))
+          .limit(MONITOR_CHECK_PAGE_BATCH_SIZE)
+          .offset(offset),
+      "Failed to calculate monitor check credits",
+    );
 
-    if (params.targetId) {
-      query = query.eq("target_id", params.targetId);
-    }
-    if (params.status) {
-      query = query.eq("status", params.status);
-    }
+    total += calculateMonitorCheckActualCreditsFromPages(batch, params.targets);
 
-    const { data, error } = await query.range(offset, offset + pageSize - 1);
-    throwIfError(error, "Failed to count monitor check pages");
-
-    const batch = data ?? [];
-    total += batch.length;
-    if (batch.length < pageSize) break;
-    offset += pageSize;
+    if (batch.length < MONITOR_CHECK_PAGE_BATCH_SIZE) break;
+    offset += MONITOR_CHECK_PAGE_BATCH_SIZE;
   }
 
   return total;
@@ -571,16 +1007,22 @@ export async function getMonitorPage(params: {
   targetId: string;
   url: string;
 }): Promise<MonitorPageRow | null> {
-  const { data, error } = await supabase_rr_service
-    .from("monitor_pages")
-    .select("*")
-    .eq("monitor_id", params.monitorId)
-    .eq("target_id", params.targetId)
-    .eq("url_hash", hashMonitorUrl(params.url))
-    .maybeSingle();
-
-  throwIfError(error, "Failed to get monitor page");
-  return data as MonitorPageRow | null;
+  const [data] = await run(
+    () =>
+      dbRr
+        .select()
+        .from(schema.monitor_pages)
+        .where(
+          and(
+            eq(schema.monitor_pages.monitor_id, params.monitorId),
+            eq(schema.monitor_pages.target_id, params.targetId),
+            eq(schema.monitor_pages.url_hash, hashMonitorUrl(params.url)),
+          ),
+        )
+        .limit(1),
+    "Failed to get monitor page",
+  );
+  return (data ?? null) as MonitorPageRow | null;
 }
 
 export async function upsertMonitorPage(params: {
@@ -593,6 +1035,9 @@ export async function upsertMonitorPage(params: {
   scrapeId: string | null;
   status: "same" | "new" | "changed" | "removed" | "error";
   metadata?: unknown;
+  // When the caller's finalize times out it aborts this signal; we then skip the
+  // write so an orphaned baseline can't poison the next run's dedup state.
+  abortSignal?: AbortSignal;
 }): Promise<void> {
   const now = new Date().toISOString();
 
@@ -602,35 +1047,39 @@ export async function upsertMonitorPage(params: {
     url: params.url,
   });
 
-  if (!existing) {
-    const { error } = await supabase_service.from("monitor_pages").insert({
-      monitor_id: params.monitorId,
-      team_id: params.teamId,
-      target_id: params.targetId,
-      url: params.url,
-      url_hash: hashMonitorUrl(params.url),
-      source: params.source,
-      first_seen_check_id: params.checkId,
-      last_seen_check_id:
-        params.status === "removed" ? undefined : params.checkId,
-      last_changed_check_id:
-        params.status === "changed" || params.status === "new"
-          ? params.checkId
-          : undefined,
-      last_scrape_id: params.scrapeId,
-      last_status: params.status,
-      is_removed: params.status === "removed",
-      removed_at: params.status === "removed" ? now : null,
-      metadata: params.metadata ?? null,
-      created_at: now,
-      updated_at: now,
-    });
+  if (params.abortSignal?.aborted) return;
 
-    throwIfError(error, "Failed to insert monitor page");
+  if (!existing) {
+    await run(
+      () =>
+        db.insert(schema.monitor_pages).values({
+          monitor_id: params.monitorId,
+          team_id: params.teamId,
+          target_id: params.targetId,
+          url: params.url,
+          url_hash: hashMonitorUrl(params.url),
+          source: params.source,
+          first_seen_check_id: params.checkId,
+          last_seen_check_id:
+            params.status === "removed" ? undefined : params.checkId,
+          last_changed_check_id:
+            params.status === "changed" || params.status === "new"
+              ? params.checkId
+              : undefined,
+          last_scrape_id: params.scrapeId,
+          last_status: params.status,
+          is_removed: params.status === "removed",
+          removed_at: params.status === "removed" ? now : null,
+          metadata: params.metadata ?? null,
+          created_at: now,
+          updated_at: now,
+        }),
+      "Failed to insert monitor page",
+    );
     return;
   }
 
-  const patch: Record<string, unknown> = {
+  const patch: Partial<typeof schema.monitor_pages.$inferInsert> = {
     last_status: params.status,
     is_removed: params.status === "removed",
     removed_at: params.status === "removed" ? now : null,
@@ -645,40 +1094,138 @@ export async function upsertMonitorPage(params: {
     patch.last_changed_check_id = params.checkId;
   }
 
-  const { error } = await supabase_service
-    .from("monitor_pages")
-    .update(patch)
-    .eq("id", existing.id);
+  await run(
+    () =>
+      db
+        .update(schema.monitor_pages)
+        .set(patch)
+        .where(eq(schema.monitor_pages.id, existing.id)),
+    "Failed to update monitor page",
+  );
+}
 
-  throwIfError(error, "Failed to update monitor page");
+type BulkUpsertMonitorPageRow = {
+  url: string;
+  urlHash?: Buffer;
+  status: "same" | "new" | "changed" | "removed" | "error";
+  metadata?: unknown;
+  source: "explicit" | "discovered";
+  scrapeId: string | null;
+};
+
+// Bulk equivalent of upsertMonitorPage: collapses an N-page upsert from ~2N
+// sequential round-trips (replica read + primary write per page) into ONE atomic
+// INSERT ... ON CONFLICT DO UPDATE keyed by the (monitor_id, target_id, url_hash)
+// unique index. Per-row field rules mirror upsertMonitorPage exactly, expressed in
+// the conflict set via `excluded` + CASE so no read is needed and Drizzle handles
+// the enum/jsonb column types (no hand-written casts that can drift from the schema).
+export async function bulkUpsertMonitorPages(params: {
+  monitorId: string;
+  teamId: string;
+  targetId: string;
+  checkId: string;
+  rows: BulkUpsertMonitorPageRow[];
+  // When finalize times out the caller aborts this signal; we then skip the whole
+  // write so an aborted finalize leaves monitor_pages untouched (no partial baseline).
+  abortSignal?: AbortSignal;
+}): Promise<void> {
+  if (params.abortSignal?.aborted) return;
+
+  // Dedup by url_hash (last wins) so a repeated URL can't double-insert, and sort
+  // by url_hash for a deterministic row-lock order.
+  const byHash = new Map<
+    string,
+    BulkUpsertMonitorPageRow & { urlHash: Buffer }
+  >();
+  for (const row of params.rows) {
+    const urlHash = row.urlHash ?? hashMonitorUrl(row.url);
+    byHash.set(urlHash.toString("hex"), { ...row, urlHash });
+  }
+  if (byHash.size === 0) return;
+  const rows = [...byHash.values()].sort((a, b) =>
+    a.urlHash.toString("hex") < b.urlHash.toString("hex") ? -1 : 1,
+  );
+
+  const now = new Date().toISOString();
+
+  // Build every row as if newly inserted; ON CONFLICT applies the existing-row
+  // rules via `excluded` + CASE so the whole upsert is ONE atomic statement — no
+  // separate read, no separate update — and Drizzle maps the enum/jsonb types from
+  // the schema, so there are no hand-written casts that can drift from the columns.
+  const values = rows.map(row => {
+    const isRemoved = row.status === "removed";
+    const isChangedOrNew = row.status === "changed" || row.status === "new";
+    return {
+      monitor_id: params.monitorId,
+      team_id: params.teamId,
+      target_id: params.targetId,
+      url: row.url,
+      url_hash: row.urlHash,
+      source: row.source,
+      first_seen_check_id: params.checkId,
+      last_seen_check_id: isRemoved ? null : params.checkId,
+      last_changed_check_id: isChangedOrNew ? params.checkId : null,
+      last_scrape_id: row.scrapeId,
+      last_status: row.status,
+      is_removed: isRemoved,
+      removed_at: isRemoved ? now : null,
+      metadata: row.metadata ?? null,
+      created_at: now,
+      updated_at: now,
+    };
+  });
+
+  if (params.abortSignal?.aborted) return;
+
+  await run(
+    () =>
+      db
+        .insert(schema.monitor_pages)
+        .values(values)
+        .onConflictDoUpdate({
+          target: [
+            schema.monitor_pages.monitor_id,
+            schema.monitor_pages.target_id,
+            schema.monitor_pages.url_hash,
+          ],
+          set: {
+            last_status: sql`excluded.last_status`,
+            is_removed: sql`excluded.is_removed`,
+            removed_at: sql`excluded.removed_at`,
+            // Preserve prior metadata when the new row carries none.
+            metadata: sql`coalesce(excluded.metadata, ${schema.monitor_pages.metadata})`,
+            // last_seen / last_scrape advance only when not removed; else preserved.
+            last_seen_check_id: sql`case when excluded.is_removed then ${schema.monitor_pages.last_seen_check_id} else excluded.last_seen_check_id end`,
+            last_scrape_id: sql`case when excluded.is_removed then ${schema.monitor_pages.last_scrape_id} else excluded.last_scrape_id end`,
+            // last_changed advances only on new/changed; first_seen is never touched.
+            last_changed_check_id: sql`case when excluded.last_status in ('new','changed') then excluded.last_changed_check_id else ${schema.monitor_pages.last_changed_check_id} end`,
+            updated_at: sql`excluded.updated_at`,
+          },
+        }),
+    "Failed to bulk upsert monitor pages",
+  );
 }
 
 export async function listActiveMonitorPages(params: {
   monitorId: string;
   targetId: string;
 }): Promise<MonitorPageRow[]> {
-  const pageSize = 1000;
-  const pages: MonitorPageRow[] = [];
-  let offset = 0;
-
-  while (true) {
-    const { data, error } = await supabase_rr_service
-      .from("monitor_pages")
-      .select("*")
-      .eq("monitor_id", params.monitorId)
-      .eq("target_id", params.targetId)
-      .eq("is_removed", false)
-      .order("created_at", { ascending: true })
-      .range(offset, offset + pageSize - 1);
-
-    throwIfError(error, "Failed to list active monitor pages");
-    const batch = (data ?? []) as MonitorPageRow[];
-    pages.push(...batch);
-    if (batch.length < pageSize) break;
-    offset += pageSize;
-  }
-
-  return pages;
+  const data = await run(
+    () =>
+      dbRr
+        .select()
+        .from(schema.monitor_pages)
+        .where(
+          and(
+            eq(schema.monitor_pages.monitor_id, params.monitorId),
+            eq(schema.monitor_pages.target_id, params.targetId),
+            eq(schema.monitor_pages.is_removed, false),
+          ),
+        )
+        .orderBy(asc(schema.monitor_pages.created_at)),
+    "Failed to list active monitor pages",
+  );
+  return data as MonitorPageRow[];
 }
 
 export async function claimDueMonitors(params: {
@@ -686,31 +1233,27 @@ export async function claimDueMonitors(params: {
   limit: number;
   leaseSeconds: number;
 }): Promise<MonitorRow[]> {
-  const { data, error } = await supabase_service.rpc(
-    "monitoring_claim_due_monitors",
-    {
-      p_worker_id: params.workerId,
-      p_limit: params.limit,
-      p_lease_seconds: params.leaseSeconds,
-    },
+  const data = await run(
+    () => monitoringClaimDueMonitors<MonitorRow>(params),
+    "Failed to claim due monitors",
   );
-
-  throwIfError(error, "Failed to claim due monitors");
-  return (data ?? []) as MonitorRow[];
+  return data;
 }
 
 export async function deferMonitorClaim(
   monitorId: string,
   until: Date,
 ): Promise<void> {
-  const { error } = await supabase_service
-    .from("monitors")
-    .update({
-      locked_until: until.toISOString(),
-      locked_at: null,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", monitorId);
-
-  throwIfError(error, "Failed to defer monitor claim");
+  await run(
+    () =>
+      db
+        .update(schema.monitors)
+        .set({
+          locked_until: until.toISOString(),
+          locked_at: null,
+          updated_at: new Date().toISOString(),
+        })
+        .where(eq(schema.monitors.id, monitorId)),
+    "Failed to defer monitor claim",
+  );
 }

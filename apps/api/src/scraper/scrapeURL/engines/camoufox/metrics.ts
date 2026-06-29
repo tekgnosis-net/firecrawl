@@ -25,7 +25,7 @@ import { Counter } from "prom-client";
 // Break down by `status_code` to distinguish 403 (fingerprint block) from 429
 // (rate limit) — they call for different responses.
 
-export type CamoufoxOutcome = "success" | "blocked" | "error";
+type CamoufoxOutcome = "success" | "blocked" | "error";
 
 export const camoufoxScrapeTotal = new Counter({
   name: "firecrawl_camoufox_scrape_total",

@@ -26,7 +26,10 @@ import { UNSUPPORTED_SITE_MESSAGE } from "../../lib/strings";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
 import { fromV1ScrapeOptions } from "../v2/types";
 import { checkPermissions } from "../../lib/permissions";
-import { crawlGroup } from "../../services/worker/nuq";
+import {
+  crawlGroup,
+  resolveNewGroupBackend,
+} from "../../services/worker/nuq-router";
 import { logRequest } from "../../services/logging/log_job";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 
@@ -160,13 +163,28 @@ export async function batchScrapeController(
         createdAt: Date.now(),
         maxConcurrency: req.body.maxConcurrency,
         zeroDataRetention,
+        v1: true,
+        webhook: req.body.webhook,
       };
 
+  if (req.body.appendToId && (!sc || sc.team_id !== req.auth.team_id)) {
+    return res.status(404).json({
+      success: false,
+      error: "Job not found",
+    });
+  }
+
   if (!req.body.appendToId) {
+    sc.queueBackend = await resolveNewGroupBackend(sc.team_id);
     await crawlGroup.addGroup(
       id,
       sc.team_id,
       (req.acuc?.flags?.crawlTtlHours ?? 24) * 60 * 60 * 1000,
+      {
+        backend: sc.queueBackend,
+        maxConcurrency: sc.maxConcurrency,
+        delaySeconds: sc.crawlerOptions?.delay,
+      },
     );
     await saveCrawl(id, sc);
     await markCrawlActive(id);
@@ -244,7 +262,7 @@ export async function batchScrapeController(
   return res.status(200).json({
     success: true,
     id,
-    url: `${protocol}://${req.get("host")}/v1/batch/scrape/${id}`,
+    url: `${protocol}://${req.host}/v1/batch/scrape/${id}`,
     invalidURLs,
   });
 }

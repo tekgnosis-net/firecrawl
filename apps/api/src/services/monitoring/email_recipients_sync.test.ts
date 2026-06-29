@@ -1,14 +1,17 @@
-jest.mock("../supabase", () => ({
-  supabase_service: {},
-  supabase_rr_service: {},
+const {
+  mockEnsureRecipient,
+  mockListRecipients,
+  mockGetTeamMemberEmails,
+  mockSendConfirmationEmail,
+} = vi.hoisted(() => ({
+  mockEnsureRecipient: vi.fn(),
+  mockListRecipients: vi.fn(),
+  mockGetTeamMemberEmails: vi.fn(),
+  mockSendConfirmationEmail: vi.fn(),
 }));
 
-const mockEnsureRecipient = jest.fn();
-const mockListRecipients = jest.fn();
-const mockGetTeamMemberEmails = jest.fn();
-
-jest.mock("./email_recipients", () => {
-  const actual = jest.requireActual("./email_recipients");
+vi.mock("./email_recipients", async importOriginal => {
+  const actual = await importOriginal<typeof import("./email_recipients")>();
   return {
     ...actual,
     ensureMonitorEmailRecipient: (...args: unknown[]) =>
@@ -20,8 +23,7 @@ jest.mock("./email_recipients", () => {
   };
 });
 
-const mockSendConfirmationEmail = jest.fn();
-jest.mock("../notification/monitoring_email", () => ({
+vi.mock("../notification/monitoring_email", () => ({
   sendMonitoringConfirmationEmail: (...args: unknown[]) =>
     mockSendConfirmationEmail(...args),
 }));
@@ -52,7 +54,8 @@ function recipientRow(
     status,
     token: `tok-${email}`,
     source,
-    confirmation_sent_at: status === "pending" ? new Date().toISOString() : null,
+    confirmation_sent_at:
+      status === "pending" ? new Date().toISOString() : null,
     confirmed_at: status === "confirmed" ? new Date().toISOString() : null,
     unsubscribed_at:
       status === "unsubscribed" ? new Date().toISOString() : null,
@@ -201,11 +204,7 @@ describe("syncMonitorEmailRecipients", () => {
     mockListRecipients.mockResolvedValue([]);
     mockGetTeamMemberEmails.mockResolvedValue(new Set(["owner@team.com"]));
     mockEnsureRecipient.mockImplementation(async ({ input }) => ({
-      row: recipientRow(
-        input.email,
-        input.status,
-        input.source,
-      ),
+      row: recipientRow(input.email, input.status, input.source),
       created: true,
     }));
 
@@ -214,7 +213,8 @@ describe("syncMonitorEmailRecipients", () => {
     });
 
     expect(mockSendConfirmationEmail).toHaveBeenCalledTimes(1);
-    const emailedTo = mockSendConfirmationEmail.mock.calls[0][0].recipient.email;
+    const emailedTo =
+      mockSendConfirmationEmail.mock.calls[0][0].recipient.email;
     expect(emailedTo).toBe("external@elsewhere.com");
 
     const byEmail = new Map(result.recipients.map(r => [r.email, r]));

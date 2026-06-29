@@ -10,7 +10,7 @@ use Firecrawl\Exceptions\FirecrawlException;
  * Options for parsing uploaded files via `/v2/parse`.
  *
  * Parse does not support browser-rendering features (actions, waitFor,
- * location, mobile) nor the screenshot, branding, audio, video, or changeTracking formats.
+ * location, mobile) nor the screenshot, branding, product, menu, audio, video, or changeTracking formats.
  * The proxy field only accepts "auto" or "basic".
  */
 final class ParseOptions
@@ -20,6 +20,8 @@ final class ParseOptions
         'screenshot',
         'screenshot@fullPage',
         'branding',
+        'product',
+        'menu',
         'audio',
         'video',
     ];
@@ -44,6 +46,7 @@ final class ParseOptions
         private readonly ?bool $blockAds = null,
         private readonly ?string $proxy = null,
         private readonly ?string $integration = null,
+        private readonly ?bool $redactPII = null,
     ) {}
 
     /**
@@ -66,6 +69,7 @@ final class ParseOptions
         ?bool $blockAds = null,
         ?string $proxy = null,
         ?string $integration = null,
+        ?bool $redactPII = null,
     ): self {
         if ($timeout !== null && $timeout <= 0) {
             throw new FirecrawlException('timeout must be positive');
@@ -97,6 +101,7 @@ final class ParseOptions
             $blockAds,
             $proxy,
             $integration,
+            $redactPII,
         );
     }
 
@@ -130,6 +135,7 @@ final class ParseOptions
             'blockAds' => $this->blockAds,
             'proxy' => $this->proxy,
             'integration' => $this->integration,
+            'redactPII' => $this->redactPII,
         ];
 
         foreach ($fields as $key => $value) {

@@ -1,5 +1,7 @@
 import { logger } from "../../lib/logger";
-import { supabase_rr_service } from "../supabase";
+import { eq, inArray } from "drizzle-orm";
+import { dbRr } from "../../db/connection";
+import * as schema from "../../db/schema";
 import { autumnClient } from "./client";
 
 const CREDITS_FEATURE_ID = "CREDITS";
@@ -26,13 +28,12 @@ interface TeamBalance {
 // ---------------------------------------------------------------------------
 
 async function lookupOrgId(teamId: string): Promise<string> {
-  const { data, error } = await supabase_rr_service
-    .from("teams")
-    .select("org_id")
-    .eq("id", teamId)
-    .single();
+  const [data] = await dbRr
+    .select({ org_id: schema.teams.org_id })
+    .from(schema.teams)
+    .where(eq(schema.teams.id, teamId))
+    .limit(1);
 
-  if (error) throw error;
   if (!data?.org_id) {
     throw new Error(`Missing org_id for team ${teamId}`);
   }
@@ -40,36 +41,36 @@ async function lookupOrgId(teamId: string): Promise<string> {
 }
 
 /**
- * Maps numeric API key IDs to their display names from the api_keys table.
- * Returns a map of id → name.  Unknown IDs are mapped to their string representation.
+ * Maps API key identifiers from Autumn events to their display names.
+ *
+ * Autumn returns whatever value was sent as `properties.apiKeyId`. Current
+ * code sends the numeric `api_keys.id`, but the 90-day aggregation window can
+ * still include legacy events tagged with opaque non-numeric values. Anything
+ * we can't resolve is labeled "Unknown" so the response never surfaces raw
+ * identifiers.
  */
 async function lookupApiKeyNames(
   apiKeyIds: string[],
 ): Promise<Record<string, string>> {
   const numericIds = apiKeyIds
     .map(id => Number(id))
-    .filter(n => !isNaN(n) && n > 0);
+    .filter(n => Number.isInteger(n) && n > 0);
 
   const nameMap: Record<string, string> = {};
 
   if (numericIds.length > 0) {
-    const { data } = await supabase_rr_service
-      .from("api_keys")
-      .select("id, name")
-      .in("id", numericIds);
+    const rows = await dbRr
+      .select({ id: schema.api_keys.id, name: schema.api_keys.name })
+      .from(schema.api_keys)
+      .where(inArray(schema.api_keys.id, numericIds));
 
-    if (data) {
-      for (const row of data) {
-        nameMap[String(row.id)] = row.name;
-      }
+    for (const row of rows) {
+      nameMap[String(row.id)] = row.name ?? "Unknown";
     }
   }
 
-  // Fall back to raw ID string for any keys not found
   for (const id of apiKeyIds) {
-    if (!nameMap[id]) {
-      nameMap[id] = id;
-    }
+    if (!nameMap[id]) nameMap[id] = "Unknown";
   }
 
   return nameMap;
@@ -158,13 +159,22 @@ async function aggregateHistoricalPeriodsByApiKeyMonth(
 
     if (!monthTotals) continue;
 
-    for (const [apiKeyId, creditsUsed] of [...monthTotals.entries()].sort(
-      ([a], [b]) => a.localeCompare(b),
+    // Collapse rows whose IDs resolve to the same display name (e.g. multiple
+    // unresolved IDs all show as "Unknown") so the response has one row per
+    // name per month.
+    const byName = new Map<string, number>();
+    for (const [apiKeyId, creditsUsed] of monthTotals) {
+      const name = nameMap[apiKeyId];
+      byName.set(name, (byName.get(name) ?? 0) + creditsUsed);
+    }
+
+    for (const [apiKey, creditsUsed] of [...byName.entries()].sort(([a], [b]) =>
+      a.localeCompare(b),
     )) {
       results.push({
         startDate,
         endDate,
-        apiKey: nameMap[apiKeyId],
+        apiKey,
         creditsUsed,
       });
     }
@@ -307,7 +317,7 @@ export async function getTeamBalance(
   }
 
   return {
-    remaining: creditBalance?.remaining ?? 0,
+    remaining: signedRemaining(creditBalance),
     granted: creditBalance?.granted ?? 0,
     planCredits,
     usage: creditBalance?.usage ?? 0,
@@ -317,6 +327,23 @@ export async function getTeamBalance(
       : null,
     periodEnd: periodEndEpoch ? new Date(periodEndEpoch).toISOString() : null,
   };
+}
+
+// Autumn caps `balance.remaining` at 0, so it can't surface negative balances
+// for teams in overage. `granted - usage` preserves the signed balance.
+function signedRemaining(
+  balance:
+    | {
+        granted?: number;
+        usage?: number;
+        remaining?: number;
+        unlimited?: boolean;
+      }
+    | undefined,
+): number {
+  if (!balance) return 0;
+  if (balance.unlimited === true) return balance.remaining ?? 0;
+  return (balance.granted ?? 0) - (balance.usage ?? 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -339,8 +366,11 @@ interface HistoricalPeriodByApiKey {
 /**
  * Fetches a team's historical credit usage across billing periods from Autumn.
  *
- * Uses `events.aggregate` with the last 90 days of daily usage and rolls those
- * daily totals into calendar-month buckets in API code.
+ * Scopes the aggregate to the team's Autumn entity so the response reflects
+ * only that team's usage, not the whole org. Uses `events.aggregate` with the
+ * last 90 days of daily usage and rolls those daily totals into calendar-month
+ * buckets in API code. A team with no entity (never provisioned) has no
+ * team-scoped usage, so we return an empty history rather than the org total.
  */
 export async function getTeamHistoricalUsage(
   teamId: string,
@@ -351,7 +381,6 @@ export async function getTeamHistoricalUsage(
 
   const orgId = await lookupOrgId(teamId);
 
-  // Try entity-scoped aggregate first, fall back to customer-level
   let response: any;
   try {
     response = await autumnClient.events.aggregate({
@@ -364,13 +393,8 @@ export async function getTeamHistoricalUsage(
   } catch (err: any) {
     const status = err?.statusCode ?? err?.status ?? err?.response?.status;
     if (status !== 404) throw err;
-    // Entity not found — retry at customer level
-    response = await autumnClient.events.aggregate({
-      customerId: orgId,
-      featureId: CREDITS_FEATURE_ID,
-      range: HISTORICAL_RANGE,
-      binSize: HISTORICAL_BIN_SIZE,
-    });
+    // Entity not found — the team has no usage of its own to report.
+    return [];
   }
 
   return aggregateHistoricalPeriodsByMonth(response.list ?? []);
@@ -404,13 +428,8 @@ export async function getTeamHistoricalUsageByApiKey(
   } catch (err: any) {
     const status = err?.statusCode ?? err?.status ?? err?.response?.status;
     if (status !== 404) throw err;
-    response = await autumnClient.events.aggregate({
-      customerId: orgId,
-      featureId: CREDITS_FEATURE_ID,
-      range: HISTORICAL_RANGE,
-      binSize: HISTORICAL_BIN_SIZE,
-      groupBy: "properties.apiKeyId",
-    });
+    // Entity not found — the team has no usage of its own to report.
+    return [];
   }
 
   return aggregateHistoricalPeriodsByApiKeyMonth(response.list ?? []);
