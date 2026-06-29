@@ -60,6 +60,22 @@ jobs:
       - name: Set up Rust (native crate build gate)
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Provision FoundationDB client (build gate needs libfdb_c)
+        # Upstream's nuq-fdb worker pulls the `foundationdb` npm package, whose
+        # postinstall gyp build hard-fails without libfdb_c — so once that dep is
+        # merged, `pnpm install` in the build gate (and thus every weekly sync)
+        # would false-fail on a clean ubuntu runner. Provision the same client
+        # deb apps/api/Dockerfile installs. Keep FDB_VERSION in sync with the
+        # Dockerfile's ARG FDB_VERSION.
+        run: |
+          set -euo pipefail
+          FDB_VERSION=7.3.63
+          ARCH="$(dpkg --print-architecture)"
+          curl -fsSL -o /tmp/fdb-clients.deb \
+            "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_${ARCH}.deb"
+          sudo dpkg -i /tmp/fdb-clients.deb
+          rm -f /tmp/fdb-clients.deb
+
       - name: Run upstream sync
         id: sync
         continue-on-error: true
@@ -94,8 +110,22 @@ jobs:
               echo "Dry run complete — merge + build gate exercised, no PR opened."
               ;;
             *)
-              gh issue create \
-                --title "Upstream sync needs manual resolution ($(date +%Y-%m-%d))" \
-                --body "$(printf 'sync-upstream.sh stopped with result=%s (non-deterministic conflict or build failure).\n\nRun it locally to resolve:\n\n    bash .github/scripts/sync-upstream.sh\n\nSee the workflow run logs for the conflicting paths.' "$RESULT")"
+              # Escalate. Reuse ONE canonical tracking issue (comment on it)
+              # instead of opening a fresh date-stamped issue every week, then
+              # FAIL the run — otherwise a successful `gh issue create` lets the
+              # job exit green and the escalation hides behind a passing check.
+              TITLE="Upstream sync needs manual resolution"
+              BODY="$(printf 'sync-upstream.sh stopped with result=%s (non-deterministic conflict or build failure) on %s.\n\nResolve locally:\n\n    bash .github/scripts/sync-upstream.sh\n\nRun logs (conflicting paths): %s/%s/actions/runs/%s' \
+                "${RESULT:-<none>}" "$(date +%Y-%m-%d)" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")"
+              EXISTING="$(gh issue list --state open --limit 100 --json number,title \
+                --jq "map(select(.title == \"$TITLE\")) | .[0].number // empty")"
+              if [ -n "$EXISTING" ]; then
+                gh issue comment "$EXISTING" --body "$BODY"
+                echo "Updated existing escalation issue #$EXISTING"
+              else
+                gh issue create --title "$TITLE" --body "$BODY"
+              fi
+              echo "::error::Upstream sync is stuck (result=${RESULT:-<none>}) — see the escalation issue."
+              exit 1
               ;;
           esac
