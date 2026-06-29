@@ -10,11 +10,19 @@ import { hasFormatOfType } from "./format-utils";
 import { TransportableError } from "./error";
 import { FeatureFlag } from "../scraper/scrapeURL/engines";
 import { isUrlBlocked } from "../scraper/WebScraper/utils/blocklist";
+import {
+  DataLayerScrapeMetadata,
+  getDataLayerSuccessCredits,
+} from "./data-layer";
 
 const creditsPerPDFPage = 1;
 const stealthProxyCostBonus = 4;
 const unblockedDomainCostBonus = 4;
 const xTwitterCostBonus = 29;
+const redactPIICostBonus = 4;
+// Each additional PDF page also gets redacted through fire-privacy, so
+// the per-page surcharge mirrors the +4 base — same tier as lockdown.
+const redactPIIPdfPageCostBonus = 4;
 
 export async function calculateCreditsToBeBilled(
   options: ScrapeOptions,
@@ -24,6 +32,7 @@ export async function calculateCreditsToBeBilled(
   flags: TeamFlags,
   error?: Error | null,
   unsupportedFeatures?: Set<FeatureFlag>,
+  dataLayer?: DataLayerScrapeMetadata,
 ) {
   const costTrackingJSON: ReturnType<typeof CostTracking.prototype.toJSON> =
     costTracking instanceof CostTracking ? costTracking.toJSON() : costTracking;
@@ -51,6 +60,14 @@ export async function calculateCreditsToBeBilled(
     return creditsToBeBilled;
   }
 
+  const dataLayerCredits = getDataLayerSuccessCredits({
+    dataLayer,
+    statusCode: document.metadata?.statusCode,
+  });
+  if (dataLayerCredits !== null) {
+    return dataLayerCredits;
+  }
+
   let creditsToBeBilled = 1; // Assuming 1 credit per document
 
   if (options.lockdown) {
@@ -66,6 +83,17 @@ export async function calculateCreditsToBeBilled(
     changeTrackingFormat?.modes?.includes("json")
   ) {
     creditsToBeBilled = 5;
+  }
+
+  if (hasFormatOfType(options.formats, "deterministicJson")) {
+    // 10 when this run generated the extractor script, 3 when it reused a
+    // cached one. The codegen call is tagged in deterministicJson/llm/client.ts.
+    const generatedScript = costTrackingJSON.calls?.some(
+      call =>
+        call.metadata?.module === "deterministic-json" &&
+        call.metadata?.role === "codegen",
+    );
+    creditsToBeBilled = generatedScript ? 10 : 3;
   }
 
   if (
@@ -103,12 +131,25 @@ export async function calculateCreditsToBeBilled(
   }
 
   const shouldParse = shouldParsePDF(options.parsers);
-  if (
+  const extraPdfPages =
     shouldParse &&
     document.metadata?.numPages !== undefined &&
     document.metadata.numPages > 1
-  ) {
-    creditsToBeBilled += creditsPerPDFPage * (document.metadata.numPages - 1);
+      ? document.metadata.numPages - 1
+      : 0;
+  if (extraPdfPages > 0) {
+    creditsToBeBilled += creditsPerPDFPage * extraPdfPages;
+  }
+
+  if (options.redactPII) {
+    // Flat +4 to match lockdown / audio / video / stealth — fire-privacy
+    // is a peer premium feature, not a cost-based one. PDF pages all
+    // pass through redaction too, so each additional page picks up
+    // another +4 on top of the +1 page parse cost.
+    creditsToBeBilled += redactPIICostBonus;
+    if (extraPdfPages > 0) {
+      creditsToBeBilled += redactPIIPdfPageCostBonus * extraPdfPages;
+    }
   }
 
   if (

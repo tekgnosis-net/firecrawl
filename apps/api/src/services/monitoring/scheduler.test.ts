@@ -1,3 +1,4 @@
+import type { MockedFunction } from "vitest";
 import { addMonitorCheckJob } from "./queue";
 import { enqueueDueMonitorChecks } from "./scheduler";
 import { isMonitorCheckStale } from "./stale";
@@ -12,64 +13,64 @@ import {
 } from "./store";
 import { autumnService } from "../autumn/autumn.service";
 
-jest.mock("./queue", () => ({
-  addMonitorCheckJob: jest.fn(),
+vi.mock("./queue", () => ({
+  addMonitorCheckJob: vi.fn(),
 }));
 
-jest.mock("./store", () => ({
-  advanceMonitorAfterSkippedCheck: jest.fn(),
-  claimDueMonitors: jest.fn(),
-  createMonitorCheck: jest.fn(),
-  dispatchScheduledMonitorCheck: jest.fn(),
-  getMonitorCheck: jest.fn(),
-  updateMonitorCheck: jest.fn(),
-  updateMonitorScheduleAfterRun: jest.fn(),
+vi.mock("./store", () => ({
+  advanceMonitorAfterSkippedCheck: vi.fn(),
+  claimDueMonitors: vi.fn(),
+  createMonitorCheck: vi.fn(),
+  dispatchScheduledMonitorCheck: vi.fn(),
+  getMonitorCheck: vi.fn(),
+  updateMonitorCheck: vi.fn(),
+  updateMonitorScheduleAfterRun: vi.fn(),
 }));
 
-jest.mock("./stale", () => ({
-  isMonitorCheckStale: jest.fn(),
+vi.mock("./stale", () => ({
+  isMonitorCheckStale: vi.fn(),
   MONITOR_CHECK_STALE_ERROR:
     "Monitor check exceeded the 1 hour running timeout.",
 }));
 
-jest.mock("../autumn/autumn.service", () => ({
+vi.mock("../autumn/autumn.service", () => ({
   autumnService: {
-    finalizeCreditsLock: jest.fn(),
+    finalizeCreditsLock: vi.fn(),
   },
 }));
 
-const mockAddMonitorCheckJob = addMonitorCheckJob as jest.MockedFunction<
+const mockAddMonitorCheckJob = addMonitorCheckJob as MockedFunction<
   typeof addMonitorCheckJob
 >;
-const mockClaimDueMonitors = claimDueMonitors as jest.MockedFunction<
+const mockClaimDueMonitors = claimDueMonitors as MockedFunction<
   typeof claimDueMonitors
 >;
-const mockCreateMonitorCheck = createMonitorCheck as jest.MockedFunction<
+const mockCreateMonitorCheck = createMonitorCheck as MockedFunction<
   typeof createMonitorCheck
 >;
 const mockDispatchScheduledMonitorCheck =
-  dispatchScheduledMonitorCheck as jest.MockedFunction<
+  dispatchScheduledMonitorCheck as MockedFunction<
     typeof dispatchScheduledMonitorCheck
   >;
-const mockGetMonitorCheck = getMonitorCheck as jest.MockedFunction<
+const mockGetMonitorCheck = getMonitorCheck as MockedFunction<
   typeof getMonitorCheck
 >;
-const mockIsMonitorCheckStale = isMonitorCheckStale as jest.MockedFunction<
+const mockIsMonitorCheckStale = isMonitorCheckStale as MockedFunction<
   typeof isMonitorCheckStale
 >;
 const mockFinalizeCreditsLock =
-  autumnService.finalizeCreditsLock as jest.MockedFunction<
+  autumnService.finalizeCreditsLock as MockedFunction<
     typeof autumnService.finalizeCreditsLock
   >;
-const mockUpdateMonitorCheck = updateMonitorCheck as jest.MockedFunction<
+const mockUpdateMonitorCheck = updateMonitorCheck as MockedFunction<
   typeof updateMonitorCheck
 >;
 const mockAdvanceMonitorAfterSkippedCheck =
-  advanceMonitorAfterSkippedCheck as jest.MockedFunction<
+  advanceMonitorAfterSkippedCheck as MockedFunction<
     typeof advanceMonitorAfterSkippedCheck
   >;
 const mockUpdateMonitorScheduleAfterRun =
-  updateMonitorScheduleAfterRun as jest.MockedFunction<
+  updateMonitorScheduleAfterRun as MockedFunction<
     typeof updateMonitorScheduleAfterRun
   >;
 
@@ -79,11 +80,14 @@ describe("monitoring scheduler", () => {
     team_id: "team-1",
     current_check_id: null,
     next_run_at: "2026-05-05T18:45:00.000Z",
+    schedule_cron: "0 9 * * *",
+    schedule_timezone: "UTC",
+    targets: [{ id: "t-1", type: "scrape" }],
   } as any;
   const check = { id: "check-1" } as any;
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
     mockClaimDueMonitors.mockResolvedValue([monitor]);
     mockCreateMonitorCheck.mockResolvedValue(check);
     mockDispatchScheduledMonitorCheck.mockResolvedValue(true);
@@ -109,14 +113,36 @@ describe("monitoring scheduler", () => {
       monitor,
       checkId: check.id,
     });
-    expect(mockAddMonitorCheckJob).toHaveBeenCalledWith({
-      monitorId: monitor.id,
-      checkId: check.id,
-      teamId: monitor.team_id,
-    });
+    expect(mockAddMonitorCheckJob).toHaveBeenCalledWith(
+      {
+        monitorId: monitor.id,
+        checkId: check.id,
+        teamId: monitor.team_id,
+      },
+      { search: false },
+    );
     expect(
       mockDispatchScheduledMonitorCheck.mock.invocationCallOrder[0],
     ).toBeLessThan(mockAddMonitorCheckJob.mock.invocationCallOrder[0]);
+  });
+
+  it("routes a search monitor to the dedicated search queue", async () => {
+    mockClaimDueMonitors.mockResolvedValue([
+      { ...monitor, targets: [{ id: "t-1", type: "search" }] } as any,
+    ]);
+
+    await expect(
+      enqueueDueMonitorChecks({ workerId: "worker-1" }),
+    ).resolves.toBe(1);
+
+    expect(mockAddMonitorCheckJob).toHaveBeenCalledWith(
+      {
+        monitorId: monitor.id,
+        checkId: check.id,
+        teamId: monitor.team_id,
+      },
+      { search: true },
+    );
   });
 
   it("fails and clears a dispatched check when enqueueing fails", async () => {
@@ -193,10 +219,13 @@ describe("monitoring scheduler", () => {
       trigger: "scheduled",
       scheduledFor: monitorWithCurrentCheck.next_run_at,
     });
-    expect(mockAddMonitorCheckJob).toHaveBeenCalledWith({
-      monitorId: monitorWithCurrentCheck.id,
-      checkId: check.id,
-      teamId: monitorWithCurrentCheck.team_id,
-    });
+    expect(mockAddMonitorCheckJob).toHaveBeenCalledWith(
+      {
+        monitorId: monitorWithCurrentCheck.id,
+        checkId: check.id,
+        teamId: monitorWithCurrentCheck.team_id,
+      },
+      { search: false },
+    );
   });
 });

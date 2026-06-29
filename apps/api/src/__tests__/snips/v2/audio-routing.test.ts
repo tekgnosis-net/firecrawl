@@ -4,27 +4,30 @@
  * audio postprocessing so browser cookies are available for avgrab.
  */
 
-// Avoid jest ESM-parse issues on transitive `uuid` import when pulling in engines.
-jest.mock("uuid", () => ({
-  v4: () => "test-uuid-v4",
-  v7: () => "test-uuid-v7",
-  validate: () => true,
-}));
-
 describe("Audio format engine routing (buildFallbackList)", () => {
-  let buildFallbackList: typeof import("../../../scraper/scrapeURL/engines").buildFallbackList;
+  let buildFallbackList: typeof import("../../../scraper/scrapeURL/engines/index.js").buildFallbackList;
+  let clearDataLayerCapabilitiesForTest: typeof import("../../../lib/data-layer.js").clearDataLayerCapabilitiesForTest;
+  let setDataLayerCapabilitiesForTest: typeof import("../../../lib/data-layer.js").setDataLayerCapabilitiesForTest;
 
   const originalFireEngineUrl = process.env.FIRE_ENGINE_BETA_URL;
-  const originalIndexUrl = process.env.INDEX_SUPABASE_URL;
+  const originalIndexUrl = process.env.INDEX_DATABASE_URL;
 
-  beforeAll(() => {
+  beforeAll(async () => {
     process.env.FIRE_ENGINE_BETA_URL = "http://test-fire-engine";
-    process.env.INDEX_SUPABASE_URL = "http://test-index-supabase";
+    process.env.INDEX_DATABASE_URL =
+      "postgresql://postgres:postgres@localhost:5432/postgres";
 
-    jest.isolateModules(() => {
-      buildFallbackList =
-        require("../../../scraper/scrapeURL/engines").buildFallbackList;
-    });
+    // Re-import engines fresh so it reads the env vars set above at eval time.
+    vi.resetModules();
+    ({ buildFallbackList } = await import(
+      "../../../scraper/scrapeURL/engines/index.js"
+    ));
+    ({ clearDataLayerCapabilitiesForTest, setDataLayerCapabilitiesForTest } =
+      await import("../../../lib/data-layer.js"));
+  });
+
+  afterEach(() => {
+    clearDataLayerCapabilitiesForTest();
   });
 
   afterAll(() => {
@@ -34,9 +37,9 @@ describe("Audio format engine routing (buildFallbackList)", () => {
       process.env.FIRE_ENGINE_BETA_URL = originalFireEngineUrl;
     }
     if (originalIndexUrl === undefined) {
-      delete process.env.INDEX_SUPABASE_URL;
+      delete process.env.INDEX_DATABASE_URL;
     } else {
-      process.env.INDEX_SUPABASE_URL = originalIndexUrl;
+      process.env.INDEX_DATABASE_URL = originalIndexUrl;
     }
   });
 
@@ -52,11 +55,11 @@ describe("Audio format engine routing (buildFallbackList)", () => {
       featureFlags: new Set(featureFlags),
       mock: null,
       logger: {
-        info: jest.fn(),
-        warn: jest.fn(),
-        debug: jest.fn(),
-        error: jest.fn(),
-        child: jest.fn().mockReturnThis(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        debug: vi.fn(),
+        error: vi.fn(),
+        child: vi.fn().mockReturnThis(),
       },
     }) as any;
 
@@ -113,5 +116,22 @@ describe("Audio format engine routing (buildFallbackList)", () => {
     const engines = fallback.map(f => f.engine);
 
     expect(engines).toContain("fire-engine;chrome-cdp");
+  });
+
+  it("does not route agent index-only requests through the data layer", async () => {
+    setDataLayerCapabilitiesForTest({
+      domains: ["profiles.example"],
+    });
+
+    const meta = buildStubMeta([]);
+    meta.url = "https://profiles.example/person/example-person";
+    meta.options.formats = [{ type: "markdown" }];
+    meta.internalOptions.agentIndexOnly = true;
+    meta.internalOptions.teamFlags = { enrichBeta: true };
+
+    const fallback = await buildFallbackList(meta);
+    const engines = fallback.map(f => f.engine);
+
+    expect(engines).toEqual(["index", "index;documents"]);
   });
 });

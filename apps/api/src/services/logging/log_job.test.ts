@@ -1,52 +1,55 @@
-import { jest } from "@jest/globals";
+import { vi } from "vitest";
 
-const captureException = jest.fn();
-jest.mock("@sentry/node", () => ({
+// vi.mock is hoisted; anything its factories reference must be created in
+// vi.hoisted() (also hoisted). Under Jest these worked because importing `jest`
+// from @jest/globals disables jest.mock hoisting.
+const { captureException, logger, values, insert } = vi.hoisted(() => {
+  const logger: any = {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+    child: vi.fn(() => logger),
+  };
+  const values = vi.fn<(data: any) => Promise<void>>();
+  const insert = vi.fn(() => ({ values }));
+  return { captureException: vi.fn(), logger, values, insert };
+});
+
+vi.mock("@sentry/node", () => ({
   captureException,
 }));
 
-jest.mock("../../config", () => ({
+vi.mock("../../config", () => ({
   config: {
     GCS_BUCKET_NAME: undefined,
     USE_DB_AUTHENTICATION: true,
   },
 }));
 
-const logger = {
-  info: jest.fn(),
-  warn: jest.fn(),
-  error: jest.fn(),
-  debug: jest.fn(),
-  child: jest.fn(() => logger),
-};
-jest.mock("../../lib/logger", () => ({
+vi.mock("../../lib/logger", () => ({
   logger,
 }));
 
-const insert = jest.fn<(data: any) => Promise<{ error: any }>>();
-const from = jest.fn(() => ({
-  insert,
-}));
-jest.mock("../supabase", () => ({
-  supabase_service: {
-    from,
-  },
+vi.mock("../../db/connection", () => ({
+  db: { insert },
 }));
 
-jest.mock("../../lib/gcs-jobs", () => ({
-  saveDeepResearchToGCS: jest.fn(),
-  saveExtractToGCS: jest.fn(),
-  saveLlmsTxtToGCS: jest.fn(),
-  saveMapToGCS: jest.fn(),
-  saveScrapeToGCS: jest.fn(),
-  saveSearchToGCS: jest.fn(),
+vi.mock("../../lib/gcs-jobs", () => ({
+  saveDeepResearchToGCS: vi.fn(),
+  saveExtractToGCS: vi.fn(),
+  saveLlmsTxtToGCS: vi.fn(),
+  saveMapToGCS: vi.fn(),
+  saveScrapeToGCS: vi.fn(),
+  saveSearchToGCS: vi.fn(),
 }));
 
-jest.mock("../../lib/extract/extract-redis", () => ({
-  saveExtractResult: jest.fn(),
+vi.mock("../../lib/extract/extract-redis", () => ({
+  saveExtractResult: vi.fn(),
 }));
 
 import { logSearch, type LoggedSearch } from "./log_job";
+import * as schema from "../../db/schema";
 
 function makeSearch(overrides: Partial<LoggedSearch> = {}): LoggedSearch {
   return {
@@ -70,8 +73,8 @@ function makeSearch(overrides: Partial<LoggedSearch> = {}): LoggedSearch {
 
 describe("logSearch", () => {
   beforeEach(() => {
-    jest.clearAllMocks();
-    insert.mockResolvedValue({ error: null });
+    vi.clearAllMocks();
+    values.mockResolvedValue(undefined);
   });
 
   it("removes null bytes from search query log fields", async () => {
@@ -85,8 +88,8 @@ describe("logSearch", () => {
 
     await logSearch(search);
 
-    expect(from).toHaveBeenCalledWith("searches");
-    const inserted = insert.mock.calls[0][0];
+    expect(insert).toHaveBeenCalledWith(schema.searches);
+    const inserted = values.mock.calls[0][0];
     expect(inserted.query).toBe("helloworld");
     expect(inserted.options.query).toBe("nestedquery");
     expect(inserted.options.sources[0].location).toBe("New\u0000York");
@@ -94,12 +97,11 @@ describe("logSearch", () => {
   });
 
   it("uses sanitized data in Sentry insert failure context", async () => {
-    insert.mockResolvedValueOnce({
-      error: {
+    values.mockRejectedValueOnce(
+      Object.assign(new Error("unsupported Unicode escape sequence"), {
         code: "22P05",
-        message: "unsupported Unicode escape sequence",
-      },
-    });
+      }),
+    );
 
     await logSearch(
       makeSearch({

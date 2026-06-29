@@ -70,6 +70,7 @@ class FirecrawlClientTest {
                 .onlyMainContent(true)
                 .timeout(30000)
                 .mobile(false)
+                .redactPII(true)
                 .build();
 
         assertEquals(List.of("markdown", "html", "video", queryFormat), options.getFormats());
@@ -78,6 +79,7 @@ class FirecrawlClientTest {
         assertTrue(options.getOnlyMainContent());
         assertEquals(30000, options.getTimeout());
         assertFalse(options.getMobile());
+        assertTrue(options.getRedactPII());
     }
 
     @Test
@@ -134,6 +136,7 @@ class FirecrawlClientTest {
         ScrapeOptions original = ScrapeOptions.builder()
                 .formats(List.of("markdown"))
                 .timeout(5000)
+                .redactPII(true)
                 .build();
 
         ScrapeOptions modified = original.toBuilder()
@@ -143,6 +146,7 @@ class FirecrawlClientTest {
         assertEquals(5000, original.getTimeout());
         assertEquals(10000, modified.getTimeout());
         assertEquals(List.of("markdown"), modified.getFormats());
+        assertTrue(modified.getRedactPII());
     }
 
     @Test
@@ -237,6 +241,83 @@ class FirecrawlClientTest {
                         .formats(List.of("video"))
                         .build()
         );
+    }
+
+    @Test
+    void testParseOptionsRejectsProductFormat() {
+        assertThrows(IllegalArgumentException.class, () ->
+                ParseOptions.builder()
+                        .formats(List.of("product"))
+                        .build()
+        );
+    }
+
+    @Test
+    void testParseOptionsRejectsMenuFormat() {
+        assertThrows(IllegalArgumentException.class, () ->
+                ParseOptions.builder()
+                        .formats(List.of("menu"))
+                        .build()
+        );
+    }
+
+    @Test
+    void testDocumentDeserializesMenu() throws Exception {
+        String json = "{\"menu\":{"
+                + "\"isMenu\":true,"
+                + "\"confidence\":0.9,"
+                + "\"currency\":\"USD\","
+                + "\"sourceUrl\":\"https://example.com/menu\","
+                + "\"merchant\":{\"name\":\"Joe's Diner\",\"type\":\"restaurant\",\"location\":{\"city\":\"NYC\"}},"
+                + "\"sections\":[{"
+                + "\"id\":\"sec-1\",\"name\":\"Mains\",\"description\":\"Hearty plates\",\"items\":[{"
+                + "\"id\":\"item-1\",\"name\":\"Burger\",\"description\":\"Beef burger\","
+                + "\"images\":[{\"url\":\"https://example.com/burger.jpg\",\"alt\":\"Burger\"}],"
+                + "\"price\":{\"amount\":12.5,\"currency\":\"USD\",\"formatted\":\"$12.50\"},"
+                + "\"availability\":{\"inStock\":true,\"text\":\"Available\"},"
+                + "\"dietary\":[\"halal\"],\"calories\":800,"
+                + "\"optionGroups\":[{\"name\":\"Cheese\"}],"
+                + "\"identifiers\":{\"merchantItemId\":\"sku-99\"},"
+                + "\"url\":\"https://example.com/menu#burger\","
+                + "\"sourceUrl\":\"https://example.com/menu\""
+                + "}]}]}}";
+
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        Document doc = mapper.readValue(json, Document.class);
+
+        Menu menu = doc.getMenu();
+        assertNotNull(menu);
+        assertTrue(menu.isMenu());
+        assertEquals(0.9, menu.getConfidence());
+        assertEquals("USD", menu.getCurrency());
+        assertEquals("https://example.com/menu", menu.getSourceUrl());
+        assertEquals("Joe's Diner", menu.getMerchant().getName());
+        assertEquals("restaurant", menu.getMerchant().getType());
+
+        assertEquals(1, menu.getSections().size());
+        MenuSection section = menu.getSections().get(0);
+        assertEquals("sec-1", section.getId());
+        assertEquals("Mains", section.getName());
+
+        MenuItem item = section.getItems().get(0);
+        assertEquals("Burger", item.getName());
+        assertEquals(12.5, item.getPrice().getAmount());
+        assertTrue(item.getAvailability().isInStock());
+        assertEquals(List.of("halal"), item.getDietary());
+        assertEquals(800.0, item.getCalories());
+        assertEquals("https://example.com/burger.jpg", item.getImages().get(0).getUrl());
+        assertEquals("sku-99", item.getIdentifiers().getMerchantItemId());
+        assertEquals("https://example.com/menu", item.getSourceUrl());
+    }
+
+    @Test
+    void testParseOptionsBuilderSupportsRedactPII() {
+        ParseOptions options = ParseOptions.builder()
+                .formats(List.of("markdown"))
+                .redactPII(true)
+                .build();
+
+        assertTrue(options.getRedactPII());
     }
 
     // ================================================================

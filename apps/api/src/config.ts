@@ -9,20 +9,11 @@ const delimitedList = (separator = ",") => {
   });
 };
 
-// Ethereum address schema: validates 0x followed by 40 hex characters
-const ethereumAddress = z
-  .string()
-  .transform(s => s.trim())
-  .pipe(
-    z.union([
-      z.literal(""), // Allow empty string (treated as undefined below)
-      z
-        .string()
-        .regex(/^0x[a-fA-F0-9]{40}$/, "Invalid Ethereum address format"),
-    ]),
-  )
-  .transform(s => (s === "" ? undefined : (s as `0x${string}`)))
-  .optional();
+const emptyStringAsUndefined = <T extends z.ZodTypeAny>(schema: T) =>
+  z.preprocess(value => (value === "" ? undefined : value), schema.optional());
+
+const emptyStringAsDefault = <T extends z.ZodTypeAny>(schema: T) =>
+  z.preprocess(value => (value === "" ? undefined : value), schema);
 
 /* Schema */
 const configSchema = z.object({
@@ -44,6 +35,20 @@ const configSchema = z.object({
   // Express
   EXPRESS_TRUST_PROXY: z.coerce.number().optional(),
 
+  // Keyless free tier (scrape/search/interact without an API key, per-IP/day).
+  // Non-negative integers; 0 means "enabled but no budget", unset means "off".
+  KEYLESS_CREDITS_PER_DAY: z.coerce.number().int().nonnegative().optional(),
+  KEYLESS_REQUESTS_PER_DAY: z.coerce.number().int().nonnegative().optional(),
+  // Shared secret that lets a trusted proxy (e.g. the hosted MCP server)
+  // forward the real client IP for keyless rate-limiting via the
+  // `x-firecrawl-keyless-ip` header. Untrusted callers can't override their IP.
+  KEYLESS_PROXY_SECRET: z.string().optional(),
+  // Optional Spur Context API token (https://docs.spur.us/context-api). When
+  // set, keyless requests have their client IP checked against Spur and are
+  // refused if the IP fronts anonymizing/rotating infrastructure (VPN/proxy/
+  // TOR). Unset disables the check entirely (keyless behaves as before).
+  SPUR_API_KEY: z.string().optional(),
+
   // API Keys & Authentication
   BULL_AUTH_KEY: z.string().optional(),
   OPENAI_API_KEY: z.string().optional(),
@@ -53,8 +58,6 @@ const configSchema = z.object({
   LLAMAPARSE_API_KEY: z.string().optional(),
   STRIPE_SECRET_KEY: z.string().optional(),
   AUTUMN_SECRET_KEY: z.string().optional(),
-  AUTUMN_REQUEST_TRACK_EXPERIMENT: z.string().optional(),
-  AUTUMN_REQUEST_TRACK_EXPERIMENT_PERCENT: z.coerce.number().default(100),
   RESEND_API_KEY: z.string().optional(),
   PREVIEW_TOKEN: z.string().optional(),
   SEARCH_PREVIEW_TOKEN: z.string().optional(),
@@ -65,6 +68,9 @@ const configSchema = z.object({
     .int()
     .nonnegative()
     .default(100),
+  FEEDBACK_MAX_AGE_SEC: z.coerce.number().int().positive().default(120),
+  FEEDBACK_DAILY_CAP_CREDITS: z.coerce.number().int().nonnegative().default(50),
+  FEEDBACK_REFUND_ENABLED: z.stringbool().default(true),
 
   // OAuth token introspection
   OAUTH_INTROSPECT_URL: z.string().optional(),
@@ -81,21 +87,34 @@ const configSchema = z.object({
   POSTGRES_DB: z.string().default("postgres"),
   POSTGRES_USER: z.string().default("postgres"),
   POSTGRES_PASSWORD: z.string().default("postgres"),
+  DATABASE_URL: z.string().optional(),
+  DATABASE_REPLICA_URL: z.string().optional(),
+  INDEX_DATABASE_URL: z.string().optional(),
+  INDEX_CACHE_REDIS_URL: z.string().optional(),
+  // Negative (miss) caching TTL for index URL->id lookups, in ms. 0 disables
+  // it; the cache then only shields lookups that find data. A positive value
+  // (e.g. 600000 = 10min) also short-circuits repeat lookups for URLs with no
+  // index entry. Kept short so any missed cache-clear self-heals quickly.
+  INDEX_CACHE_NEGATIVE_TTL_MS: z.coerce.number().default(0),
   REDIS_URL: z.string().optional(),
   REDIS_EVICT_URL: z.string().optional(),
   REDIS_RATE_LIMIT_URL: z.string().optional(),
   NUQ_DATABASE_URL: z.string().optional(),
   NUQ_DATABASE_URL_LISTEN: z.string().optional(),
   NUQ_RABBITMQ_URL: z.string().optional(),
-
-  // Supabase
-  SUPABASE_URL: z.string().optional(),
-  SUPABASE_ANON_TOKEN: z.string().optional(),
-  SUPABASE_SERVICE_TOKEN: z.string().optional(),
-  SUPABASE_REPLICA_URL: z.string().optional(),
-  INDEX_SUPABASE_URL: z.string().optional(),
-  INDEX_SUPABASE_SERVICE_TOKEN: z.string().optional(),
-  SEARCH_INDEX_SUPABASE_URL: z.string().optional(),
+  FDB_CLUSTER_FILE: emptyStringAsUndefined(z.string()),
+  NUQ_BACKEND: emptyStringAsUndefined(z.enum(["pg", "fdb"])),
+  NUQ_FDB_READY_SHARDS: emptyStringAsDefault(
+    z.coerce.number().int().positive().default(2048),
+  ),
+  // 1 = strict (priority, FIFO) promotion order per team; raise for teams with
+  // extreme finish rates at the cost of approximate cross-shard ordering
+  NUQ_FDB_TEAM_PENDING_SHARDS: emptyStringAsDefault(
+    z.coerce.number().int().positive().default(1),
+  ),
+  NUQ_FDB_TIME_BUCKETS: emptyStringAsDefault(
+    z.coerce.number().int().positive().default(16),
+  ),
 
   // Google Cloud Storage
   GCS_BUCKET_NAME: z.string().optional(),
@@ -103,10 +122,21 @@ const configSchema = z.object({
   GCS_FIRE_ENGINE_BUCKET_NAME: z.string().optional(),
   GCS_INDEX_BUCKET_NAME: z.string().optional(),
   GCS_MEDIA_BUCKET_NAME: z.string().optional(),
+  GCS_SCREENSHOT_RESIGN_BEFORE: emptyStringAsUndefined(z.string().datetime()),
+  GCS_PARSE_UPLOAD_BUCKET_NAME: z.string().optional(),
+  PARSE_UPLOAD_STORAGE_DRIVER: z.enum(["local", "gcs"]).optional(),
+  PARSE_UPLOAD_REF_SECRET: emptyStringAsUndefined(z.string().trim().min(1)),
+  PARSE_UPLOAD_PUBLIC_BASE_URL: z.string().url().optional(),
 
   // ClickHouse (Search Analytics)
   CLICKHOUSE_ANALYTICS_URL: z.string().optional(),
   CLICKHOUSE_ANALYTICS_DATABASE: z.string().optional(),
+
+  // Search highlights (beta): query-highlights model service. URL is the base
+  // (e.g. https://firecrawl--query-highlights.modal.run); TOKEN is the bearer
+  // token sent on every request.
+  HIGHLIGHT_MODEL_URL: z.string().optional(),
+  HIGHLIGHT_MODEL_TOKEN: z.string().optional(),
 
   // Fire Engine
   FIRE_ENGINE_BETA_URL: z.string().optional(),
@@ -147,6 +177,7 @@ const configSchema = z.object({
   NUQ_WORKER_COUNT: z.coerce.number().default(5),
   NUQ_PREFETCH_WORKER_PORT: z.coerce.number().default(3011).catch(3011), // todo: investigate why .catch is needed
   NUQ_RECONCILER_WORKER_PORT: z.coerce.number().default(3012).catch(3012),
+  CCLOG_WORKER_PORT: z.coerce.number().default(3013).catch(3013),
   EXTRACT_WORKER_PORT: z.coerce.number().default(3004),
   NUQ_WAIT_MODE: z.string().optional(),
 
@@ -241,12 +272,6 @@ const configSchema = z.object({
   BACKGROUND_INDEX_TEAM_ID: z.string().optional(),
   PRECRAWL_TEAM_ID: z.string().optional(),
 
-  // Payment (x402)
-  X402_ENDPOINT_PRICE_USD: z.string().optional(),
-  X402_NETWORK: z.string().optional(),
-  X402_PAY_TO_ADDRESS: ethereumAddress,
-  X402_FACILITATOR_URL: z.string().url().optional(),
-
   // System
   MAX_CPU: z.coerce.number().default(0.8),
   MAX_RAM: z.coerce.number().default(0.8),
@@ -269,6 +294,7 @@ const configSchema = z.object({
   GITHUB_REF_NAME: z.string().optional(),
   RESTRICTED_COUNTRIES: delimitedList(",").optional(),
   DISABLE_ENGPICKER: z.stringbool().optional(),
+  DISABLE_MONITORING: z.stringbool().default(false),
 
   EXTRACT_V3_BETA_URL: z.string().optional(),
   AGENT_INTEROP_SECRET: z.string().optional(),
@@ -285,9 +311,25 @@ const configSchema = z.object({
   // Audio (avgrab)
   AVGRAB_SERVICE_URL: z.string().optional(),
 
+  // Product extraction (product-search Rust service)
+  PRODUCT_EXTRACTION_SERVICE_URL: z.string().optional(),
+
+  // Menu extraction (menu-search Rust service)
+  MENU_EXTRACTION_SERVICE_URL: z.string().optional(),
+
+  // PII Redaction (fire-privacy)
+  FIRE_PRIVACY_URL: z.string().optional(),
+  FIRE_PRIVACY_TIMEOUT_MS: z.coerce.number().int().positive().default(5000),
+
   NUQ_PREFETCH_WORKER_HEARTBEAT_URL: z.string().optional(),
 
   ZDRCLEANER_HEARTBEAT_URL: z.string().optional(),
+
+  // Deterministic JSON extraction (reusable-json-mode)
+  EXTRACT_CODEGEN_MODEL: z.string().default("gemini-3.1-flash-lite"),
+  EXTRACT_ANCHOR_MODEL: z.string().default("openai/gpt-oss-120b"),
+  EXTRACT_LIGHT_MODEL: z.string().default("openai/gpt-oss-20b"),
+  CODE_SANDBOX_URL: z.string().default("ws://code-sandbox:3001"),
 });
 
 export const config = configSchema.parse(process.env);

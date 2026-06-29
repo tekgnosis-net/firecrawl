@@ -1,5 +1,5 @@
 import { Request, Response } from "express";
-import { checkTeamCredits } from "../../../src/services/billing/credit_billing";
+import { autumnService } from "../../services/autumn/autumn.service";
 import { authenticateUser } from "../auth";
 import { RateLimiterMode } from "../../../src/types";
 import { addScrapeJob } from "../../../src/services/queue-jobs";
@@ -33,7 +33,10 @@ import { ZodError } from "zod";
 import { UNSUPPORTED_SITE_MESSAGE } from "../../lib/strings";
 import { fromV0ScrapeOptions } from "../v2/types";
 import { isSelfHosted } from "../../lib/deployment";
-import { crawlGroup } from "../../services/worker/nuq";
+import {
+  crawlGroup,
+  resolveNewGroupBackend,
+} from "../../services/worker/nuq-router";
 import { logRequest } from "../../services/logging/log_job";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
@@ -125,13 +128,14 @@ export async function crawlController(req: Request, res: Response) {
     }
 
     const limitCheck = req.body?.crawlerOptions?.limit ?? 1;
-    const {
-      success: creditsCheckSuccess,
-      message: creditsCheckMessage,
-      remainingCredits,
-    } = await checkTeamCredits(chunk, team_id, limitCheck);
+    // Autumn is the source of truth for credits.
+    const autumnResult = await autumnService.checkCredits({
+      teamId: team_id,
+      value: limitCheck,
+      properties: { source: "v0/crawl" },
+    });
 
-    if (!creditsCheckSuccess) {
+    if (autumnResult !== null && !autumnResult.allowed) {
       return res.status(402).json({
         error: isSelfHosted()
           ? "Insufficient credits. You may be requesting with a higher limit than the amount of credits you have left. Please check your server configuration."
@@ -139,7 +143,13 @@ export async function crawlController(req: Request, res: Response) {
       });
     }
 
-    // TODO: need to do this to v1
+    // When Autumn allows the request (incl. overage) we don't clamp the crawl
+    // limit, matching the v1/v2 middleware (which uses Infinity for remaining on
+    // allow). null = Autumn unavailable / self-hosted -> also no clamp.
+    const remainingCredits =
+      autumnResult === null || autumnResult.allowed
+        ? Infinity
+        : autumnResult.remaining;
     crawlerOptions.limit = Math.min(remainingCredits, crawlerOptions.limit);
 
     let url = urlSchema.parse(req.body.url);
@@ -225,10 +235,16 @@ export async function crawlController(req: Request, res: Response) {
       sc.robots = await crawler.getRobotsTxt();
     } catch (_) {}
 
+    sc.queueBackend = await resolveNewGroupBackend(sc.team_id);
     await crawlGroup.addGroup(
       id,
       sc.team_id,
       (chunk?.flags?.crawlTtlHours ?? 24) * 60 * 60 * 1000,
+      {
+        backend: sc.queueBackend,
+        maxConcurrency: sc.maxConcurrency,
+        delaySeconds: sc.crawlerOptions?.delay,
+      },
     );
 
     await saveCrawl(id, sc);

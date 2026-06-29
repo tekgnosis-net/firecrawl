@@ -56,6 +56,7 @@ public class ParseTests
             OnlyMainContent = true,
             Timeout = 30000,
             Proxy = "auto",
+            RedactPII = true,
         };
 
         var json = JsonSerializer.Serialize(options, FirecrawlHttpClient.JsonOptions);
@@ -63,6 +64,7 @@ public class ParseTests
         Assert.Contains("\"onlyMainContent\":true", json);
         Assert.Contains("\"timeout\":30000", json);
         Assert.Contains("\"proxy\":\"auto\"", json);
+        Assert.Contains("\"redactPII\":true", json);
     }
 
     [Fact]
@@ -75,6 +77,30 @@ public class ParseTests
 
         var ex = Assert.Throws<ArgumentException>(() => options.Validate());
         Assert.Contains("screenshot", ex.Message);
+    }
+
+    [Fact]
+    public void ParseOptions_Validate_RejectsProductFormat()
+    {
+        var options = new ParseOptions
+        {
+            Formats = new List<object> { "markdown", "product" }
+        };
+
+        var ex = Assert.Throws<ArgumentException>(() => options.Validate());
+        Assert.Contains("product", ex.Message);
+    }
+
+    [Fact]
+    public void ParseOptions_Validate_RejectsMenuFormat()
+    {
+        var options = new ParseOptions
+        {
+            Formats = new List<object> { "markdown", "menu" }
+        };
+
+        var ex = Assert.Throws<ArgumentException>(() => options.Validate());
+        Assert.Contains("menu", ex.Message);
     }
 
     [Fact]

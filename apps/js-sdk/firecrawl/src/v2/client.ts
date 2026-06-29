@@ -7,6 +7,7 @@ import {
 import { parse as parseMethod } from "./methods/parse";
 import { search } from "./methods/search";
 import { map as mapMethod } from "./methods/map";
+import { feedback as feedbackMethod, searchFeedback as searchFeedbackMethod } from "./methods/feedback";
 import {
   startCrawl,
   getCrawlStatus,
@@ -32,6 +33,7 @@ import {
   listBrowsers,
 } from "./methods/browser";
 import { getConcurrency, getCreditUsage, getQueueStatus, getTokenUsage, getCreditUsageHistorical, getTokenUsageHistorical } from "./methods/usage";
+import { ResearchClient } from "./methods/research";
 import {
   createMonitor as createMonitorMethod,
   deleteMonitor as deleteMonitorMethod,
@@ -49,6 +51,9 @@ import type {
   ScrapeOptions,
   SearchData,
   SearchRequest,
+  EndpointFeedbackRequest,
+  FeedbackResponse,
+  SearchFeedbackRequest,
   MapData,
   MapOptions,
   CrawlResponse,
@@ -119,6 +124,7 @@ export type FirecrawlClientInput = FirecrawlClientOptions | string;
 
 export class FirecrawlClient {
   private readonly http: HttpClient;
+  private _research?: ResearchClient;
 
   private isCloudService(url: string): boolean {
     return url.includes('api.firecrawl.dev');
@@ -135,9 +141,9 @@ export class FirecrawlClient {
     const apiKey = (opts.apiKey ?? process.env.FIRECRAWL_API_KEY ?? "").trim();
     const apiUrl = (opts.apiUrl ?? process.env.FIRECRAWL_API_URL ?? "https://api.firecrawl.dev").replace(/\/$/, "");
 
-    if (this.isCloudService(apiUrl) && !apiKey) {
-      throw new Error("API key is required for the cloud API. Set FIRECRAWL_API_KEY env or pass apiKey.");
-    }
+    // No API key is allowed: scrape, search, and interact fall back to the
+    // keyless free tier (rate-limited per IP). Other methods will return 401
+    // from the API until a key is provided.
 
     this.http = new HttpClient({
       apiKey,
@@ -232,6 +238,35 @@ export class FirecrawlClient {
    */
   async search(query: string, req: Omit<SearchRequest, "query"> = {}): Promise<SearchData> {
     return search(this.http, { query, ...req });
+  }
+
+  /**
+   * Submit feedback for a v2 job.
+   * @param request Feedback payload with endpoint, job id, rating, and supporting signals.
+   * @returns Feedback record and refund details.
+   */
+  async feedback(request: EndpointFeedbackRequest): Promise<FeedbackResponse> {
+    return feedbackMethod(this.http, request);
+  }
+
+  /**
+   * Submit feedback for a search job.
+   * @param jobId Search job id returned by search.
+   * @param request Search feedback payload.
+   * @returns Feedback record and refund details.
+   */
+  async searchFeedback(jobId: string, request: SearchFeedbackRequest): Promise<FeedbackResponse> {
+    return searchFeedbackMethod(this.http, jobId, request);
+  }
+
+  // Research
+  /**
+   * Access the v2 research endpoints (arXiv papers + GitHub history/readmes).
+   * Example: `firecrawl.research.searchPapers("diffusion models")`.
+   */
+  get research(): ResearchClient {
+    if (!this._research) this._research = new ResearchClient(this.http);
+    return this._research;
   }
 
   // Map
@@ -606,4 +641,3 @@ export class FirecrawlClient {
 }
 
 export default FirecrawlClient;
-

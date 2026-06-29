@@ -13,8 +13,9 @@ import {
   formatsRequestJsonExtraction,
 } from "./diff";
 import { judgeChange } from "./judgeChange";
+import type { LlmUsageLabels } from "./search/tuning";
 
-type MonitorPageDiffStatus = "same" | "new" | "changed";
+type MonitorPageDiffStatus = "same" | "new" | "changed" | "error";
 
 type Judgment = {
   meaningful: boolean;
@@ -36,6 +37,7 @@ type MonitorPageDiffResult = {
   judgment?: Judgment;
   diffText?: string;
   diffJson?: Record<string, { previous: unknown; current: unknown }>;
+  error?: string;
 };
 
 type PreviousPageRef = {
@@ -103,15 +105,17 @@ export async function computeAndPersistPageDiff(params: {
       ? (doc.json as Record<string, unknown>)
       : undefined;
 
-    // If the current scrape didn't produce a JSON document we can't
-    // compute a JSON diff; treat as `changed` to be safe (matches the
-    // markdown-missing branch's behavior).
+    // If the current scrape didn't produce a JSON document we can't compute a
+    // JSON diff (e.g. the extraction step failed) - report `error` rather than
+    // a false `changed`, so the user isn't alerted to a content change that
+    // didn't happen.
     if (!currentJson) {
       return {
-        status: "changed",
+        status: "error",
         diffGcsKey: null,
         diffTextBytes: null,
         diffJsonBytes: null,
+        error: "JSON extraction produced no result for this check.",
       };
     }
 
@@ -169,6 +173,7 @@ export async function computeAndPersistPageDiff(params: {
                 diffText: markdownSidecar.text,
               }
             : undefined,
+          labels: { teamId, monitorId, monitorCheckId: checkId },
         })
       : undefined;
     return {
@@ -232,6 +237,7 @@ export async function computeAndPersistPageDiff(params: {
         markdownDiff: {
           diffText: diff.text,
         },
+        labels: { teamId, monitorId, monitorCheckId: checkId },
       })
     : undefined;
   return {
@@ -251,6 +257,7 @@ async function runJudge(args: {
   markdownDiff?: {
     diffText?: string;
   };
+  labels: LlmUsageLabels;
 }): Promise<Judgment | undefined> {
   try {
     return await judgeChange({
@@ -259,6 +266,7 @@ async function runJudge(args: {
       extractionPrompt: args.extractionPrompt ?? undefined,
       jsonDiff: args.jsonDiff,
       markdownDiff: args.markdownDiff,
+      labels: args.labels,
     });
   } catch (error) {
     rootLogger.error("Judge call failed", { error });

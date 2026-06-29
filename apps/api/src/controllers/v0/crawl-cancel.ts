@@ -6,13 +6,18 @@ import { getCrawl, saveCrawl } from "../../../src/lib/crawl-redis";
 import * as Sentry from "@sentry/node";
 import { configDotenv } from "dotenv";
 import { redisEvictConnection } from "../../../src/services/redis";
-import { crawlGroup } from "../../services/worker/nuq";
+import { crawlGroup } from "../../services/worker/nuq-router";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
 configDotenv();
 
 export async function crawlCancelController(req: Request, res: Response) {
   try {
+    const jobId = req.params.jobId;
+    if (typeof jobId !== "string") {
+      return res.status(400).json({ error: "Invalid job ID" });
+    }
+
     const auth = await authenticateUser(req, res, RateLimiterMode.CrawlStatus);
     if (!auth.success) {
       if (auth.status === 401) applyAgentAuthDiscoveryHeader(res);
@@ -36,10 +41,7 @@ export async function crawlCancelController(req: Request, res: Response) {
     );
 
     redisEvictConnection
-      .sadd(
-        "teams_using_v0:" + team_id,
-        "crawl:" + req.params.jobId + ":cancel",
-      )
+      .sadd("teams_using_v0:" + team_id, "crawl:" + jobId + ":cancel")
       .catch(error =>
         logger.error("Failed to add team to teams_using_v0 (2)", {
           error,
@@ -47,7 +49,7 @@ export async function crawlCancelController(req: Request, res: Response) {
         }),
       );
 
-    const sc = await getCrawl(req.params.jobId);
+    const sc = await getCrawl(jobId);
     if (!sc) {
       return res.status(404).json({ error: "Job not found" });
     }
@@ -57,7 +59,7 @@ export async function crawlCancelController(req: Request, res: Response) {
       return res.status(403).json({ error: "Unauthorized" });
     }
 
-    const group = await crawlGroup.getGroup(req.params.jobId);
+    const group = await crawlGroup.getGroup(jobId);
     if (!group) {
       return res.status(404).json({ error: "Job not found" });
     }
@@ -68,9 +70,13 @@ export async function crawlCancelController(req: Request, res: Response) {
 
     try {
       sc.cancelled = true;
-      await saveCrawl(req.params.jobId, sc);
+      await saveCrawl(jobId, sc);
     } catch (error) {
       logger.error(error);
+    }
+
+    if (sc.queueBackend === "fdb") {
+      await crawlGroup.cancelGroup(jobId);
     }
 
     res.json({

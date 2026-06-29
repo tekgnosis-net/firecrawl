@@ -5,11 +5,11 @@ import { autumnHealthController } from "../controllers/v0/admin/autumn-health";
 import { authMiddleware, checkCreditsMiddleware, wrap } from "./shared";
 import { acucCacheClearController } from "../controllers/v0/admin/acuc-cache-clear";
 import { checkFireEngine } from "../controllers/v0/admin/check-fire-engine";
-import { cclogController } from "../controllers/v0/admin/cclog";
 import { indexQueuePrometheus } from "../controllers/v0/admin/index-queue-prometheus";
 import { triggerPrecrawl } from "../controllers/v0/admin/precrawl";
 import {
   metricsController,
+  nuqFdbMetricsController,
   nuqMetricsController,
 } from "../controllers/v0/admin/metrics";
 import { realtimeSearchController } from "../controllers/v2/f-search";
@@ -24,64 +24,69 @@ import { RateLimiterMode } from "../types";
 
 export const adminRouter = express.Router();
 
-adminRouter.get(
-  `/admin/${config.BULL_AUTH_KEY}/redis-health`,
-  redisHealthController,
-);
+if (config.BULL_AUTH_KEY) {
+  adminRouter.get(
+    `/admin/${config.BULL_AUTH_KEY}/redis-health`,
+    redisHealthController,
+  );
 
-adminRouter.get(
-  `/admin/${config.BULL_AUTH_KEY}/autumn-health`,
-  autumnHealthController,
-);
+  adminRouter.get(
+    `/admin/${config.BULL_AUTH_KEY}/autumn-health`,
+    autumnHealthController,
+  );
 
-adminRouter.post(
-  `/admin/${config.BULL_AUTH_KEY}/acuc-cache-clear`,
-  wrap(acucCacheClearController),
-);
+  adminRouter.post(
+    `/admin/${config.BULL_AUTH_KEY}/acuc-cache-clear`,
+    wrap(acucCacheClearController),
+  );
 
-adminRouter.get(
-  `/admin/${config.BULL_AUTH_KEY}/feng-check`,
-  wrap(checkFireEngine),
-);
+  adminRouter.get(
+    `/admin/${config.BULL_AUTH_KEY}/feng-check`,
+    wrap(checkFireEngine),
+  );
 
-adminRouter.get(`/admin/${config.BULL_AUTH_KEY}/cclog`, wrap(cclogController));
+  adminRouter.get(
+    `/admin/${config.BULL_AUTH_KEY}/index-queue-prometheus`,
+    wrap(indexQueuePrometheus),
+  );
 
-adminRouter.get(
-  `/admin/${config.BULL_AUTH_KEY}/index-queue-prometheus`,
-  wrap(indexQueuePrometheus),
-);
+  adminRouter.get(
+    `/admin/${config.BULL_AUTH_KEY}/precrawl`,
+    wrap(triggerPrecrawl),
+  );
 
-adminRouter.get(
-  `/admin/${config.BULL_AUTH_KEY}/precrawl`,
-  wrap(triggerPrecrawl),
-);
+  adminRouter.get(
+    `/admin/${config.BULL_AUTH_KEY}/metrics`,
+    wrap(metricsController),
+  );
 
-adminRouter.get(
-  `/admin/${config.BULL_AUTH_KEY}/metrics`,
-  wrap(metricsController),
-);
+  adminRouter.get(
+    `/admin/${config.BULL_AUTH_KEY}/nuq-metrics`,
+    wrap(nuqMetricsController),
+  );
 
-adminRouter.get(
-  `/admin/${config.BULL_AUTH_KEY}/nuq-metrics`,
-  wrap(nuqMetricsController),
-);
+  adminRouter.get(
+    `/admin/${config.BULL_AUTH_KEY}/nuq-fdb-metrics`,
+    wrap(nuqFdbMetricsController),
+  );
 
-adminRouter.post(
-  `/admin/${config.BULL_AUTH_KEY}/fsearch`,
-  wrap(realtimeSearchController),
-);
+  adminRouter.post(
+    `/admin/${config.BULL_AUTH_KEY}/fsearch`,
+    wrap(realtimeSearchController),
+  );
 
-adminRouter.post(
-  `/admin/${config.BULL_AUTH_KEY}/concurrency-queue-backfill`,
-  wrap(concurrencyQueueBackfillController),
-);
+  adminRouter.post(
+    `/admin/${config.BULL_AUTH_KEY}/concurrency-queue-backfill`,
+    wrap(concurrencyQueueBackfillController),
+  );
 
-adminRouter.post(
-  `/admin/${config.BULL_AUTH_KEY}/crawl-monitor`,
-  authMiddleware(RateLimiterMode.Crawl),
-  checkCreditsMiddleware(2),
-  wrap(crawlMonitorController),
-);
+  adminRouter.post(
+    `/admin/${config.BULL_AUTH_KEY}/crawl-monitor`,
+    authMiddleware(RateLimiterMode.Crawl),
+    checkCreditsMiddleware(2),
+    wrap(crawlMonitorController),
+  );
+}
 
 adminRouter.post(
   `/admin/integration/create-user`,

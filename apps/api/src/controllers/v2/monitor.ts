@@ -25,7 +25,10 @@ import {
   listMonitors,
   updateMonitor,
 } from "../../services/monitoring/store";
-import { enqueueMonitorCheck } from "../../services/monitoring/scheduler";
+import {
+  enqueueMonitorCheck,
+  monitorIsSearch,
+} from "../../services/monitoring/scheduler";
 import {
   estimateRunsPerMonth,
   validateMonitorCron,
@@ -294,6 +297,24 @@ export async function updateMonitorController(
   }
 
   const input = updateMonitorSchema.parse(req.body);
+
+  const mergedTargets = input.targets ?? existing.targets;
+  const mergedGoal = input.goal !== undefined ? input.goal : existing.goal;
+  const mergedJudgeEnabled =
+    input.judgeEnabled !== undefined
+      ? input.judgeEnabled
+      : existing.judge_enabled;
+  if (
+    mergedTargets.some(t => t.type === "search") &&
+    mergedJudgeEnabled !== false &&
+    (typeof mergedGoal !== "string" || mergedGoal.trim().length === 0)
+  ) {
+    return res.status(400).json({
+      success: false,
+      error: "A search target requires a non-empty goal",
+    });
+  }
+
   const cron = input.schedule?.cron ?? existing.schedule_cron;
   const timezone = input.schedule?.timezone ?? existing.schedule_timezone;
   let schedule;
@@ -355,7 +376,7 @@ export async function updateMonitorController(
     }),
   );
 
-  // Only re-sync when notification config actually changed.
+  // Only re-sync when notification config changed.
   let subscriptions: Awaited<
     ReturnType<typeof loadEmailRecipientSubscriptions>
   > = [];
@@ -422,6 +443,12 @@ export async function runMonitorController(
   if (!monitor) {
     return res.status(404).json({ success: false, error: "Monitor not found" });
   }
+  if (monitor.status === "paused") {
+    return res.status(409).json({
+      success: false,
+      error: "Monitor is paused. Resume it before running a check.",
+    });
+  }
   if (monitor.current_check_id) {
     return res.status(409).json({
       success: false,
@@ -438,6 +465,7 @@ export async function runMonitorController(
     monitorId: monitor.id,
     checkId: check.id,
     teamId: monitor.team_id,
+    search: monitorIsSearch(monitor),
   });
 
   res.status(200).json({
@@ -553,7 +581,7 @@ export async function getMonitorCheckController(
     if (totalPagesForFilter <= nextSkip) return undefined;
     const url = new URL(
       `/v2/monitor/${monitorId}/checks/${checkId}`,
-      `${req.protocol}://${req.get("host")}`,
+      `${req.protocol}://${req.host}`,
     );
     url.searchParams.set("skip", String(nextSkip));
     url.searchParams.set("limit", String(query.limit));
@@ -572,19 +600,22 @@ export async function getMonitorCheckController(
   });
 }
 
-// Unauthenticated POST endpoints — the token is the credential. Backs the
-// firecrawl-web confirm/unsubscribe pages; POST-only so passive GET scanners
-// can't consume tokens against the dashboard URL.
+// Unauthenticated: the token is the credential. POST-only so passive GET
+// scanners can't consume tokens via the dashboard URL.
 
 const emailActionBodySchema = z.object({
-  // 32-byte base64url is 43 chars; range leaves room for future formats.
+  // 32-byte base64url is 43 chars; range leaves room for other formats.
   token: z.string().min(16).max(64),
 });
 
 type EmailActionResponse =
   | {
       success: true;
-      result: "confirmed" | "already_confirmed" | "unsubscribed" | "already_unsubscribed";
+      result:
+        | "confirmed"
+        | "already_confirmed"
+        | "unsubscribed"
+        | "already_unsubscribed";
       email: string;
       monitorName: string | null;
     }
@@ -592,7 +623,6 @@ type EmailActionResponse =
       success: false;
       error: "invalid_token" | "not_found" | "internal_error";
     };
-
 
 function parseTokenFromRequest(req: { body?: unknown }): string | null {
   const candidate =
@@ -628,8 +658,7 @@ export async function confirmMonitorEmailController(
 
     const monitorName = await getMonitorNameById(row.monitor_id);
 
-    // Heuristic: if confirmed_at is older than 5s, this call was a no-op
-    // (already confirmed). Used only to flavor the rendered page.
+    // confirmed_at older than 5s means this call was a no-op (already confirmed).
     let result: "confirmed" | "already_confirmed" | "already_unsubscribed";
     if (row.status === "unsubscribed") {
       result = "already_unsubscribed";

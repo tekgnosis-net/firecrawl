@@ -36,7 +36,65 @@ const crawlTargetSchema = z.strictObject({
   scrapeOptions: scrapeOptionsSchema,
 });
 
-const monitorTargetSchema = z.union([scrapeTargetSchema, crawlTargetSchema]);
+const monitorDomainSchema = z
+  .string()
+  .trim()
+  .toLowerCase()
+  .refine(
+    value =>
+      /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$/.test(
+        value,
+      ),
+    "Domain must be a valid hostname without protocol or path",
+  );
+
+// Strip internal-only depth/alertMode/recheckAfter (and search-unused scrapeOptions)
+// before validation so older clients sending them don't 400.
+const searchTargetSchema = z.preprocess(
+  value => {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const {
+        depth: _depth,
+        alertMode: _alertMode,
+        recheckAfter: _recheckAfter,
+        scrapeOptions: _scrapeOptions,
+        ...rest
+      } = value as Record<string, unknown>;
+      return rest;
+    }
+    return value;
+  },
+  z
+    .strictObject({
+      id: z.string().uuid().optional(),
+      type: z.literal("search"),
+      queries: z.array(z.string().min(1).max(256)).min(1).max(12),
+      searchWindow: z
+        .enum(["5m", "15m", "1h", "6h", "24h", "7d"], {
+          error: "searchWindow must be one of: 5m, 15m, 1h, 6h, 24h, 7d",
+        })
+        .optional()
+        .default("24h"),
+      includeDomains: z.array(monitorDomainSchema).max(50).optional(),
+      excludeDomains: z.array(monitorDomainSchema).max(50).optional(),
+      maxResults: z.number().int().min(1).max(50).optional().default(10),
+    })
+    .superRefine((target, ctx) => {
+      if (target.includeDomains?.length && target.excludeDomains?.length) {
+        ctx.addIssue({
+          code: "custom",
+          message: "includeDomains and excludeDomains are mutually exclusive",
+          path: ["excludeDomains"],
+        });
+      }
+    }),
+);
+
+const monitorTargetSchema = z.union([
+  scrapeTargetSchema,
+  crawlTargetSchema,
+  searchTargetSchema,
+]);
 
 const monitorWebhookSchema = createWebhookSchema([
   "monitor.page",
@@ -81,16 +139,18 @@ const monitorScheduleSchema = z
     timezone: schedule.timezone,
   }));
 
-const monitorNotificationSchema = z
-  .strictObject({
-    email: z
-      .strictObject({
-        enabled: z.boolean().optional().default(false),
-        recipients: z.array(z.email()).max(25).optional().default([]),
-        includeDiffs: z.boolean().optional().default(false),
-      })
-      .optional(),
-  })
+const monitorNotificationInner = z.strictObject({
+  email: z
+    .strictObject({
+      enabled: z.boolean().optional().default(false),
+      recipients: z.array(z.email()).max(25).optional().default([]),
+      includeDiffs: z.boolean().optional().default(false),
+    })
+    .optional(),
+});
+// Create defaults a missing notification to {}; the UPDATE schema deliberately does
+// not (a default there would materialize {} on a PATCH and wipe the stored email config).
+const monitorNotificationSchema = monitorNotificationInner
   .optional()
   .default({});
 
@@ -119,17 +179,71 @@ const createMonitorBaseSchema = z.strictObject({
   origin: z.string().optional().prefault("api"),
 });
 
-export const createMonitorSchema = createMonitorBaseSchema.transform(
-  applyJudgeEnabledDefault,
-);
+function requireGoalForSearchTargets(
+  input: { targets?: unknown; goal?: unknown; judgeEnabled?: unknown },
+  ctx: z.RefinementCtx,
+): void {
+  const targets = input.targets;
+  if (!Array.isArray(targets)) return;
+  const hasSearchTarget = targets.some(
+    t =>
+      t && typeof t === "object" && (t as { type?: unknown }).type === "search",
+  );
+  if (!hasSearchTarget) return;
+  if (input.judgeEnabled === false) return;
+  const goal = input.goal;
+  if (typeof goal !== "string" || goal.trim().length === 0) {
+    ctx.addIssue({
+      code: "custom",
+      message: "A search target requires a non-empty goal",
+      path: ["goal"],
+    });
+  }
+}
+
+export const createMonitorSchema = createMonitorBaseSchema
+  .superRefine(requireGoalForSearchTargets)
+  .transform(applyJudgeEnabledDefault);
+
+// Patches may rely on the already-stored goal, so only reject when the patch has
+// search targets AND explicitly clears the goal; the controller re-validates the merge.
+function rejectGoalClearedWithSearchTargets(
+  input: { targets?: unknown; goal?: unknown; judgeEnabled?: unknown },
+  ctx: z.RefinementCtx,
+): void {
+  const targets = input.targets;
+  if (!Array.isArray(targets)) return;
+  const hasSearchTarget = targets.some(
+    t =>
+      t && typeof t === "object" && (t as { type?: unknown }).type === "search",
+  );
+  if (!hasSearchTarget) return;
+  if (input.judgeEnabled === false) return;
+  const goal = input.goal;
+  if (goal === undefined) return;
+  if (goal === null || (typeof goal === "string" && goal.trim().length === 0)) {
+    ctx.addIssue({
+      code: "custom",
+      message: "A search target requires a non-empty goal",
+      path: ["goal"],
+    });
+  }
+}
 
 export const updateMonitorSchema = createMonitorBaseSchema
   .partial()
   .extend({
     status: z.enum(["active", "paused"]).optional(),
+    // No default => omitted means "leave unchanged"; a default would materialize {} on
+    // a PATCH and wipe the stored email config.
+    notification: monitorNotificationInner.optional(),
+    // Drop the create-path .default(30): otherwise an omitting PATCH resets configured retention.
+    retentionDays: z.number().int().positive().max(365).optional(),
+    // Drop the create-path .prefault("api") so an empty PATCH stays empty (the guard below fires).
+    origin: z.string().optional(),
   })
-  .refine(x => Object.keys(x).length > 0, "Update body cannot be empty")
-  .transform(applyJudgeEnabledDefault);
+  .superRefine(rejectGoalClearedWithSearchTargets)
+  .refine(x => Object.keys(x).length > 0, "Update body cannot be empty");
 
 export const listMonitorsQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(100).optional().default(25),
@@ -147,6 +261,7 @@ export const listMonitorChecksQuerySchema = z.object({
       "failed",
       "partial",
       "skipped_overlap",
+      "skipped_no_credits",
     ])
     .optional(),
 });
@@ -157,8 +272,16 @@ export const monitorCheckDetailQuerySchema = z.object({
   status: z.enum(["same", "new", "changed", "removed", "error"]).optional(),
 });
 
+// Stripped from API input but stored targets may carry them; surface as optional
+// internal-only fields so runner/store can read stored values without type errors.
 export type MonitorTarget = z.infer<typeof monitorTargetSchema> & {
   id: string;
+} & {
+  depth?: "raw" | "standard" | "deep";
+  alertMode?: "first_match" | "every_new_result" | "material_dev";
+  recheckAfter?: "1h" | "6h" | "24h" | "7d";
+  // Absent on search; optional so union reads compile.
+  scrapeOptions?: z.infer<typeof scrapeOptionsSchema>;
 };
 export type CreateMonitorRequest = z.infer<typeof createMonitorSchema>;
 export type UpdateMonitorRequest = z.infer<typeof updateMonitorSchema>;
@@ -200,7 +323,8 @@ export type MonitorCheckRow = {
     | "completed"
     | "failed"
     | "partial"
-    | "skipped_overlap";
+    | "skipped_overlap"
+    | "skipped_no_credits";
   scheduled_for: string | null;
   started_at: string | null;
   finished_at: string | null;
@@ -238,7 +362,7 @@ export type MonitorPageRow = {
   team_id: string;
   target_id: string;
   url: string;
-  url_hash: string;
+  url_hash: Buffer;
   source: MonitorPageSource;
   first_seen_check_id: string | null;
   last_seen_check_id: string | null;
@@ -267,7 +391,7 @@ export type MonitorCheckPageInsert = {
   team_id: string;
   target_id: string;
   url: string;
-  url_hash?: string;
+  url_hash?: Buffer;
   status: MonitorPageStatus;
   previous_scrape_id?: string | null;
   current_scrape_id?: string | null;

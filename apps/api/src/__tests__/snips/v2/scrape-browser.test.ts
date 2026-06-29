@@ -107,6 +107,8 @@ describe("Scrape browser interact replay", () => {
         expect(executeResponse.statusCode).toBe(200);
         expect(executeResponse.body.success).toBe(true);
         expect(executeResponse.body.stdout).toContain(marker);
+        expect(typeof executeResponse.body.cdpUrl).toBe("string");
+        expect(executeResponse.body.cdpUrl.length).toBeGreaterThan(0);
       } finally {
         if (scrapeId) {
           await scrapeStopInteractiveBrowserRaw(scrapeId, identity);
@@ -230,6 +232,10 @@ describe("Scrape browser interact replay", () => {
   itIf(ALLOW_TEST_SUITE_WEBSITE && !!config.IDMUX_URL)(
     "returns 403 when scrape job belongs to another team",
     async () => {
+      if (identity.teamId === otherIdentity.teamId) {
+        return;
+      }
+
       const scrapeResponse = await scrapeRaw(
         {
           url: `${TEST_SUITE_WEBSITE}?testId=${crypto.randomUUID()}`,

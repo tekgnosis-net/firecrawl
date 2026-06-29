@@ -1,8 +1,6 @@
 import { Request, Response } from "express";
-import {
-  billTeam,
-  checkTeamCredits,
-} from "../../services/billing/credit_billing";
+import { billTeam } from "../../services/billing/credit_billing";
+import { autumnService } from "../../services/autumn/autumn.service";
 import { authenticateUser } from "../auth";
 import { RateLimiterMode, ScrapeJobSingleUrls } from "../../types";
 import { logSearch, logRequest } from "../../services/logging/log_job";
@@ -22,7 +20,7 @@ import {
 } from "../v1/types";
 import { fromV0Combo } from "../v2/types";
 import { ScrapeJobTimeoutError } from "../../lib/error";
-import { scrapeQueue } from "../../services/worker/nuq";
+import { scrapeQueue } from "../../services/worker/nuq-router";
 import { defaultOrigin } from "../../lib/default-values";
 import { getSearchZDR } from "../../lib/zdr-helpers";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
@@ -186,7 +184,8 @@ export async function searchController(req: Request, res: Response) {
     }
     const { team_id, chunk } = auth;
 
-    if (getSearchZDR(chunk?.flags) === "forced") {
+    const v0SearchZDRMode = getSearchZDR(chunk?.flags);
+    if (v0SearchZDRMode === "forced-zdr" || v0SearchZDRMode === "forced-anon") {
       return res.status(400).json({
         error:
           "Your team has zero data retention enabled. This is not supported on the v0 API. Please update your code to use the v1 API.",
@@ -236,9 +235,13 @@ export async function searchController(req: Request, res: Response) {
     const searchOptions = req.body.searchOptions ?? { limit: 5 };
 
     try {
-      const { success: creditsCheckSuccess, message: creditsCheckMessage } =
-        await checkTeamCredits(chunk, team_id, 1);
-      if (!creditsCheckSuccess) {
+      const autumnResult = await autumnService.checkCredits({
+        teamId: team_id,
+        value: 1,
+        properties: { source: "v0/search" },
+      });
+      // null = Autumn unavailable / self-hosted -> fail open, matching v1/v2.
+      if (autumnResult !== null && !autumnResult.allowed) {
         return res.status(402).json({ error: "Insufficient credits" });
       }
     } catch (error) {

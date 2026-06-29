@@ -1,9 +1,12 @@
-import { supabase_service } from "../supabase";
+import { db } from "../../db/connection";
+import * as schema from "../../db/schema";
+import { changeTrackingInsertScrape } from "../../db/rpc";
 import { config } from "../../config";
 import "dotenv/config";
 import { logger as _logger } from "../../lib/logger";
 import { configDotenv } from "dotenv";
 import * as Sentry from "@sentry/node";
+import type { PgTable } from "drizzle-orm/pg-core";
 import {
   saveDeepResearchToGCS,
   saveExtractToGCS,
@@ -13,10 +16,12 @@ import {
   saveSearchToGCS,
 } from "../../lib/gcs-jobs";
 import { hasFormatOfType } from "../../lib/format-utils";
+import { keylessTeamUuid } from "../../lib/keyless";
 import type { Document, ScrapeOptions } from "../../controllers/v2/types";
 import type { CostTracking } from "../../lib/cost-tracking";
 import type { Logger } from "winston";
 import { saveExtractResult } from "../../lib/extract/extract-redis";
+import { trackFirstSurfaceUse } from "../posthog";
 configDotenv();
 
 const previewTeamId = "3adefd26-77ec-5968-8dcf-c94b5630d1de";
@@ -33,58 +38,84 @@ function sanitizeString(value: string | null | undefined): string | null {
   return value.replace(nullByteRegex, "");
 }
 
+const tableMap: Record<string, PgTable> = {
+  requests: schema.requests,
+  scrapes: schema.scrapes,
+  parses: schema.parses,
+  crawls: schema.crawls,
+  batch_scrapes: schema.batch_scrapes,
+  searches: schema.searches,
+  research_paper_searches: schema.research_paper_searches,
+  research_paper_inspects: schema.research_paper_inspects,
+  research_paper_reads: schema.research_paper_reads,
+  research_related_papers: schema.research_related_papers,
+  research_github_searches: schema.research_github_searches,
+  extracts: schema.extracts,
+  maps: schema.maps,
+  llmstxts: schema.llmstxts,
+  deep_researches: schema.deep_researches,
+};
+
 async function robustInsert(
   table: string,
   data: any,
   force: boolean,
-  logger: Logger,
+  _logger: Logger,
 ) {
+  const logger = _logger.child({
+    module: "log_job",
+    method: "robustInsert",
+    table,
+    canonicalLog: "log_job/robustInsert",
+  });
+
   if (config.USE_DB_AUTHENTICATION !== true) {
     logger.info(
       "Skipping database insertion due to USE_DB_AUTHENTICATION being off",
-      { table },
     );
     return;
   }
 
+  const target = tableMap[table];
+
+  const attempts: { error: any; timeMs: number; backoffMs: number }[] = [];
+
   if (force) {
-    let i = 0,
-      done = false;
-    let lastError: any = null;
-    while (i++ <= 10) {
+    for (let i = 0; i < 10; i++) {
+      const start = Date.now();
       try {
-        const { error } = await supabase_service.from(table).insert(data);
-        if (error) {
-          lastError = error;
-          logger.error(
-            "Error inserting into database due to Supabase error, trying again",
-            { error, table, attempt: i },
-          );
-          await new Promise(resolve => setTimeout(resolve, 75));
-        } else {
-          done = true;
-          break;
-        }
+        await db.insert(target).values(data);
+        attempts.push({
+          error: null,
+          timeMs: Date.now() - start,
+          backoffMs: i === 0 ? 0 : 75,
+        });
+        break;
       } catch (error) {
-        lastError = error;
-        logger.error(
-          "Error inserting into database due to unknown error, trying again",
-          { error, table, attempt: i },
-        );
+        attempts.push({
+          error,
+          timeMs: Date.now() - start,
+          backoffMs: i === 0 ? 0 : 75,
+        });
         await new Promise(resolve => setTimeout(resolve, 75));
       }
     }
 
-    if (done) {
-      logger.info("Inserted into database successfully", { table });
-    } else {
-      logger.error("Failed to insert into database after 10 attempts", {
-        table,
-        lastError,
+    if (attempts.length === 1 && attempts[0].error === null) {
+      logger.debug("Inserted into database successfully", { attempts });
+    } else if (
+      attempts.length > 1 &&
+      attempts[attempts.length - 1].error === null
+    ) {
+      logger.warn("Inserted into database successfully with retries", {
+        attempts,
       });
+    } else {
+      logger.error("Failed to insert into database", { attempts });
       // Report to Sentry with context
       Sentry.captureException(
-        lastError || new Error("Database insert failed after 10 attempts"),
+        attempts[attempts.length - 1]?.error ||
+          new Error("Database insert failed after 10 attempts"),
         {
           tags: {
             table,
@@ -94,40 +125,22 @@ async function robustInsert(
             table,
             data: JSON.stringify(data).substring(0, 500), // Limit size
             attempts: 10,
-            lastError: lastError ? JSON.stringify(lastError) : null,
+            lastError: attempts[attempts.length - 1]?.error
+              ? JSON.stringify(attempts[attempts.length - 1].error)
+              : null,
           },
         },
       );
     }
   } else {
+    const start = Date.now();
     try {
-      const { error } = await supabase_service.from(table).insert(data);
-      if (error) {
-        logger.error("Error inserting into database due to Supabase error", {
-          error,
-          table,
-        });
-        // Report to Sentry
-        Sentry.captureException(error, {
-          tags: {
-            table,
-            operation: "robustInsert",
-            force: "false",
-          },
-          extra: {
-            table,
-            error: JSON.stringify(error),
-            data: JSON.stringify(data).substring(0, 500), // Limit size
-          },
-        });
-      } else {
-        logger.info("Inserted into database successfully", { table });
-      }
+      await db.insert(target).values(data);
+      attempts.push({ error: null, timeMs: Date.now() - start, backoffMs: 0 });
+      logger.debug("Inserted into database successfully", { attempts });
     } catch (error) {
-      logger.error("Error inserting into database due to unknown error", {
-        error,
-        table,
-      });
+      attempts.push({ error, timeMs: Date.now() - start, backoffMs: 0 });
+      logger.error("Failed to insert into database", { attempts });
       // Report to Sentry
       Sentry.captureException(error, {
         tags: {
@@ -158,7 +171,12 @@ type LoggedRequest = {
     | "parse"
     | "agent"
     | "browser"
-    | "interact";
+    | "interact"
+    | "research_paper_search"
+    | "research_paper_inspect"
+    | "research_paper_read"
+    | "research_related_papers"
+    | "research_github_search";
   api_version: string;
   team_id: string;
   origin?: string;
@@ -176,6 +194,19 @@ export async function logRequest(request: LoggedRequest) {
     teamId: request.team_id,
     zeroDataRetention: request.zeroDataRetention,
   });
+
+  // Emit a one-time PostHog milestone the first time this team uses each
+  // surface (playground / sdk / mcp / cli / api / ...). Fire-and-forget.
+  // Skip zero-data-retention requests — don't send their metadata to PostHog.
+  if (!request.zeroDataRetention) {
+    trackFirstSurfaceUse({
+      teamId: request.team_id,
+      origin: request.origin,
+      kind: request.kind,
+      apiVersion: request.api_version,
+      apiKeyId: request.api_key_id,
+    });
+  }
 
   // Sanitize user-provided fields (most likely sources of null bytes)
   const sanitizedOrigin = sanitizeString(request.origin);
@@ -219,6 +250,7 @@ export type LoggedScrape = {
   options: ScrapeOptions;
   cost_tracking?: ReturnType<typeof CostTracking.prototype.toJSON>;
   pdf_num_pages?: number;
+  content_type?: string | null;
   credits_cost: number;
   skipNuq: boolean;
   zeroDataRetention: boolean;
@@ -251,9 +283,10 @@ export async function logScrape(scrape: LoggedScrape, force: boolean = false) {
       error: scrape.error ?? null,
       time_taken: scrape.time_taken,
       team_id:
-        scrape.team_id === "preview" || scrape.team_id?.startsWith("preview_")
+        keylessTeamUuid(scrape.team_id) ??
+        (scrape.team_id === "preview" || scrape.team_id?.startsWith("preview_")
           ? previewTeamId
-          : scrape.team_id,
+          : scrape.team_id),
       options: scrape.zeroDataRetention ? null : scrape.options,
       cost_tracking: scrape.zeroDataRetention
         ? null
@@ -267,6 +300,7 @@ export async function logScrape(scrape: LoggedScrape, force: boolean = false) {
         : {
             monitor_id: scrape.monitor_id ?? null,
             monitor_check_id: scrape.monitor_check_id ?? null,
+            content_type: scrape.content_type ?? null,
           }),
     },
     force,
@@ -286,7 +320,8 @@ export async function logScrape(scrape: LoggedScrape, force: boolean = false) {
     !scrape.is_parse &&
     scrape.is_successful &&
     !scrape.zeroDataRetention &&
-    config.USE_DB_AUTHENTICATION
+    config.USE_DB_AUTHENTICATION &&
+    !scrape.team_id.startsWith("preview_")
   ) {
     const hasMarkdown = hasFormatOfType(scrape.options.formats, "markdown");
     const hasChangeTracking = hasFormatOfType(
@@ -295,27 +330,21 @@ export async function logScrape(scrape: LoggedScrape, force: boolean = false) {
     );
 
     if (hasMarkdown || hasChangeTracking) {
-      const { error } = await supabase_service.rpc(
-        "change_tracking_insert_scrape",
-        {
-          p_team_id: scrape.team_id,
-          p_url: scrape.url,
-          p_job_id: scrape.id,
-          p_change_tracking_tag: hasChangeTracking
-            ? hasChangeTracking.tag
-            : null,
-          p_date_added: new Date().toISOString(),
-        },
-      );
-
-      if (error) {
+      try {
+        await changeTrackingInsertScrape({
+          team_id: scrape.team_id,
+          url: scrape.url,
+          job_id: scrape.id,
+          change_tracking_tag: hasChangeTracking ? hasChangeTracking.tag : null,
+          date_added: new Date().toISOString(),
+        });
+        _logger.debug("Change tracking record inserted successfully");
+      } catch (error) {
         _logger.warn("Error inserting into change_tracking_scrapes", {
           error,
           scrapeId: scrape.id,
           teamId: scrape.team_id,
         });
-      } else {
-        _logger.debug("Change tracking record inserted successfully");
       }
     }
   }
@@ -469,6 +498,76 @@ export async function logSearch(search: LoggedSearch, force: boolean = false) {
   if (search.results && !search.zeroDataRetention) {
     await saveSearchToGCS(search, logger);
   }
+}
+
+export type ResearchRequestKind =
+  | "research_paper_search"
+  | "research_paper_inspect"
+  | "research_paper_read"
+  | "research_related_papers"
+  | "research_github_search";
+
+export type ResearchTableName =
+  | "research_paper_searches"
+  | "research_paper_inspects"
+  | "research_paper_reads"
+  | "research_related_papers"
+  | "research_github_searches";
+
+type LoggedResearchEndpoint = {
+  table: ResearchTableName;
+  id: string;
+  request_id: string;
+  target: string;
+  team_id: string;
+  options: any;
+  response: any;
+  num_results: number;
+  time_taken: number;
+  credits_cost: number;
+  is_successful: boolean;
+  error?: string;
+  zeroDataRetention: boolean;
+};
+
+export async function logResearchEndpoint(
+  research: LoggedResearchEndpoint,
+  force: boolean = false,
+) {
+  const logger = _logger.child({
+    module: "log_job",
+    method: "logResearchEndpoint",
+    researchId: research.id,
+    requestId: research.request_id,
+    teamId: research.team_id,
+    zeroDataRetention: research.zeroDataRetention,
+  });
+
+  await robustInsert(
+    research.table,
+    {
+      id: research.id,
+      request_id: research.request_id,
+      target: research.zeroDataRetention
+        ? "<redacted due to zero data retention>"
+        : (sanitizeString(research.target) ?? ""),
+      team_id:
+        keylessTeamUuid(research.team_id) ??
+        (research.team_id === "preview" ||
+        research.team_id?.startsWith("preview_")
+          ? previewTeamId
+          : research.team_id),
+      options: research.zeroDataRetention ? null : research.options,
+      response: research.zeroDataRetention ? null : research.response,
+      num_results: research.num_results,
+      time_taken: research.time_taken,
+      credits_cost: research.credits_cost,
+      is_successful: research.is_successful,
+      error: research.zeroDataRetention ? null : (research.error ?? null),
+    },
+    force,
+    logger,
+  );
 }
 
 export type LoggedExtract = {

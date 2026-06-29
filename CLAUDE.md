@@ -107,3 +107,4 @@ You generally don't need to touch these unless changing serialization at the bou
 - **`scrapeTimeout` is shared.** Don't invent ad-hoc timeouts in snips; import from `./lib`.
 - **Version-scope changes deliberately.** A change to `/v2/scrape` does not automatically apply to `/v1/scrape`; the types and controllers are separate by design. If a fix should land in multiple versions, make that explicit.
 - **Prettier auto-formats on commit** (lint-staged + husky). Don't fight it.
+- **Never bypass `knip` failures** (e.g. with `git commit --no-verify`). If the pre-commit `knip` check fails, fix the reported unused exports/files — even if they predate your change — before committing.
