@@ -570,6 +570,7 @@ export interface DocumentMetadata {
   statusCode?: number;
   scrapeId?: string;
   numPages?: number;
+  totalPages?: number;
   contentType?: string;
   timezone?: string;
   proxyUsed?: "basic" | "stealth";
@@ -674,6 +675,12 @@ export interface SearchRequest {
   ignoreInvalidURLs?: boolean;
   timeout?: number; // ms
   scrapeOptions?: ScrapeOptions;
+  /**
+   * Enterprise search options. Use `["zdr"]` for end-to-end Zero Data
+   * Retention or `["anon"]` for anonymized search. Must be enabled for
+   * your team.
+   */
+  enterprise?: Array<"default" | "anon" | "zdr">;
   integration?: string;
   origin?: string;
 }
