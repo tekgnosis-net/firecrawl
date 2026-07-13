@@ -14,6 +14,11 @@ import { hasFormatOfType } from "../../lib/format-utils";
 import { TransportableError } from "../../lib/error";
 import { NuQJob } from "../../services/worker/nuq";
 import { checkPermissions } from "../../lib/permissions";
+import {
+  actionTypesOf,
+  checkKeyFormatRestriction,
+  formatTypesOf,
+} from "../../lib/key-restriction";
 import { withSpan, setSpanAttributes, SpanKind } from "../../lib/otel-tracer";
 import { processJobInternal } from "../../services/worker/scrape-worker";
 import { ScrapeJobData } from "../../types";
@@ -25,13 +30,14 @@ import { captureExceptionWithZdrCheck } from "../../services/sentry";
 import type { BillingMetadata } from "../../services/billing/types";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 import {
-  KEYLESS_CREDITS_MESSAGE,
+  KEYLESS_FREE_TIER_LIMIT_MESSAGE,
   adjustKeylessCredits,
   logKeylessCreditUsage,
   reserveKeylessCredits,
 } from "../../lib/keyless";
 import { projectScrapeCredits } from "../../lib/keyless-credit-projection";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
+import { resolveThreatProtection } from "../../lib/threat-protection/request";
 
 const AGENT_INTEROP_CONCURRENCY_BOOST = 3;
 
@@ -67,11 +73,33 @@ export async function scrapeController(
         });
       });
 
+      // Threat protection: resolve the effective policy (org config +
+      // per-request override). No-ops (null policy, zero I/O) for teams
+      // without the flag.
+      const threatProtection = await resolveThreatProtection({
+        teamId: req.auth.team_id,
+        orgId: req.acuc?.org_id ?? null,
+        flags: req.acuc?.flags ?? null,
+        override: req.body.threatProtection,
+      });
+      if (threatProtection.error) {
+        setSpanAttributes(span, {
+          "scrape.error": threatProtection.error,
+          "scrape.status_code": 403,
+        });
+        return res.status(403).json({
+          success: false,
+          error: threatProtection.error,
+        });
+      }
+
       // Permission check span
       const permissions = await withSpan(
         "api.scrape.check_permissions",
         async permSpan => {
-          const perms = checkPermissions(req.body, req.acuc?.flags);
+          const perms = checkPermissions(req.body, req.acuc?.flags, {
+            threatProtectionOrgConfig: threatProtection.orgConfig,
+          });
           setSpanAttributes(permSpan, {
             "permissions.success": !perms.error,
             "permissions.error": perms.error,
@@ -88,6 +116,23 @@ export async function scrapeController(
         return res.status(403).json({
           success: false,
           error: permissions.error,
+        });
+      }
+
+      const keyRestriction = await checkKeyFormatRestriction(
+        formatTypesOf(req.body.formats),
+        actionTypesOf(req.body.actions),
+        req.acuc?.api_key_id,
+        req.acuc?.flags ?? null,
+      );
+      if (!keyRestriction.allowed) {
+        setSpanAttributes(span, {
+          "scrape.error": keyRestriction.error,
+          "scrape.status_code": keyRestriction.status,
+        });
+        return res.status(keyRestriction.status).json({
+          success: false,
+          error: keyRestriction.error,
         });
       }
 
@@ -142,7 +187,7 @@ export async function scrapeController(
           applyAgentAuthDiscoveryHeader(res);
           return res.status(429).json({
             success: false,
-            error: KEYLESS_CREDITS_MESSAGE,
+            error: KEYLESS_FREE_TIER_LIMIT_MESSAGE,
           });
         }
         reservedKeylessCredits = projectedKeylessCredits;
@@ -284,6 +329,7 @@ export async function scrapeController(
                       zeroDataRetention,
                       teamFlags: req.acuc?.flags ?? null,
                       agentIndexOnly: (req as any).agentIndexOnly ?? false,
+                      threatProtection: threatProtection.policy ?? undefined,
                     },
                     skipNuq: true,
                     origin,
@@ -388,6 +434,17 @@ export async function scrapeController(
               "scrape.status_code": 400,
             });
             return res.status(400).json({
+              success: false,
+              code: e.code,
+              error: e.message,
+            });
+          }
+
+          if (e.code === "unsafe_domain_blocked") {
+            setSpanAttributes(span, {
+              "scrape.status_code": 403,
+            });
+            return res.status(403).json({
               success: false,
               code: e.code,
               error: e.message,

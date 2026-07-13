@@ -208,6 +208,7 @@ export interface ScrapeOptions {
   storeInCache?: boolean;
   lockdown?: boolean;
   redactPII?: boolean | RedactPIIOptions;
+  threatProtection?: ThreatProtectionOptions;
   profile?: {
     name: string;
     saveChanges?: boolean;
@@ -241,6 +242,27 @@ export interface RedactPIIOptions {
   replaceStyle?: "tag" | "mask" | "remove";
 }
 
+/**
+ * Enterprise: per-request field-level override of your team's threat
+ * protection policy. Requires threat protection to be enabled for your team
+ * and request overrides to be allowed in the team configuration. Only the
+ * fields you provide replace the team policy's values.
+ */
+export interface ThreatProtectionOptions {
+  /** "off" disables scanning for this request; "normal" applies the policy. */
+  mode?: "off" | "normal";
+  /** Block verdicts at or above this risk score (integer 0-100). */
+  riskScoreThreshold?: number;
+  /** Exact domains or globs like "*.example.com" to always block (max 1000). */
+  blacklist?: string[];
+  /** Exact domains or globs to always allow; wins over everything (max 1000). */
+  whitelist?: string[];
+  /** Lowercase TLDs without the leading dot, e.g. "zip" (max 1000). */
+  blockedTlds?: string[];
+  /** Behavior when scanning is unavailable: "closed" blocks, "open" allows. */
+  failurePolicy?: "open" | "closed";
+}
+
 export type ParseFileData =
   | Blob
   | File
@@ -267,6 +289,7 @@ export type ParseOptions = Omit<
   | "storeInCache"
   | "lockdown"
   | "proxy"
+  | "threatProtection"
 > & {
   formats?: ParseFormatOption[];
   proxy?: "basic" | "auto";
@@ -570,6 +593,7 @@ export interface DocumentMetadata {
   statusCode?: number;
   scrapeId?: string;
   numPages?: number;
+  totalPages?: number;
   contentType?: string;
   timezone?: string;
   proxyUsed?: "basic" | "stealth";
@@ -674,6 +698,13 @@ export interface SearchRequest {
   ignoreInvalidURLs?: boolean;
   timeout?: number; // ms
   scrapeOptions?: ScrapeOptions;
+  /**
+   * Enterprise search options. Use `["zdr"]` for end-to-end Zero Data
+   * Retention or `["anon"]` for anonymized search. Must be enabled for
+   * your team.
+   */
+  enterprise?: Array<"default" | "anon" | "zdr">;
+  threatProtection?: ThreatProtectionOptions;
   integration?: string;
   origin?: string;
 }
@@ -762,6 +793,7 @@ export interface MapOptions {
   integration?: string;
   origin?: string;
   location?: LocationConfig;
+  threatProtection?: ThreatProtectionOptions;
 }
 
 export type FeedbackRating = "good" | "partial" | "bad";

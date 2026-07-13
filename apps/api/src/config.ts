@@ -49,6 +49,33 @@ const configSchema = z.object({
   // TOR). Unset disables the check entirely (keyless behaves as before).
   SPUR_API_KEY: z.string().optional(),
 
+  // Threat protection (enterprise domain risk blocking). "normal" mode uses
+  // Google Web Risk. An unset key disables the provider (lookups then fail
+  // per the org's failurePolicy).
+  GOOGLE_WEB_RISK_API_KEY: z.string().optional(),
+  GOOGLE_WEB_RISK_API_URL: z
+    .string()
+    .url()
+    .default("https://webrisk.googleapis.com"),
+  // Google Web Risk Update API sync tuning. ZDR: "normal" mode checks run
+  // against a locally synced hash-prefix database (threatLists:computeDiff)
+  // instead of sending URLs to Google, and verdicts are never persisted.
+  //
+  // Floor for how often threatLists:computeDiff may run per list. Google's
+  // recommendedNextDiff is respected when it is later than this floor.
+  THREAT_LIST_SYNC_MIN_INTERVAL_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(60),
+  // A synced threat list older than this is treated as unavailable
+  // (provider-failure semantics → the org's failurePolicy decides).
+  THREAT_LIST_STALENESS_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(6 * 60 * 60),
+
   // API Keys & Authentication
   BULL_AUTH_KEY: z.string().optional(),
   OPENAI_API_KEY: z.string().optional(),
@@ -132,11 +159,12 @@ const configSchema = z.object({
   CLICKHOUSE_ANALYTICS_URL: z.string().optional(),
   CLICKHOUSE_ANALYTICS_DATABASE: z.string().optional(),
 
-  // Search highlights (beta): query-highlights model service. URL is the base
-  // (e.g. https://firecrawl--query-highlights.modal.run); TOKEN is the bearer
-  // token sent on every request.
+  // Search highlights (beta): highlighter service base URL. TOKEN is optional
+  // bearer auth for legacy/external services; the in-cluster service omits it.
   HIGHLIGHT_MODEL_URL: z.string().optional(),
   HIGHLIGHT_MODEL_TOKEN: z.string().optional(),
+  HIGHLIGHT_SHADOW_RATE: z.coerce.number().min(0).max(1).default(0),
+  HIGHLIGHT_SHADOW_MAX_INFLIGHT: z.coerce.number().int().positive().default(8),
 
   // Fire Engine
   FIRE_ENGINE_BETA_URL: z.string().optional(),
@@ -232,6 +260,26 @@ const configSchema = z.object({
   SLACK_WEBHOOK_URL: z.string().optional(),
   SLACK_ADMIN_WEBHOOK_URL: z.string().optional(),
   DISABLE_WEBHOOK_DELIVERY: z.stringbool().optional(),
+
+  // Slack integration ("Add to Slack" for monitor notifications + /monitor
+  // slash command). Credentials come from the Firecrawl Slack app.
+  SLACK_CLIENT_ID: z.string().optional(),
+  SLACK_CLIENT_SECRET: z.string().optional(),
+  SLACK_SIGNING_SECRET: z.string().optional(),
+  // Bot scopes requested during install. Override only if the Slack app manifest
+  // changes; keep in sync with slack-app-manifest.json.
+  SLACK_OAUTH_SCOPES: z
+    .string()
+    .default(
+      "chat:write,chat:write.public,commands,channels:read,groups:read,team:read,incoming-webhook",
+    ),
+  // Absolute URL Slack redirects back to after authorize. Must exactly match a
+  // Redirect URL configured on the Slack app (e.g.
+  // https://api.firecrawl.dev/v2/slack/oauth/callback).
+  SLACK_OAUTH_REDIRECT_URL: z.string().optional(),
+  // 32-byte key (hex or base64) used to AES-256-GCM encrypt stored bot tokens.
+  // If unset, tokens are stored with a `plain:` prefix (self-hosted only).
+  SLACK_TOKEN_ENCRYPTION_KEY: z.string().optional(),
   ALLOW_LOCAL_WEBHOOKS: z.stringbool().optional(),
   WEBHOOK_USE_RABBITMQ: z.stringbool().optional(),
 

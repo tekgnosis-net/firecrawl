@@ -14,8 +14,12 @@ import {
   calculateScrapeCredits,
 } from "./scrape";
 import { applySearchHighlights, highlightsEnvReady } from "./highlights";
+import { runSearchHighlightsShadow } from "./highlights-shadow";
 import { trackSearchResults, trackSearchRequest } from "../lib/tracking";
 import type { BillingMetadata } from "../services/billing/types";
+import type { ThreatProtectionPolicy } from "../lib/threat-protection/types";
+import { checkUrlsAgainstThreatPolicy } from "../lib/threat-protection/request";
+import { calculateThreatScanCredits } from "../lib/scrape-billing";
 
 interface SearchOptions {
   query: string;
@@ -48,6 +52,8 @@ interface SearchContext {
   billing?: BillingMetadata;
   agentIndexOnly?: boolean;
   keylessReserved?: boolean;
+  /** Effective threat protection policy; blocked domains are removed from results entirely. */
+  threatProtectionPolicy?: ThreatProtectionPolicy | null;
 }
 
 interface SearchExecuteResult {
@@ -104,6 +110,46 @@ export async function executeSearch(
     enterprise: options.enterprise,
   })) as SearchV2Response;
 
+  // Threat protection: remove blocked results entirely — before
+  // slicing/counting, before scraping, and before returning. Checks are
+  // URL-level and deduped within this request; scan fees bill +2 per unique
+  // scanned URL (see calculateThreatScanCredits), charged as part of the
+  // search credits below.
+  let threatScanCredits = 0;
+  const threatPolicy = context.threatProtectionPolicy;
+  if (threatPolicy && threatPolicy.mode !== "off") {
+    const urlsToCheck = [
+      ...(searchResponse.web ?? []).map(x => x.url),
+      ...(searchResponse.news ?? []).map(x => x.url),
+      ...(searchResponse.images ?? []).map(x => x.url),
+    ].filter((x): x is string => !!x);
+
+    if (urlsToCheck.length > 0) {
+      const { decisionsByUrl } = await checkUrlsAgainstThreatPolicy(
+        urlsToCheck,
+        threatPolicy,
+        { teamId },
+      );
+      threatScanCredits = calculateThreatScanCredits(decisionsByUrl.values());
+      const isAllowed = (url: string | undefined | null): boolean => {
+        if (!url) return true;
+        const decision = decisionsByUrl.get(url);
+        return decision === undefined || decision.allowed;
+      };
+      if (searchResponse.web) {
+        searchResponse.web = searchResponse.web.filter(x => isAllowed(x.url));
+      }
+      if (searchResponse.news) {
+        searchResponse.news = searchResponse.news.filter(x => isAllowed(x.url));
+      }
+      if (searchResponse.images) {
+        searchResponse.images = searchResponse.images.filter(x =>
+          isAllowed(x.url),
+        );
+      }
+    }
+  }
+
   if (searchResponse.web && searchResponse.web.length > 0) {
     searchResponse.web = searchResponse.web.map(result => ({
       ...result,
@@ -145,8 +191,13 @@ export async function executeSearch(
 
   const isZDR = options.enterprise?.includes("zdr");
   const creditsPerTenResults = isZDR ? 10 : 2;
+  // Threat protection scan fees ride on the search credits: they are part of
+  // serving the search itself (every result domain is scanned before
+  // filtering), so they bill against the same feature and show up in the
+  // request's creditsUsed.
   const searchCredits =
-    Math.ceil(totalResultsCount / 10) * creditsPerTenResults;
+    Math.ceil(totalResultsCount / 10) * creditsPerTenResults +
+    threatScanCredits;
   let scrapeCredits = 0;
 
   const shouldScrape =
@@ -171,6 +222,7 @@ export async function executeSearch(
         billing,
         agentIndexOnly: context.agentIndexOnly,
         keylessReserved: context.keylessReserved,
+        threatProtectionPolicy: threatPolicy ?? null,
       };
 
       const allDocsWithCostTracking = await scrapeSearchResults(
@@ -196,12 +248,20 @@ export async function executeSearch(
   // Runs after scraping (mergeScrapedContent rebuilds the result objects, so
   // highlight mutations must come last to survive). Uses the user's original
   // query, not the domain-filtered upstream query.
-  if (
+  const shouldApplyHighlights =
     options.highlights &&
     flags?.highlightsBeta === true &&
-    highlightsEnvReady()
-  ) {
+    highlightsEnvReady();
+  if (shouldApplyHighlights) {
     await applySearchHighlights(searchResponse, query, logger);
+  } else {
+    runSearchHighlightsShadow({
+      response: searchResponse,
+      query,
+      requestId: context.requestId,
+      teamId,
+      zeroDataRetention: zeroDataRetention === true || isZDR === true,
+    });
   }
 
   const scrapeFormats = scrapeOptions?.formats

@@ -14,6 +14,8 @@ import {
   DataLayerScrapeMetadata,
   getDataLayerSuccessCredits,
 } from "./data-layer";
+import type { ThreatDecision } from "./threat-protection/types";
+import { UnsafeDomainBlockedError } from "./threat-protection/error";
 
 const creditsPerPDFPage = 1;
 const stealthProxyCostBonus = 4;
@@ -23,6 +25,40 @@ const redactPIICostBonus = 4;
 // Each additional PDF page also gets redacted through fire-privacy, so
 // the per-page surcharge mirrors the +4 base — same tier as lockdown.
 const redactPIIPdfPageCostBonus = 4;
+// Threat protection scans: +2 per scanned URL in "normal" mode (Google Web
+// Risk). Checks are URL-level and so is the billable unit: consulted
+// decisions bill once per unique canonical `decision.url` within one billing
+// scope — a scrape and its same-URL re-check share one fee, while a crawl of
+// N pages bills N scans (each page job is its own scope). Verdicts are never
+// reused across requests (no verdict cache — ZDR). Local-only decisions
+// (whitelist/blacklist/blocked-tld, mode off, provider failure) never bill.
+const threatScanCost = 2;
+
+/**
+ * Sums the scan fees for a set of threat protection decisions. Only decisions
+ * that consulted the provider bill; the fee is +2 per unique scanned
+ * canonical URL across the given decisions.
+ */
+export function calculateThreatScanCredits(
+  decisions: Iterable<ThreatDecision>,
+): number {
+  const billedUrls = new Set<string>();
+  let credits = 0;
+  for (const decision of decisions) {
+    if (!decision.providerConsulted) continue;
+    // Decisions serialized by a pre-URL-level deploy have no `url`; bill
+    // them individually (the old per-decision behavior) rather than letting
+    // them all collapse onto one `undefined` key.
+    if (decision.url === undefined) {
+      credits += threatScanCost;
+      continue;
+    }
+    if (billedUrls.has(decision.url)) continue;
+    billedUrls.add(decision.url);
+    credits += threatScanCost;
+  }
+  return credits;
+}
 
 export async function calculateCreditsToBeBilled(
   options: ScrapeOptions,
@@ -33,9 +69,27 @@ export async function calculateCreditsToBeBilled(
   error?: Error | null,
   unsupportedFeatures?: Set<FeatureFlag>,
   dataLayer?: DataLayerScrapeMetadata,
+  // Threat protection decisions for this scrape (initial + redirect checks,
+  // in order). Each decision with `providerConsulted` bills a scan fee (+2
+  // per unique scanned URL) on top of the scrape's own cost — on both success
+  // and failure (a scrape blocked by threat protection still consulted the
+  // classifier). For scrapes blocked by threat protection, the
+  // UnsafeDomainBlockedError in `error` also carries its decision, which is
+  // used as a fallback when the decisions array did not make it here.
+  threatDecisions?: ThreatDecision[],
 ) {
   const costTrackingJSON: ReturnType<typeof CostTracking.prototype.toJSON> =
     costTracking instanceof CostTracking ? costTracking.toJSON() : costTracking;
+
+  const effectiveThreatDecisions: ThreatDecision[] =
+    threatDecisions && threatDecisions.length > 0
+      ? threatDecisions
+      : error instanceof UnsafeDomainBlockedError
+        ? [error.decision]
+        : [];
+  const threatScanCredits = calculateThreatScanCredits(
+    effectiveThreatDecisions,
+  );
 
   if (document === null) {
     // Failure -- check cost tracking if FIRE-1
@@ -57,7 +111,10 @@ export async function calculateCreditsToBeBilled(
       creditsToBeBilled = 1;
     }
 
-    return creditsToBeBilled;
+    // Failed scrapes bill no base cost (except the cases above), but threat
+    // protection scans that already happened still bill — including scrapes
+    // blocked by the policy itself.
+    return creditsToBeBilled + threatScanCredits;
   }
 
   const dataLayerCredits = getDataLayerSuccessCredits({
@@ -65,7 +122,7 @@ export async function calculateCreditsToBeBilled(
     statusCode: document.metadata?.statusCode,
   });
   if (dataLayerCredits !== null) {
-    return dataLayerCredits;
+    return dataLayerCredits + threatScanCredits;
   }
 
   let creditsToBeBilled = 1; // Assuming 1 credit per document
@@ -166,6 +223,8 @@ export async function calculateCreditsToBeBilled(
   if (urlsToCheck.some(u => isUrlBlocked(u, null) && !isUrlBlocked(u, flags))) {
     creditsToBeBilled += unblockedDomainCostBonus;
   }
+
+  creditsToBeBilled += threatScanCredits;
 
   return creditsToBeBilled;
 }

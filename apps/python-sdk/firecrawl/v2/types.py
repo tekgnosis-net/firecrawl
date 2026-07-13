@@ -123,6 +123,7 @@ class DocumentMetadata(BaseModel):
     status_code: Optional[int] = None
     scrape_id: Optional[str] = None
     num_pages: Optional[int] = None
+    total_pages: Optional[int] = None
     content_type: Optional[str] = None
     proxy_used: Optional[Literal["basic", "stealth"]] = None
     timezone: Optional[str] = None
@@ -211,6 +212,7 @@ class DocumentMetadata(BaseModel):
             if isinstance(v, list) and k in {
                 "status_code",
                 "num_pages",
+                "total_pages",
                 "credits_used",
             }:
                 first = v[0] if v else None
@@ -747,6 +749,35 @@ class RedactPIIOptions(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class ThreatProtectionOptions(BaseModel):
+    """Enterprise: per-request field-level override of your team's threat
+    protection policy.
+
+    Requires threat protection to be enabled for your team and request
+    overrides to be allowed in the team configuration. Only the fields you
+    explicitly provide replace the team policy's values.
+    """
+
+    # "off" disables scanning for this request; "normal" applies the policy.
+    mode: Optional[Literal["off", "normal"]] = None
+    # Block verdicts at or above this risk score (integer 0-100).
+    risk_score_threshold: Optional[int] = Field(
+        default=None, alias="riskScoreThreshold"
+    )
+    # Exact domains or globs like "*.example.com" to always block (max 1000).
+    blacklist: Optional[List[str]] = None
+    # Exact domains or globs to always allow; wins over everything (max 1000).
+    whitelist: Optional[List[str]] = None
+    # Lowercase TLDs without the leading dot, e.g. "zip" (max 1000).
+    blocked_tlds: Optional[List[str]] = Field(default=None, alias="blockedTlds")
+    # Behavior when scanning is unavailable: "closed" blocks, "open" allows.
+    failure_policy: Optional[Literal["open", "closed"]] = Field(
+        default=None, alias="failurePolicy"
+    )
+
+    model_config = {"populate_by_name": True}
+
+
 class ScrapeOptions(BaseModel):
     """Options for scraping operations."""
 
@@ -787,6 +818,9 @@ class ScrapeOptions(BaseModel):
     lockdown: Optional[bool] = None
     redact_pii: Optional[Union[bool, RedactPIIOptions]] = Field(
         default=None, alias="redactPII"
+    )
+    threat_protection: Optional[ThreatProtectionOptions] = Field(
+        default=None, alias="threatProtection"
     )
     profile: Optional[Dict[str, Any]] = None
     integration: Optional[str] = None
@@ -1019,6 +1053,7 @@ class MapOptions(BaseModel):
     timeout: Optional[int] = None
     integration: Optional[str] = None
     location: Optional["Location"] = None
+    threat_protection: Optional[ThreatProtectionOptions] = None
 
 
 class MapRequest(BaseModel):
@@ -1568,6 +1603,10 @@ class SearchRequest(BaseModel):
     ignore_invalid_urls: Optional[bool] = None
     timeout: Optional[int] = 300000
     scrape_options: Optional[ScrapeOptions] = None
+    # Enterprise search options. Use ["zdr"] for end-to-end Zero Data
+    # Retention or ["anon"] for anonymized search. Must be enabled for your team.
+    enterprise: Optional[List[str]] = None
+    threat_protection: Optional[ThreatProtectionOptions] = None
     integration: Optional[str] = None
 
     @field_validator("sources")

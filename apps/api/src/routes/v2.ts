@@ -59,7 +59,15 @@ import {
   browserListController,
   browserWebhookDestroyedController,
 } from "../controllers/v2/browser";
+import {
+  browserReplayController,
+  browserReplayPageController,
+} from "../controllers/v2/browser-replay";
 import { activityController } from "../controllers/v1/activity";
+import {
+  getTeamThreatProtectionController,
+  putTeamThreatProtectionController,
+} from "../controllers/v2/team-threat-protection";
 import { supportProxyController } from "../controllers/v2/support-proxy";
 import { createResearchRouter } from "../controllers/v2/research-proxy";
 import {
@@ -78,6 +86,15 @@ import {
   unsubscribeMonitorEmailController,
   updateMonitorController,
 } from "../controllers/v2/monitor";
+import {
+  slackChannelsController,
+  slackCommandsController,
+  slackDisconnectController,
+  slackEventsController,
+  slackOAuthCallbackController,
+  slackOAuthStartController,
+  slackStatusController,
+} from "../controllers/v2/slack";
 
 export const v2Router = express.Router();
 expressWs(express()).applyTo(v2Router);
@@ -404,6 +421,18 @@ v2Router.get(
   wrap(activityController),
 );
 
+v2Router.get(
+  "/team/threat-protection",
+  authMiddleware(RateLimiterMode.Account),
+  wrap(getTeamThreatProtectionController),
+);
+
+v2Router.put(
+  "/team/threat-protection",
+  authMiddleware(RateLimiterMode.Account),
+  wrap(putTeamThreatProtectionController),
+);
+
 v2Router.post(
   "/monitor",
   authMiddleware(RateLimiterMode.Crawl),
@@ -469,6 +498,33 @@ v2Router.get(
   wrap(getMonitorCheckController),
 );
 
+// Slack integration ("Add to Slack" + /monitor slash command).
+// Public endpoints (OAuth callback, slash command, events) authenticate via the
+// OAuth state nonce / Slack request signature rather than a Firecrawl API key.
+v2Router.post(
+  "/slack/oauth/start",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  wrap(slackOAuthStartController),
+);
+v2Router.get("/slack/oauth/callback", wrap(slackOAuthCallbackController));
+v2Router.get(
+  "/slack/status",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  wrap(slackStatusController),
+);
+v2Router.get(
+  "/slack/channels",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  wrap(slackChannelsController),
+);
+v2Router.delete(
+  "/slack/installation",
+  authMiddleware(RateLimiterMode.CrawlStatus),
+  wrap(slackDisconnectController),
+);
+v2Router.post("/slack/commands", wrap(slackCommandsController));
+v2Router.post("/slack/events", wrap(slackEventsController));
+
 v2Router.post(
   ["/browser", "/interact"],
   authMiddleware(RateLimiterMode.Browser),
@@ -487,6 +543,18 @@ v2Router.post(
   ["/browser/:sessionId/execute", "/interact/:sessionId/execute"],
   authMiddleware(RateLimiterMode.BrowserExecute),
   wrap(browserExecuteController),
+);
+
+v2Router.get(
+  ["/browser/:sessionId/replay", "/interact/:sessionId/replay"],
+  authMiddleware(RateLimiterMode.BrowserReplay),
+  wrap(browserReplayController),
+);
+
+v2Router.get(
+  ["/browser/:sessionId/replay/:pageId", "/interact/:sessionId/replay/:pageId"],
+  authMiddleware(RateLimiterMode.BrowserReplay),
+  wrap(browserReplayPageController),
 );
 
 v2Router.delete(

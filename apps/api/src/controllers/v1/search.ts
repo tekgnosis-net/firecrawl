@@ -12,11 +12,17 @@ import { v7 as uuidv7 } from "uuid";
 import { logSearch, logRequest } from "../../services/logging/log_job";
 import { search } from "../../search";
 import { logger as _logger } from "../../lib/logger";
+import {
+  actionTypesOf,
+  checkKeyFormatRestriction,
+  formatTypesOf,
+} from "../../lib/key-restriction";
 import type { Logger } from "winston";
 import { ScrapeJobTimeoutError } from "../../lib/error";
 import { captureExceptionWithZdrCheck } from "../../services/sentry";
 import { z } from "zod";
 import { executeSearch } from "../../search/execute";
+import { resolveThreatProtection } from "../../lib/threat-protection/request";
 import {
   DocumentWithCostTracking,
   scrapeSearchResults,
@@ -28,7 +34,7 @@ import {
 import { fromV1ScrapeOptions } from "../v2/types";
 import { getSearchForcedKind } from "../../lib/zdr-helpers";
 import {
-  KEYLESS_CREDITS_MESSAGE,
+  KEYLESS_FREE_TIER_LIMIT_MESSAGE,
   adjustKeylessCredits,
   logKeylessCreditUsage,
   reserveKeylessCredits,
@@ -122,11 +128,45 @@ export async function searchController(
   try {
     req.body = searchRequestSchema.parse(req.body);
 
+    const requestedFormats = formatTypesOf(req.body.scrapeOptions?.formats);
+    const keyRestriction = await checkKeyFormatRestriction(
+      requestedFormats,
+      // Search only scrapes (and only runs actions) when formats are
+      // requested; without them scrapeOptions is ignored entirely.
+      requestedFormats.length > 0
+        ? actionTypesOf(req.body.scrapeOptions?.actions)
+        : [],
+      req.acuc?.api_key_id,
+      req.acuc?.flags ?? null,
+    );
+    if (!keyRestriction.allowed) {
+      return res.status(keyRestriction.status).json({
+        success: false,
+        error: keyRestriction.error,
+      });
+    }
+
     logger = logger.child({
       version: "v1",
       query: req.body.query,
       origin: req.body.origin,
     });
+
+    // Threat protection: resolve the effective policy. Blocked domains are
+    // removed from search results entirely.
+    const threatProtection = await resolveThreatProtection({
+      teamId: req.auth.team_id,
+      orgId: req.acuc?.org_id ?? null,
+      flags: req.acuc?.flags ?? null,
+      override:
+        req.body.threatProtection ?? req.body.scrapeOptions?.threatProtection,
+    });
+    if (threatProtection.error) {
+      return res.status(403).json({
+        success: false,
+        error: threatProtection.error,
+      });
+    }
 
     await logRequest({
       id: jobId,
@@ -172,7 +212,7 @@ export async function searchController(
         applyAgentAuthDiscoveryHeader(res);
         return res.status(429).json({
           success: false,
-          error: KEYLESS_CREDITS_MESSAGE,
+          error: KEYLESS_FREE_TIER_LIMIT_MESSAGE,
         });
       }
       reservedKeylessCredits = projectedKeylessCredits;
@@ -205,6 +245,7 @@ export async function searchController(
         zeroDataRetention,
         agentIndexOnly: (req as any).agentIndexOnly ?? false,
         keylessReserved: reservedKeylessCredits > 0,
+        threatProtectionPolicy: threatProtection.policy,
       },
       logger,
     );

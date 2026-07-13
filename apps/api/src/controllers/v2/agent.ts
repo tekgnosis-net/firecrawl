@@ -11,6 +11,13 @@ import { logRequest } from "../../services/logging/log_job";
 import { config } from "../../config";
 import { agentConsumeFreeRequestIfLeft } from "../../db/rpc";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
+import {
+  checkUrlsAgainstThreatPolicy,
+  resolveThreatProtection,
+} from "../../lib/threat-protection/request";
+import { UnsafeDomainBlockedError } from "../../lib/threat-protection/error";
+import { calculateThreatScanCredits } from "../../lib/scrape-billing";
+import { billTeam } from "../../services/billing/credit_billing";
 
 export async function agentController(
   req: RequestWithAuth<{}, AgentResponse, AgentRequest>,
@@ -45,6 +52,60 @@ export async function agentController(
     subId: req.acuc?.sub_id,
     zeroDataRetention: getScrapeZDR(req.acuc?.flags) === "forced",
   });
+
+  // Threat protection: check the agent's starting URLs before handing off to
+  // the agent service. Content the agent fetches through the API
+  // (agent-interop scrapes) is additionally enforced by the scrape pipeline's
+  // org-policy resolution; in-page navigations performed by the remote
+  // browser cannot be intercepted here.
+  const threatProtection = await resolveThreatProtection({
+    teamId: req.auth.team_id,
+    orgId: req.acuc?.org_id ?? null,
+    flags: req.acuc?.flags ?? null,
+    override: req.body.threatProtection,
+  });
+  if (threatProtection.error) {
+    return res.status(403).json({
+      success: false,
+      error: threatProtection.error,
+    });
+  }
+  if (threatProtection.policy && (req.body.urls?.length ?? 0) > 0) {
+    const { blocked, decisionsByUrl } = await checkUrlsAgainstThreatPolicy(
+      req.body.urls ?? [],
+      threatProtection.policy,
+      { teamId: req.auth.team_id },
+    );
+    if (blocked.length > 0) {
+      // The whole request is rejected below, so no agent job will ever run
+      // to bill the allowed start URLs' scans — every consulted decision
+      // (allowed and blocked) bills its scan fee here (+2 per unique
+      // scanned URL): the scans already happened.
+      const threatScanCredits = calculateThreatScanCredits(
+        decisionsByUrl.values(),
+      );
+      if (threatScanCredits > 0) {
+        billTeam(
+          req.auth.team_id,
+          req.acuc?.sub_id ?? undefined,
+          threatScanCredits,
+          req.acuc?.api_key_id ?? null,
+          { endpoint: "agent", jobId: agentId },
+        ).catch(error => {
+          logger.error(
+            `Failed to bill team ${req.auth.team_id} for ${threatScanCredits} threat scan credit(s): ${error}`,
+          );
+        });
+      }
+      const first = blocked[0];
+      const error = new UnsafeDomainBlockedError(first.url, first.decision);
+      return res.status(403).json({
+        success: false,
+        code: error.code,
+        error: error.message,
+      });
+    }
+  }
 
   if (!config.EXTRACT_V3_BETA_URL) {
     throw new Error("Agent beta is not enabled.");

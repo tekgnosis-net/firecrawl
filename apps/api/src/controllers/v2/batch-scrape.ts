@@ -27,12 +27,24 @@ import { UNSUPPORTED_SITE_MESSAGE } from "../../lib/strings";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
 import { checkPermissions } from "../../lib/permissions";
 import {
+  actionTypesOf,
+  checkKeyFormatRestriction,
+  formatTypesOf,
+} from "../../lib/key-restriction";
+import {
   crawlGroup,
   resolveNewGroupBackend,
 } from "../../services/worker/nuq-router";
 import { logRequest } from "../../services/logging/log_job";
 import type { BillingMetadata } from "../../services/billing/types";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
+import {
+  checkUrlsAgainstThreatPolicy,
+  resolveThreatProtection,
+} from "../../lib/threat-protection/request";
+import { UnsafeDomainBlockedError } from "../../lib/threat-protection/error";
+import { calculateThreatScanCredits } from "../../lib/scrape-billing";
+import { billTeam } from "../../services/billing/credit_billing";
 
 export async function batchScrapeController(
   req: RequestWithAuth<{}, BatchScrapeResponse, BatchScrapeRequest>,
@@ -45,11 +57,39 @@ export async function batchScrapeController(
     req.body = batchScrapeRequestSchema.parse(req.body);
   }
 
-  const permissions = checkPermissions(req.body, req.acuc?.flags);
+  const threatProtection = await resolveThreatProtection({
+    teamId: req.auth.team_id,
+    orgId: req.acuc?.org_id ?? null,
+    flags: req.acuc?.flags ?? null,
+    override: req.body.threatProtection,
+  });
+  if (threatProtection.error) {
+    return res.status(403).json({
+      success: false,
+      error: threatProtection.error,
+    });
+  }
+
+  const permissions = checkPermissions(req.body, req.acuc?.flags, {
+    threatProtectionOrgConfig: threatProtection.orgConfig,
+  });
   if (permissions.error) {
     return res.status(403).json({
       success: false,
       error: permissions.error,
+    });
+  }
+
+  const keyRestriction = await checkKeyFormatRestriction(
+    formatTypesOf(req.body.formats),
+    actionTypesOf(req.body.actions),
+    req.acuc?.api_key_id,
+    req.acuc?.flags ?? null,
+  );
+  if (!keyRestriction.allowed) {
+    return res.status(keyRestriction.status).json({
+      success: false,
+      error: keyRestriction.error,
     });
   }
 
@@ -132,6 +172,71 @@ export async function batchScrapeController(
     }
   }
 
+  // Threat protection: reject/report blocked URLs at enqueue time so they
+  // never consume scrape slots. Mirrors the isUrlBlocked handling above:
+  // with ignoreInvalidURLs they are reported in invalidURLs; without it the
+  // whole request is rejected. Any URL that slips through (e.g. via a
+  // redirect) is still blocked in the scrape pipeline and its job document
+  // gets the unsafe_domain_blocked error.
+  if (threatProtection.policy) {
+    const { blocked, decisionsByUrl } = await checkUrlsAgainstThreatPolicy(
+      urls,
+      threatProtection.policy,
+      { teamId: req.auth.team_id },
+    );
+    if (blocked.length > 0) {
+      // Consulted decisions bill the scan fee (+2 per unique scanned URL) —
+      // the scans already happened. With ignoreInvalidURLs the allowed URLs
+      // proceed to scrape jobs that bill their own scans, so only blocked
+      // ones bill here; when the whole request is rejected below, no scrape
+      // jobs will ever run, so every scanned URL bills here.
+      const threatScanCredits = calculateThreatScanCredits(
+        req.body.ignoreInvalidURLs
+          ? blocked.map(x => x.decision)
+          : decisionsByUrl.values(),
+      );
+      if (
+        threatScanCredits > 0 &&
+        (req.body.__agentInterop?.shouldBill ?? true)
+      ) {
+        billTeam(
+          req.auth.team_id,
+          req.acuc?.sub_id ?? undefined,
+          threatScanCredits,
+          req.acuc?.api_key_id ?? null,
+          billing,
+        ).catch(error => {
+          logger.error(
+            `Failed to bill team ${req.auth.team_id} for ${threatScanCredits} threat scan credit(s): ${error}`,
+          );
+        });
+      }
+      if (req.body.ignoreInvalidURLs) {
+        const blockedSet = new Set(blocked.map(x => x.url));
+        const keptUnnormalized: string[] = [];
+        const keptUrls: string[] = [];
+        urls.forEach((u, i) => {
+          if (blockedSet.has(u)) {
+            invalidURLs!.push(unnormalizedURLs[i] ?? u);
+          } else {
+            keptUrls.push(u);
+            keptUnnormalized.push(unnormalizedURLs[i]);
+          }
+        });
+        urls = keptUrls;
+        unnormalizedURLs = keptUnnormalized;
+      } else {
+        const first = blocked[0];
+        const error = new UnsafeDomainBlockedError(first.url, first.decision);
+        return res.status(403).json({
+          success: false,
+          code: error.code,
+          error: error.message,
+        });
+      }
+    }
+  }
+
   if (urls.length === 0) {
     return res.status(400).json({
       success: false,
@@ -173,6 +278,7 @@ export async function batchScrapeController(
           zeroDataRetention,
           bypassBilling: !(req.body.__agentInterop?.shouldBill ?? true),
           agentIndexOnly: (req as any).agentIndexOnly ?? false,
+          threatProtection: threatProtection.policy ?? undefined,
         }, // NOTE: smart wait disabled for batch scrapes to ensure contentful scrape, speed does not matter
         team_id: req.auth.team_id,
         createdAt: Date.now(),

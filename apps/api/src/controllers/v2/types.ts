@@ -28,6 +28,7 @@ import {
 import { BrandingProfile } from "../../types/branding";
 import { ProductProfile } from "../../types/product";
 import { MenuProfile } from "../../types/menu";
+import { threatProtectionOverrideSchema } from "../../lib/threat-protection/config";
 
 // Base URL schema with common validation logic
 export const URL = z.preprocess(
@@ -692,6 +693,9 @@ const baseScrapeOptions = z.strictObject({
   storeInCache: z.boolean().prefault(true),
   lockdown: z.boolean().prefault(false),
   redactPII: redactPIISchema,
+  // Enterprise: per-request field-level override of the org's threat
+  // protection policy. Gated on the team flag + org config (checkPermissions).
+  threatProtection: threatProtectionOverrideSchema.optional(),
 
   profile: z
     .object({
@@ -880,6 +884,7 @@ const extractOptions = z
     __experimental_showCostTracking: z.boolean().prefault(false),
     ignoreInvalidURLs: z.boolean().prefault(true),
     webhook: webhookSchema.optional(),
+    threatProtection: threatProtectionOverrideSchema.optional(),
   })
   .refine(obj => obj.urls || obj.prompt, {
     error: "Either 'urls' or 'prompt' must be provided.",
@@ -940,6 +945,7 @@ export const agentRequestSchema = z.strictObject({
 
   overrideWhitelist: z.string().optional(),
   model: z.enum(["spark-1-pro", "spark-1-mini"]).default("spark-1-pro"),
+  threatProtection: threatProtectionOverrideSchema.optional(),
 });
 
 export type AgentRequest = z.infer<typeof agentRequestSchema>;
@@ -1191,6 +1197,7 @@ const mapRequestSchemaBase = crawlerOptions
     ignoreCache: z.boolean().prefault(false),
     location: locationSchema,
     headers: z.record(z.string(), z.string()).optional(),
+    threatProtection: threatProtectionOverrideSchema.optional(),
   });
 
 export const mapRequestSchema = strictWithMessage(mapRequestSchemaBase);
@@ -1302,6 +1309,7 @@ export type Document = {
     scrapeId?: string;
     error?: string;
     numPages?: number;
+    totalPages?: number;
     contentType?: string;
     timezone?: string;
     proxyUsed: "basic" | "stealth";
@@ -1377,6 +1385,7 @@ export interface URLTrace {
 
 export interface ExtractResponse {
   success: boolean;
+  code?: ErrorCodes;
   error?: string;
   data?: any;
   scrape_id?: string;
@@ -1533,6 +1542,7 @@ type Account = {
 export type TeamFlags = {
   ignoreRobots?: "disabled" | "allowed" | "forced";
   customRobotsAgent?: "disabled" | "allowed";
+  threatProtection?: "disabled" | "allowed" | "forced";
   unblockedDomains?: string[];
   forceZDR?: boolean;
   allowZDR?: boolean;
@@ -1542,6 +1552,10 @@ export type TeamFlags = {
   checkRobotsOnScrape?: boolean;
   crawlTtlHours?: number;
   ipWhitelist?: boolean;
+  // gates the per-team API key IP allowlist (ip_restriction_config table)
+  ipRestriction?: boolean;
+  // gates the per-key scope/format lockdown (key_restriction_config table)
+  keyRestriction?: boolean;
   bypassCreditChecks?: boolean;
   debugBranding?: boolean;
   maxBrowserSessions?: number;
@@ -1549,6 +1563,19 @@ export type TeamFlags = {
   highlightsBeta?: boolean;
   menuBeta?: boolean;
   enrichBeta?: boolean;
+  professionalProfileCompanyDataBeta?: boolean;
+  organizationDataSourceAccess?: Record<
+    string,
+    {
+      status?: "enabled" | "disabled" | "suspended" | string | null;
+      termsKey?: string | null;
+      termsVersion?: string | null;
+      termsAcceptedAt?: string | null;
+      enabledAt?: string | null;
+      disabledAt?: string | null;
+      disabledReason?: string | null;
+    }
+  >;
 } | null;
 
 interface RequestWithMaybeACUC<
@@ -1938,6 +1965,7 @@ export const searchRequestSchema = z
     // scrapeURL. Falls back to the provider snippet when the URL isn't indexed.
     highlights: z.boolean().optional().prefault(false),
     __searchPreviewToken: z.string().optional(),
+    threatProtection: threatProtectionOverrideSchema.optional(),
     scrapeOptions: baseScrapeOptions
       .extend({
         formats: z

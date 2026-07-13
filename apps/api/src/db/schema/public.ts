@@ -13,6 +13,9 @@ import {
   timestamp,
   date,
   bytea,
+  check,
+  foreignKey,
+  unique,
 } from "drizzle-orm/pg-core";
 
 const ts = (name: string) =>
@@ -60,15 +63,25 @@ export const agents = pgTable("agents", {
   error: text("error"),
 });
 
-export const api_keys = pgTable("api_keys", {
-  id: bigintNum("id").notNull().generatedByDefaultAsIdentity(),
-  created_at: ts("created_at").defaultNow(),
-  key: uuid("key").defaultRandom(),
-  name: text("name"),
-  team_id: uuid("team_id"),
-  owner_id: uuid("owner_id"),
-  agent_provisioned: boolean("agent_provisioned").default(false),
-});
+export const api_keys = pgTable(
+  "api_keys",
+  {
+    id: bigintNum("id").notNull().generatedByDefaultAsIdentity(),
+    created_at: ts("created_at").defaultNow(),
+    key: uuid("key").defaultRandom(),
+    name: text("name"),
+    team_id: uuid("team_id"),
+    owner_id: uuid("owner_id"),
+    agent_provisioned: boolean("agent_provisioned").default(false),
+    // API-key-scoped concurrency limit; null = key inherits the team limit only
+    concurrency: integer("concurrency"),
+  },
+  table => [
+    // Target of key_restriction_config's composite FK, which pins a
+    // restriction row's team_id to the key's actual team.
+    unique("api_keys_id_team_id_key").on(table.id, table.team_id),
+  ],
+);
 
 export const batch_scrapes = pgTable("batch_scrapes", {
   id: uuid("id").notNull(),
@@ -242,6 +255,56 @@ export const idempotency_keys = pgTable("idempotency_keys", {
   created_at: ts("created_at").notNull().defaultNow(),
 });
 
+// Per-team API key IP allowlist, gated by the ipRestriction team flag.
+// Enforced only when allowed_ips is non-empty; entries are IPv4/IPv6/CIDR.
+export const ip_restriction_config = pgTable("ip_restriction_config", {
+  id: uuid("id").notNull().defaultRandom(),
+  team_id: uuid("team_id").notNull().unique(),
+  allowed_ips: jsonb("allowed_ips")
+    .notNull()
+    .default(sql`'[]'::jsonb`),
+  created_at: ts("created_at").notNull().defaultNow(),
+  updated_at: ts("updated_at").notNull().defaultNow(),
+});
+
+// Per-API-key scope/format lockdown, gated by the keyRestriction team flag.
+// Each allowlist is enforced only when non-empty; allowed_formats holds v2
+// format type names, allowed_endpoints holds endpoint group names.
+export const key_restriction_config = pgTable(
+  "key_restriction_config",
+  {
+    id: uuid("id").notNull().defaultRandom(),
+    api_key_id: bigintNum("api_key_id").notNull().unique(),
+    team_id: uuid("team_id").notNull(),
+    allowed_formats: jsonb("allowed_formats")
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    allowed_endpoints: jsonb("allowed_endpoints")
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    created_at: ts("created_at").notNull().defaultNow(),
+    updated_at: ts("updated_at").notNull().defaultNow(),
+  },
+  table => [
+    // Composite FK keeps team_id consistent with the key's actual team, so
+    // team-scoped dashboard listings can't target another team's key.
+    foreignKey({
+      columns: [table.api_key_id, table.team_id],
+      foreignColumns: [api_keys.id, api_keys.team_id],
+    }).onDelete("cascade"),
+    // The API treats non-array/non-string junk as an empty allowlist, which
+    // would silently lift the restriction — make such rows unrepresentable.
+    check(
+      "allowed_formats_is_string_array",
+      sql`jsonb_typeof(${table.allowed_formats}) = 'array' AND NOT jsonb_path_exists(${table.allowed_formats}, '$[*] ? (@.type() != "string")')`,
+    ),
+    check(
+      "allowed_endpoints_is_string_array",
+      sql`jsonb_typeof(${table.allowed_endpoints}) = 'array' AND NOT jsonb_path_exists(${table.allowed_endpoints}, '$[*] ? (@.type() != "string")')`,
+    ),
+  ],
+);
+
 export const llm_texts = pgTable("llm_texts", {
   id: uuid("id").notNull().defaultRandom(),
   origin_url: text("origin_url").notNull(),
@@ -385,6 +448,23 @@ export const monitors = pgTable("monitors", {
   deleted_at: ts("deleted_at"),
   goal: text("goal"),
   judge_enabled: boolean("judge_enabled").notNull().default(false),
+});
+
+export const slack_installations = pgTable("slack_installations", {
+  id: uuid("id").notNull().defaultRandom(),
+  team_id: uuid("team_id").notNull(),
+  slack_team_id: text("slack_team_id").notNull(),
+  slack_team_name: text("slack_team_name"),
+  slack_enterprise_id: text("slack_enterprise_id"),
+  bot_user_id: text("bot_user_id"),
+  bot_token: text("bot_token").notNull(),
+  scope: text("scope"),
+  authed_user_id: text("authed_user_id"),
+  app_id: text("app_id"),
+  incoming_webhook: jsonb("incoming_webhook"),
+  revoked_at: ts("revoked_at"),
+  created_at: ts("created_at").notNull().defaultNow(),
+  updated_at: ts("updated_at").notNull().defaultNow(),
 });
 
 export const notification_preferences = pgTable("notification_preferences", {
@@ -574,6 +654,19 @@ export const teams = pgTable("teams", {
   referrer_integration: varchar("referrer_integration"),
   allocated_concurrent_browsers: integer("allocated_concurrent_browsers"),
   org_id: uuid("org_id").notNull(),
+});
+
+// Org-scoped threat protection configuration (enterprise feature, gated by the
+// `threatProtection` team flag). One row per org; DDL is applied out-of-band.
+// The policy document lives in the `config` jsonb column (parsed tolerantly in
+// lib/threat-protection/store.ts); only `mode` is a dedicated column.
+export const threat_protection_config = pgTable("threat_protection_config", {
+  id: uuid("id").notNull().defaultRandom(),
+  org_id: uuid("org_id").notNull().unique(),
+  mode: varchar("mode").notNull().default("off"),
+  config: jsonb("config").notNull().default({}),
+  created_at: ts("created_at").notNull().defaultNow(),
+  updated_at: ts("updated_at").notNull().defaultNow(),
 });
 
 export const user_notifications = pgTable("user_notifications", {

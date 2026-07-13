@@ -19,6 +19,7 @@ import { webhookSchema } from "../../services/webhook/schema";
 import { BrandingProfile } from "../../types/branding";
 import { ProductProfile } from "../../types/product";
 import { MenuProfile } from "../../types/menu";
+import { threatProtectionOverrideSchema } from "../../lib/threat-protection/config";
 
 type Format =
   | "markdown"
@@ -528,6 +529,9 @@ const baseScrapeOptions = z.strictObject({
     .gte(0)
     .prefault(1 * 24 * 60 * 60 * 1000),
   storeInCache: z.boolean().prefault(true),
+  // Enterprise: per-request field-level override of the org's threat
+  // protection policy. Gated on the team flag + org config (checkPermissions).
+  threatProtection: threatProtectionOverrideSchema.optional(),
   // @deprecated
   __experimental_cache: z.boolean().prefault(false).optional(),
   __searchPreviewToken: z.string().optional(),
@@ -744,6 +748,7 @@ const extractV1Options = z
     __experimental_showCostTracking: z.boolean().prefault(false),
     ignoreInvalidURLs: z.boolean().prefault(false),
     webhook: webhookSchema.optional(),
+    threatProtection: threatProtectionOverrideSchema.optional(),
   })
   .refine(obj => obj.urls || obj.prompt, {
     error: "Either 'urls' or 'prompt' must be provided.",
@@ -972,6 +977,7 @@ const mapRequestSchemaBase = crawlerOptions
     ignoreCache: z.boolean().prefault(false),
     location: locationSchema,
     headers: z.record(z.string(), z.string()).optional(),
+    threatProtection: threatProtectionOverrideSchema.optional(),
   });
 
 export const mapRequestSchema = mapRequestSchemaBase.strict();
@@ -1073,6 +1079,7 @@ export type Document = {
     scrapeId?: string;
     error?: string;
     numPages?: number;
+    totalPages?: number;
     contentType?: string;
     timezone?: string;
     proxyUsed: "basic" | "stealth";
@@ -1132,6 +1139,7 @@ export interface URLTrace {
 
 export interface ExtractResponse {
   success: boolean;
+  code?: ErrorCodes;
   error?: string;
   data?: any;
   scrape_id?: string;
@@ -1254,14 +1262,8 @@ export type AuthCreditUsageChunk = {
   sub_current_period_end: string | null;
   sub_user_id: string | null;
   price_id: string | null;
-  price_credits: number; // credit limit with assoicated price, or free_credits (500) if free plan
   price_should_be_graceful: boolean;
   price_associated_auto_recharge_price_id: string | null;
-  credits_used: number;
-  coupon_credits: number; // do not rely on this number to be up to date after calling a billTeam
-  adjusted_credits_used: number; // credits this period minus coupons used
-  remaining_credits: number;
-  total_credits_sum: number;
   plan_priority: {
     bucketLimit: number;
     planModifier: number;
@@ -1279,6 +1281,7 @@ export type AuthCreditUsageChunk = {
     scrapeAgentPreview?: number;
     browser?: number;
     browserExecute?: number;
+    browserReplay?: number;
     account?: number;
     supportAsk?: number;
     supportDocsSearch?: number;
@@ -1301,6 +1304,7 @@ export type AuthCreditUsageChunk = {
 export type TeamFlags = {
   ignoreRobots?: "disabled" | "allowed" | "forced";
   customRobotsAgent?: "disabled" | "allowed";
+  threatProtection?: "disabled" | "allowed" | "forced";
   unblockedDomains?: string[];
   forceZDR?: boolean;
   allowZDR?: boolean;
@@ -1310,6 +1314,10 @@ export type TeamFlags = {
   checkRobotsOnScrape?: boolean;
   crawlTtlHours?: number;
   ipWhitelist?: boolean;
+  // gates the per-team API key IP allowlist (ip_restriction_config table)
+  ipRestriction?: boolean;
+  // gates the per-key scope/format lockdown (key_restriction_config table)
+  keyRestriction?: boolean;
   skipCountryCheck?: boolean;
   browserBeta?: boolean;
   bypassCreditChecks?: boolean;
@@ -1320,6 +1328,19 @@ export type TeamFlags = {
   researchBeta?: boolean;
   highlightsBeta?: boolean;
   enrichBeta?: boolean;
+  professionalProfileCompanyDataBeta?: boolean;
+  organizationDataSourceAccess?: Record<
+    string,
+    {
+      status?: "enabled" | "disabled" | "suspended" | string | null;
+      termsKey?: string | null;
+      termsVersion?: string | null;
+      termsAcceptedAt?: string | null;
+      enabledAt?: string | null;
+      disabledAt?: string | null;
+      disabledReason?: string | null;
+    }
+  >;
   // routes the team's new queue work to the FoundationDB backend
   nuqFdb?: boolean;
 } | null;
@@ -1554,6 +1575,7 @@ export const searchRequestSchema = z
     timeout: z.int().positive().finite().prefault(60000),
     ignoreInvalidURLs: z.boolean().optional().prefault(false),
     __searchPreviewToken: z.string().optional(),
+    threatProtection: threatProtectionOverrideSchema.optional(),
     scrapeOptions: baseScrapeOptions
       .extend({
         formats: z
