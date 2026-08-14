@@ -62,7 +62,10 @@ if ! git merge --no-edit --no-ff "upstream/${UPSTREAM_BRANCH}"; then
     esac
   done < <(git status --porcelain | grep -E '^(DD|AU|UD|UA|DU|AA|UU)' || true)
 
-  if git status --porcelain | grep -qE '^(DD|AU|UD|UA|DU|AA|UU)'; then
+  # NOT `git status | grep -q`: GNU grep -q exits at the first match, which
+  # SIGPIPEs the still-streaming git status; under pipefail that flips the
+  # condition false and the script dies at `git commit` with no result emitted.
+  if [ -n "$(git ls-files --unmerged)" ]; then
     emit result conflict
     exit 2
   fi
