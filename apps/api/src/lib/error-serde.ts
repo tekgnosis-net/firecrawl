@@ -33,11 +33,15 @@ import {
   BrandingNotSupportedError,
   AudioUnsupportedUrlError,
   VideoUnsupportedUrlError,
+  MediaAccessDeniedError,
   XTwitterConfigurationError,
 } from "../scraper/scrapeURL/error";
+import { UnsafeDomainBlockedError } from "./threat-protection/error";
 
 // TODO: figure out correct typing for this
 const errorMap: Record<ErrorCodes, any> = {
+  // Terms responses are API-level, never transported through workers.
+  THIRD_PARTY_DATA_TERMS_REQUIRED: null,
   SCRAPE_TIMEOUT: ScrapeJobTimeoutError,
   MAP_TIMEOUT: MapTimeoutError,
   UNKNOWN_ERROR: UnknownError,
@@ -67,8 +71,10 @@ const errorMap: Record<ErrorCodes, any> = {
   CRAWL_DENIAL: CrawlDenialError,
   SCRAPE_AUDIO_UNSUPPORTED_URL: AudioUnsupportedUrlError,
   SCRAPE_VIDEO_UNSUPPORTED_URL: VideoUnsupportedUrlError,
+  SCRAPE_MEDIA_ACCESS_DENIED: MediaAccessDeniedError,
   SCRAPE_X_TWITTER_CONFIGURATION_ERROR: XTwitterConfigurationError,
   MAP_FAILED: MapFailedError,
+  unsafe_domain_blocked: UnsafeDomainBlockedError,
 
   // Zod errors
   BAD_REQUEST: null,

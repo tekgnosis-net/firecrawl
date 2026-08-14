@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { isIPv4 } from "node:net";
 import { v5 as uuidv5 } from "uuid";
 import { config } from "../config";
@@ -5,6 +6,7 @@ import { db } from "../db/connection";
 import * as schema from "../db/schema";
 import { redisRateLimitClient } from "../services/rate-limiter";
 import { isKeylessIpSuspicious } from "./spur";
+import { logger } from "./logger";
 
 // Keyless free tier: scrape, search, and interact can be used without an API key
 // from the official MCP server, CLI, or SDKs. It's gated per-IP/day by TWO
@@ -17,7 +19,11 @@ import { isKeylessIpSuspicious } from "./spur";
 const KEYLESS_REQUESTS_PER_DAY = config.KEYLESS_REQUESTS_PER_DAY;
 const KEYLESS_CREDITS_PER_DAY = config.KEYLESS_CREDITS_PER_DAY;
 
-export const KEYLESS_CREDITS_MESSAGE = `You've reached today's limit of free, unauthenticated credits for Firecrawl. Sign up for a free API key at https://firecrawl.dev for 1000 more credits and higher rate limits for free. (If you're an agent, you can also use https://firecrawl.dev/auth.md)`;
+// Shared 429 copy for both keyless request-cap and credit-cap failures.
+export const KEYLESS_FREE_TIER_LIMIT_MESSAGE = `You've hit Firecrawl's keyless free tier rate limit. To continue now, create a free API key at https://www.firecrawl.dev/signin.
+
+Then authenticate with:
+Authorization: Bearer YOUR_API_KEY`;
 
 // The tier is "configured" when BOTH limits are set — even to 0. Unset means the
 // feature is off (callers get a plain Unauthorized); 0 means it's on but the
@@ -30,6 +36,34 @@ export function isKeylessConfigured(): boolean {
 }
 
 const DAY_SECONDS = 86400;
+
+// This value is emitted only on quota exhaustion. It is a versioned, keyed
+// pseudonym—not an IP address—so analytics can join the event to the existing
+// privacy-controlled signup/OAuth matching pipeline without expanding raw-IP
+// logging. Rotation intentionally creates a new cohort namespace.
+export const KEYLESS_CONVERSION_COHORT_VERSION = "v1";
+
+function normalizeKeylessIpv4(ip: string): string {
+  const trimmed = ip.trim();
+  const lower = trimmed.toLowerCase();
+  return lower.startsWith("::ffff:") && isIPv4(trimmed.slice(7))
+    ? trimmed.slice(7)
+    : trimmed;
+}
+
+export function keylessConversionCohort(ip: string): string | undefined {
+  const secret = config.KEYLESS_CONVERSION_HMAC_SECRET;
+  const normalizedIp = normalizeKeylessIpv4(ip);
+  if (!secret || !normalizedIp) return undefined;
+  return `${KEYLESS_CONVERSION_COHORT_VERSION}:${createHmac("sha256", secret)
+    .update(normalizedIp)
+    .digest("base64url")}`;
+}
+
+export function keylessExhaustionTelemetry(ip: string): Record<string, string> {
+  const conversionCohort = keylessConversionCohort(ip);
+  return conversionCohort ? { conversionCohort } : {};
+}
 
 // Keyless teams reuse the `preview_` prefix so billing (autumn `isPreviewTeam`)
 // and GCS persistence are skipped automatically, with a dedicated infix so the
@@ -75,19 +109,75 @@ export function keylessTeamUuid(
  * is treated as IPv4.
  */
 export function isKeylessIpEligible(ip: string): boolean {
-  const normalized = ip.startsWith("::ffff:") ? ip.slice("::ffff:".length) : ip;
-  return isIPv4(normalized);
+  return isIPv4(normalizeKeylessIpv4(ip));
 }
 
 const requestsKey = (ip: string) => `keyless_requests:${ip}`;
 const creditsKey = (ip: string) => `keyless_credits:${ip}`;
 
+type KeylessQuotaReason = "requests" | "credits";
+
 type KeylessConsumeResult = {
   ok: boolean;
-  reason?: "requests" | "credits";
+  reason?: KeylessQuotaReason;
   requestsUsed: number;
   creditsUsed: number;
+  retryAfterSeconds?: number;
 };
+
+function positiveRedisTtl(ttl: number): number | undefined {
+  return ttl > 0 ? ttl : undefined;
+}
+
+/**
+ * Quota denials remain valid when Redis cannot provide the optional TTL hint.
+ * Keep that secondary lookup from changing a controlled 429 into a generic
+ * authentication failure.
+ */
+async function retryAfterSecondsFor(key: string): Promise<number | undefined> {
+  try {
+    return positiveRedisTtl(await redisRateLimitClient.ttl(key));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Structured response for projected-credit reservation exhaustion. */
+export async function keylessLimitBody(
+  teamId: string,
+  mode: string,
+): Promise<{
+  success: false;
+  error: string;
+  reason: "credits";
+  retry_after_seconds?: number;
+}> {
+  const ip = keylessIpFromTeamId(teamId);
+  let retryAfterSeconds: number | undefined;
+  try {
+    retryAfterSeconds = ip
+      ? positiveRedisTtl(await redisRateLimitClient.ttl(creditsKey(ip)))
+      : undefined;
+  } catch {
+    // The reservation already proved the limit; missing TTL must not turn its
+    // controlled 429 into a server error.
+  }
+  logger.warn("Keyless request blocked", {
+    canonicalLog: "keyless/consume",
+    event: "keyless_exhausted",
+    blocked: true,
+    reason: "credits",
+    mode,
+    retryAfterSeconds,
+    ...keylessExhaustionTelemetry(ip ?? ""),
+  });
+  return {
+    success: false,
+    error: KEYLESS_FREE_TIER_LIMIT_MESSAGE,
+    reason: "credits",
+    ...(retryAfterSeconds ? { retry_after_seconds: retryAfterSeconds } : {}),
+  };
+}
 
 type KeylessCreditReservationResult = {
   ok: boolean;
@@ -118,10 +208,22 @@ export async function consumeKeylessRequest(
   );
 
   if (requestsUsed > requestLimit) {
-    return { ok: false, reason: "requests", requestsUsed, creditsUsed };
+    return {
+      ok: false,
+      reason: "requests",
+      requestsUsed,
+      creditsUsed,
+      retryAfterSeconds: await retryAfterSecondsFor(rKey),
+    };
   }
   if (creditsUsed >= creditLimit) {
-    return { ok: false, reason: "credits", requestsUsed, creditsUsed };
+    return {
+      ok: false,
+      reason: "credits",
+      requestsUsed,
+      creditsUsed,
+      retryAfterSeconds: await retryAfterSecondsFor(creditsKey(ip)),
+    };
   }
   return { ok: true, requestsUsed, creditsUsed };
 }
@@ -210,19 +312,26 @@ return next
 
 /**
  * Read-only check of whether an IP could currently use the keyless tier (no
- * consumption). Used by the hosted MCP to decide, at connect time, whether to
- * serve keyless (eligible) or throw so FastMCP emits the OAuth challenge (not).
+ * consumption). Used by the hosted MCP before a keyless tool call so an
+ * ineligible caller receives structured recovery without an OAuth challenge.
  */
-export async function checkKeylessEligibility(
-  ip: string,
-): Promise<{ eligible: boolean; reason?: string }> {
+export async function checkKeylessEligibility(ip: string): Promise<{
+  eligible: boolean;
+  reason?:
+    | KeylessQuotaReason
+    | "disabled"
+    | "ineligible_ip"
+    | "suspicious"
+    | "error";
+  retryAfterSeconds?: number;
+}> {
   if (!isKeylessConfigured()) return { eligible: false, reason: "disabled" };
   if (!ip || !isKeylessIpEligible(ip)) {
     return { eligible: false, reason: "ineligible_ip" };
   }
   // Optional Spur Context check (only when SPUR_API_KEY is set): treat IPs on
-  // anonymizing/rotating infrastructure as ineligible so the hosted MCP issues
-  // an OAuth challenge instead of serving keyless that auth would then reject.
+  // anonymizing/rotating infrastructure as ineligible so the hosted MCP can
+  // return a bounded recovery result instead of serving a request auth rejects.
   if (await isKeylessIpSuspicious(ip)) {
     return { eligible: false, reason: "suspicious" };
   }
@@ -232,19 +341,28 @@ export async function checkKeylessEligibility(
       10,
     );
     if (requestsUsed >= (KEYLESS_REQUESTS_PER_DAY ?? 0)) {
-      return { eligible: false, reason: "requests" };
+      return {
+        eligible: false,
+        reason: "requests",
+        retryAfterSeconds: await retryAfterSecondsFor(requestsKey(ip)),
+      };
     }
+    const creditKey = creditsKey(ip);
     const creditsUsed = parseInt(
-      (await redisRateLimitClient.get(creditsKey(ip))) ?? "0",
+      (await redisRateLimitClient.get(creditKey)) ?? "0",
       10,
     );
     if (creditsUsed >= (KEYLESS_CREDITS_PER_DAY ?? 0)) {
-      return { eligible: false, reason: "credits" };
+      return {
+        eligible: false,
+        reason: "credits",
+        retryAfterSeconds: await retryAfterSecondsFor(creditKey),
+      };
     }
     return { eligible: true };
   } catch {
-    // Limiter store unavailable — fail closed so the MCP issues an OAuth
-    // challenge rather than granting unbounded keyless.
+    // Limiter store unavailable — fail closed so the MCP returns structured
+    // recovery rather than granting unbounded keyless access.
     return { eligible: false, reason: "error" };
   }
 }

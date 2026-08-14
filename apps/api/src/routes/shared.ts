@@ -29,7 +29,8 @@ import {
   CREDITS_FEATURE_ID,
 } from "../services/autumn/autumn.service";
 import { getTeamBalance } from "../services/autumn/usage";
-import { canUseDataLayerForRequest } from "../lib/data-layer";
+import { getThirdPartyDataTermsRequiredResponse } from "../lib/exchange";
+import { getExchangeAccessForRequestBody } from "../lib/exchange-request";
 import { getScrapeZDR } from "../lib/zdr-helpers";
 
 export function checkCreditsMiddleware(
@@ -74,10 +75,10 @@ export function checkCreditsMiddleware(
           }
 
           // Enforce 50-credit cap for unverified agent keys. Autumn is the
-          // source of truth for credit usage now (not ACUC.adjusted_credits_used):
-          // getTeamBalance().usage is the team's credits used this period. If
-          // Autumn is unavailable we fail open (skip the cap), matching the
-          // Autumn-outage behavior of the main credit check below.
+          // source of truth for credit usage: getTeamBalance().usage is the
+          // team's credits used this period. If Autumn is unavailable we fail
+          // open (skip the cap), matching the Autumn-outage behavior of the
+          // main credit check below.
           const UNVERIFIED_CREDIT_LIMIT = 50;
           let unverifiedCreditsUsed: number | null = null;
           try {
@@ -145,6 +146,7 @@ export function checkCreditsMiddleware(
         properties: {
           source: "checkCreditsMiddleware",
           path: req.path,
+          apiKeyId: req.acuc?.api_key_id ?? null,
         },
         featureId,
       });
@@ -246,7 +248,14 @@ export function authMiddleware(
           }
           return res
             .status(auth.status)
-            .json({ success: false, error: auth.error });
+            .json({
+              success: false,
+              error: auth.error,
+              ...(auth.keylessReason ? { reason: auth.keylessReason } : {}),
+              ...(auth.retryAfterSeconds
+                ? { retry_after_seconds: auth.retryAfterSeconds }
+                : {}),
+            });
         } else {
           return;
         }
@@ -256,13 +265,6 @@ export function authMiddleware(
 
       req.auth = { team_id, org_id };
       req.acuc = chunk ?? undefined;
-      if (chunk) {
-        req.account = {
-          remainingCredits: chunk.price_should_be_graceful
-            ? chunk.remaining_credits + chunk.price_credits
-            : chunk.remaining_credits,
-        };
-      }
       next();
     })().catch(err => next(err));
   };
@@ -293,33 +295,60 @@ export function blocklistMiddleware(
   res: Response,
   next: NextFunction,
 ) {
+  return blocklistGate(req, res, next, { exchange: false });
+}
+
+/**
+ * Blocklist gate for single-URL scrape-shaped routes (scrape, crawl), where
+ * an Exchange-eligible URL may bypass the blocklist because the exchange
+ * engine can serve it. Everything else (map, search, batch scrape, monitors)
+ * keeps plain blocklist behavior - batch stays out until its jobs carry the
+ * access flags the worker-side recheck needs.
+ */
+export function scrapeBlocklistMiddleware(
+  req: RequestWithMaybeACUC<any, any, any>,
+  res: Response,
+  next: NextFunction,
+) {
+  return blocklistGate(req, res, next, { exchange: true });
+}
+
+function blocklistGate(
+  req: RequestWithMaybeACUC<any, any, any>,
+  res: Response,
+  next: NextFunction,
+  options: { exchange: boolean },
+) {
   (async () => {
     const zeroDataRetention =
       getScrapeZDR(req.acuc?.flags) === "forced" ||
-      req.body?.zeroDataRetention === true ||
-      req.body?.lockdown === true;
-    const canUseDataLayer =
+      req.body?.zeroDataRetention === true;
+    const exchangeAccess =
+      options.exchange &&
       typeof req.body.url === "string" &&
-      (await canUseDataLayerForRequest({
-        url: req.body.url,
-        formats: req.body.formats,
-        actions: req.body.actions,
-        headers: req.body.headers,
-        waitFor: req.body.waitFor,
-        mobile: req.body.mobile,
-        location: req.body.location,
-        proxy: req.body.proxy,
-        blockAds: req.body.blockAds,
-        zeroDataRetention,
-        lockdown: req.body.lockdown,
+      (await getExchangeAccessForRequestBody({
+        body: req.body,
         flags: req.acuc?.flags ?? null,
+        url: req.body.url,
+        zeroDataRetention,
       }));
+    const canUseExchange =
+      typeof exchangeAccess === "object" && exchangeAccess.allowed;
+
+    if (typeof exchangeAccess === "object" && exchangeAccess.termsRequired) {
+      if (!res.headersSent) {
+        return res
+          .status(403)
+          .json(getThirdPartyDataTermsRequiredResponse(exchangeAccess.terms));
+      }
+    }
 
     if (
       typeof req.body.url === "string" &&
-      !canUseDataLayer &&
+      !canUseExchange &&
       isUrlBlocked(req.body.url, req.acuc?.flags ?? null, {
         team_id: req.acuc?.team_id ?? null,
+        org_id: req.acuc?.org_id ?? null,
         origin: typeof req.body.origin === "string" ? req.body.origin : null,
       })
     ) {

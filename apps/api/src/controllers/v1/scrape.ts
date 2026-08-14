@@ -14,6 +14,11 @@ import { fromV1ScrapeOptions } from "../v2/types";
 import { TransportableError } from "../../lib/error";
 import { NuQJob } from "../../services/worker/nuq";
 import { checkPermissions } from "../../lib/permissions";
+import {
+  actionTypesOf,
+  checkKeyFormatRestriction,
+  formatTypesOf,
+} from "../../lib/key-restriction";
 import { includesFormat } from "../../lib/format-utils";
 import { teamConcurrencySemaphore } from "../../services/worker/team-semaphore";
 import { processJobInternal } from "../../services/worker/scrape-worker";
@@ -24,13 +29,15 @@ import { getErrorContactMessage } from "../../lib/deployment";
 import { captureExceptionWithZdrCheck } from "../../services/sentry";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 import {
-  KEYLESS_CREDITS_MESSAGE,
   adjustKeylessCredits,
+  keylessLimitBody,
   logKeylessCreditUsage,
   reserveKeylessCredits,
 } from "../../lib/keyless";
 import { projectScrapeCredits } from "../../lib/keyless-credit-projection";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
+import { resolveThreatProtection } from "../../lib/threat-protection/request";
+import { getEffectiveConcurrencyLimit } from "../../lib/concurrency-limit";
 
 export async function scrapeController(
   req: RequestWithAuth<{}, ScrapeResponse, ScrapeRequest>,
@@ -45,11 +52,39 @@ export async function scrapeController(
   const preNormalizedBody = { ...req.body };
   req.body = scrapeRequestSchema.parse(req.body);
 
-  const permissions = checkPermissions(req.body, req.acuc?.flags);
+  const threatProtection = await resolveThreatProtection({
+    teamId: req.auth.team_id,
+    orgId: req.acuc?.org_id ?? null,
+    flags: req.acuc?.flags ?? null,
+    override: req.body.threatProtection,
+  });
+  if (threatProtection.error) {
+    return res.status(403).json({
+      success: false,
+      error: threatProtection.error,
+    });
+  }
+
+  const permissions = checkPermissions(req.body, req.acuc?.flags, {
+    threatProtectionOrgConfig: threatProtection.orgConfig,
+  });
   if (permissions.error) {
     return res.status(403).json({
       success: false,
       error: permissions.error,
+    });
+  }
+
+  const keyRestriction = await checkKeyFormatRestriction(
+    formatTypesOf(req.body.formats),
+    actionTypesOf(req.body.actions),
+    req.acuc?.api_key_id,
+    req.acuc?.flags ?? null,
+  );
+  if (!keyRestriction.allowed) {
+    return res.status(keyRestriction.status).json({
+      success: false,
+      error: keyRestriction.error,
     });
   }
 
@@ -121,10 +156,9 @@ export async function scrapeController(
     );
     if (!reservation.ok) {
       applyAgentAuthDiscoveryHeader(res);
-      return res.status(429).json({
-        success: false,
-        error: KEYLESS_CREDITS_MESSAGE,
-      });
+      return res.status(429).json(
+        await keylessLimitBody(req.auth.team_id, "v1_scrape"),
+      );
     }
     reservedKeylessCredits = projectedKeylessCredits;
   }
@@ -155,7 +189,7 @@ export async function scrapeController(
     doc = await teamConcurrencySemaphore.withSemaphore(
       req.auth.team_id,
       jobId,
-      req.acuc?.concurrency || 1,
+      await getEffectiveConcurrencyLimit(req.auth.team_id, req.acuc?.org_id),
       aborter.signal,
       timeout ?? 60_000,
       async limited => {
@@ -193,7 +227,9 @@ export async function scrapeController(
               bypassBilling: isDirectToBullMQ,
               zeroDataRetention,
               teamFlags: req.acuc?.flags ?? null,
+              orgId: req.acuc?.org_id ?? null,
               agentIndexOnly: (req as any).agentIndexOnly ?? false,
+              threatProtection: threatProtection.policy ?? undefined,
             },
             skipNuq: true,
             origin,
@@ -251,6 +287,22 @@ export async function scrapeController(
 
       if (e.code === "SCRAPE_ACTIONS_NOT_SUPPORTED") {
         return res.status(400).json({
+          success: false,
+          code: e.code,
+          error: e.message,
+        });
+      }
+
+      if (e.code === "unsafe_domain_blocked") {
+        return res.status(403).json({
+          success: false,
+          code: e.code,
+          error: e.message,
+        });
+      }
+
+      if (e.code === "SCRAPE_MEDIA_ACCESS_DENIED") {
+        return res.status(403).json({
           success: false,
           code: e.code,
           error: e.message,

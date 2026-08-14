@@ -1,5 +1,30 @@
 """
 Research functionality for Firecrawl v2 API.
+
+These functions query Firecrawl's **research paper index** (~43M paper
+abstracts) served at ``/v2/search/research``. The corpus is roughly 90%
+biomedical and life sciences — PubMed, bioRxiv and medRxiv — with arXiv
+covering physics, mathematics and computer science.
+
+.. warning::
+   This is **not** the same thing as ``search(categories=["research"])``.
+   That option is a website/domain filter applied to ordinary web search: it
+   restricts Google-style results to about 14 academic domains
+   (arxiv.org, pubmed.ncbi.nlm.nih.gov, nature.com, sciencedirect.com, ...)
+   and returns web page snippets. The functions in this module query the
+   paper index itself and return ranked paper records with full abstracts,
+   passage-level reads and citation-graph neighbours.
+
+   Use ``search_papers()`` for literature search; use
+   ``search(categories=["research"])`` when you want ordinary web results
+   narrowed to academic sites.
+
+.. note::
+   **Response keys are camelCase.** Unlike the rest of the Python SDK, these
+   functions return the raw JSON body from the API as a ``dict``: it is not
+   parsed into typed models and it is **not** normalized to snake_case. Expect
+   ``paperId``, ``primaryId``, ``createdDate``, ``updateDate``,
+   ``articleRank``, ``seedOverlap``, ``poolSize`` and so on.
 """
 
 from typing import Any, Dict, List, Optional
@@ -7,6 +32,14 @@ from urllib.parse import quote
 
 from ..utils import HttpClient, handle_response_error
 from ..utils.get_version import get_version
+from .research_docs import (
+    INSPECT_PAPER_DOC,
+    READ_PAPER_DOC,
+    RELATED_PAPERS_DOC,
+    SEARCH_GITHUB_DOC,
+    SEARCH_PAPERS_DOC,
+    doc,
+)
 
 
 BASE = "/v2/search/research"
@@ -32,6 +65,7 @@ def _get(client: HttpClient, path: str) -> Dict[str, Any]:
     return response.json()
 
 
+@doc(SEARCH_PAPERS_DOC)
 def search_papers(
     client: HttpClient,
     query: str,
@@ -60,10 +94,15 @@ def search_papers(
     )
 
 
+@doc(INSPECT_PAPER_DOC)
 def inspect_paper(client: HttpClient, paper_id: str) -> Dict[str, Any]:
-    return _get(client, f"{BASE}/papers/{quote(paper_id, safe='')}")
+    return _get(
+        client,
+        f"{BASE}/papers/{quote(paper_id, safe='')}" + _query({"origin": ORIGIN}),
+    )
 
 
+@doc(READ_PAPER_DOC)
 def read_paper(
     client: HttpClient,
     paper_id: str,
@@ -78,6 +117,7 @@ def read_paper(
     )
 
 
+@doc(RELATED_PAPERS_DOC)
 def related_papers(
     client: HttpClient,
     paper_id: str,
@@ -104,6 +144,7 @@ def related_papers(
     )
 
 
+@doc(SEARCH_GITHUB_DOC)
 def search_github(
     client: HttpClient,
     query: str,

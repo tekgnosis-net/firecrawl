@@ -1,9 +1,8 @@
 import express, { Request, Response } from "express";
-import { Agent, fetch } from "undici";
 import { z } from "zod";
 import { v7 as uuidv7 } from "uuid";
-import { config } from "../../config";
 import { logger as rootLogger } from "../../lib/logger";
+import { fetchResearchUpstream } from "../../lib/research-upstream";
 import { chargeKeylessCredits } from "../../lib/keyless";
 import { billTeam } from "../../services/billing/credit_billing";
 import { getSearchForcedKind } from "../../lib/zdr-helpers";
@@ -18,19 +17,13 @@ import type {
 import type { RequestWithAuth } from "../v1/types";
 import { wrap } from "../../routes/shared";
 import { integrationSchema } from "../../utils/integration";
+import { requestOrigin } from "../../lib/request-origin";
 
-const TIMEOUT_MS = 120_000;
 const SEARCH_CREDITS_PER_TEN_RESULTS = 2;
 const ZDR_SEARCH_CREDITS_PER_TEN_RESULTS = 10;
 
 const FORWARDED_REQUEST_HEADERS = ["accept", "x-request-id"];
 const FORWARDED_RESPONSE_HEADERS = ["content-type", "x-request-id"];
-
-const dispatcher = new Agent({
-  connectTimeout: TIMEOUT_MS,
-  headersTimeout: TIMEOUT_MS,
-  bodyTimeout: TIMEOUT_MS,
-});
 
 const multiString = z
   .union([z.string(), z.array(z.string())])
@@ -91,6 +84,50 @@ const githubSearchSchema = z.strictObject({
   k: kSchema(100),
   ...commonQuery,
 });
+
+const starsSchema = z.coerce.number().int().nonnegative().optional();
+
+const booleanFlag = z
+  .union([z.boolean(), z.enum(["true", "false"])])
+  .optional()
+  .transform(value =>
+    value === undefined ? undefined : value === true || value === "true",
+  );
+
+const developerSearchSchema = z.strictObject({
+  query: z.string().min(1),
+  k: kSchema(100),
+  types: multiString,
+  repos: multiString,
+  sources: multiString,
+  passages: kSchema(5),
+  language: z.string().min(1).optional(),
+  topic: multiString,
+  license: z.string().min(1).optional(),
+  min_stars: starsSchema,
+  max_stars: starsSchema,
+  archived: booleanFlag,
+  fork: booleanFlag,
+  skills: z.enum(["only"]).optional(),
+  ...commonQuery,
+});
+
+const DEVELOPER_SEARCH_QUERY_KEYS = [
+  "query",
+  "k",
+  "types",
+  "repos",
+  "sources",
+  "passages",
+  "language",
+  "topic",
+  "license",
+  "min_stars",
+  "max_stars",
+  "archived",
+  "fork",
+  "skills",
+];
 
 type ResearchEndpointConfig = {
   kind: ResearchRequestKind;
@@ -155,37 +192,8 @@ function addLegacySnakeCaseAliases<T>(value: T): T {
   return object as T;
 }
 
-function appendQuery(
-  url: URL,
-  params: Record<string, unknown>,
-  allowed: string[],
-) {
-  for (const key of allowed) {
-    const value = params[key];
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        if (item !== undefined && item !== null) {
-          url.searchParams.append(key, String(item));
-        }
-      }
-    } else if (value !== undefined && value !== null) {
-      url.searchParams.append(key, String(value));
-    }
-  }
-}
-
 function resultCount(body: any): number {
   return Array.isArray(body?.results) ? body.results.length : 0;
-}
-
-function firstHeaderValue(req: Request, key: string): string | undefined {
-  const value = req.headers[key];
-  if (Array.isArray(value)) return value[0];
-  return typeof value === "string" ? value : undefined;
-}
-
-function requestOrigin(params: ResearchQueryParams, req: Request) {
-  return params.origin ?? firstHeaderValue(req, "x-origin") ?? "api";
 }
 
 function creditsFor(
@@ -193,6 +201,17 @@ function creditsFor(
   body: any,
   req: RequestWithAuth<any, any, any>,
 ) {
+  // Make certain research index accesses free (AI/ML & life-sciences indices).
+  // Research paper endpoints should have no credit cost. Explicit exceptions
+  // remain billable: GitHub search and developer/code search.
+  const freeResearchKinds = new Set([
+    "research_paper_search",
+    "research_related_papers",
+    "research_paper_read",
+    "research_paper_inspect",
+  ]);
+  if (freeResearchKinds.has(config.kind)) return 0;
+
   if (config.billAs === "scrape") return 1;
   const forcedKind = getSearchForcedKind(req.acuc?.flags);
   const perTen =
@@ -215,18 +234,12 @@ function researchError(
   });
 }
 
-async function fetchResearchUpstream(
+async function fetchForRequest(
   req: RequestWithAuth<any, any, any>,
   path: string,
   params: Record<string, unknown>,
   queryKeys: string[],
 ) {
-  const base = config.RESEARCH_PROXY_URL;
-  if (!base) return null;
-
-  const url = new URL(base.replace(/\/+$/, "") + path);
-  appendQuery(url, params, queryKeys);
-
   const headers: Record<string, string> = {};
   for (const h of FORWARDED_REQUEST_HEADERS) {
     const v = req.headers[h];
@@ -234,12 +247,7 @@ async function fetchResearchUpstream(
   }
   headers["firecrawl-team-id"] = req.auth.team_id;
 
-  return fetch(url, {
-    method: "GET",
-    headers,
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-    dispatcher,
-  });
+  return fetchResearchUpstream({ path, params, queryKeys, headers });
 }
 
 function createResearchController(
@@ -250,6 +258,7 @@ function createResearchController(
 ): ResearchController {
   return async (req, res: Response) => {
     const authedReq = req as RequestWithAuth<any, any, any>;
+
     const started = Date.now();
     const jobId = uuidv7();
     const logger = rootLogger.child({
@@ -259,7 +268,8 @@ function createResearchController(
       teamId: authedReq.auth.team_id,
     });
 
-    const parsed = schema.safeParse(req.query);
+    const source = req.method === "POST" ? (req.body ?? {}) : req.query;
+    const parsed = schema.safeParse(source);
     if (!parsed.success) {
       logger.warn("Invalid research query", { error: parsed.error.issues });
       return researchError(
@@ -290,7 +300,7 @@ function createResearchController(
     let credits = 0;
 
     try {
-      const upstream = await fetchResearchUpstream(
+      const upstream = await fetchForRequest(
         authedReq,
         endpoint.upstreamPath(params, authedReq),
         params,
@@ -320,7 +330,6 @@ function createResearchController(
         if (credits > 0) {
           billTeam(
             authedReq.auth.team_id,
-            authedReq.acuc?.sub_id ?? undefined,
             credits,
             authedReq.acuc?.api_key_id ?? null,
             {
@@ -481,6 +490,35 @@ export function createResearchRouter(options: { legacy?: boolean } = {}) {
       ),
     ),
   );
+
+  return router;
+}
+
+export function createDeveloperRouter(options: { root?: boolean } = {}) {
+  const router = express.Router();
+
+  const controller = wrap(
+    createResearchController(
+      developerSearchSchema,
+      DEVELOPER_SEARCH_QUERY_KEYS,
+      {
+        kind: "code_search",
+        table: "code_searches",
+        action: "searchDeveloper",
+        targetHint: params => String(params.query),
+        upstreamPath: () => "/v2/code/search",
+        billAs: "search",
+      },
+    ),
+  );
+
+  if (options.root) {
+    router.get("/", controller);
+    router.post("/", controller);
+  } else {
+    router.get("/search", controller);
+    router.post("/search", controller);
+  }
 
   return router;
 }

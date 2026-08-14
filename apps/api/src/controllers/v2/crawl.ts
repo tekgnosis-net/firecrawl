@@ -19,6 +19,11 @@ import { logger as _logger } from "../../lib/logger";
 import { generateCrawlerOptionsFromPrompt } from "../../scraper/scrapeURL/transformers/llmExtract";
 import { CostTracking } from "../../lib/cost-tracking";
 import { checkPermissions } from "../../lib/permissions";
+import {
+  actionTypesOf,
+  checkKeyFormatRestriction,
+  formatTypesOf,
+} from "../../lib/key-restriction";
 import { buildPromptWithWebsiteStructure } from "../../lib/map-utils";
 import {
   crawlGroup,
@@ -26,6 +31,13 @@ import {
 } from "../../services/worker/nuq-router";
 import { logRequest } from "../../services/logging/log_job";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
+import { resolveThreatProtection } from "../../lib/threat-protection/request";
+import { checkUrl } from "../../lib/threat-protection";
+import { UnsafeDomainBlockedError } from "../../lib/threat-protection/error";
+import { calculateThreatScanCredits } from "../../lib/scrape-billing";
+import { billTeam } from "../../services/billing/credit_billing";
+import { getEffectiveConcurrencyLimit } from "../../lib/concurrency-limit";
+import { emitRejectedScrapeActivityEvent } from "../../lib/siem-logging";
 
 export async function crawlController(
   req: RequestWithAuth<{}, CrawlResponse, CrawlRequest>,
@@ -33,10 +45,27 @@ export async function crawlController(
 ) {
   const preNormalizedBody = req.body;
   req.body = crawlRequestSchema.parse(req.body);
+  const id = uuidv7();
+  const zeroDataRetention =
+    getScrapeZDR(req.acuc?.flags) === "forced" || req.body.zeroDataRetention;
+
+  const threatProtection = await resolveThreatProtection({
+    teamId: req.auth.team_id,
+    orgId: req.acuc?.org_id ?? null,
+    flags: req.acuc?.flags ?? null,
+    override: req.body.scrapeOptions?.threatProtection,
+  });
+  if (threatProtection.error) {
+    return res.status(403).json({
+      success: false,
+      error: threatProtection.error,
+    });
+  }
 
   const permissions = checkPermissions(
     { ...req.body, crawlerOptions: req.body },
     req.acuc?.flags,
+    { threatProtectionOrgConfig: threatProtection.orgConfig },
   );
   if (permissions.error) {
     return res.status(403).json({
@@ -45,10 +74,66 @@ export async function crawlController(
     });
   }
 
-  const zeroDataRetention =
-    getScrapeZDR(req.acuc?.flags) === "forced" || req.body.zeroDataRetention;
+  // Threat protection: check the seed URL before kicking off the crawl.
+  // Blocked seed => request-level error. Discovered links are checked during
+  // link discovery in the workers (blocked ones are silently skipped).
+  if (threatProtection.policy) {
+    const decision = await checkUrl(req.body.url, threatProtection.policy, {
+      teamId: req.auth.team_id,
+    });
+    if (!decision.allowed) {
+      // A blocked seed still bills the scan fee when the classifier was
+      // consulted — the scan already happened. (An allowed seed is not billed
+      // here: its scrape job re-checks the cached verdict and bills there.)
+      const threatScanCredits = calculateThreatScanCredits([decision]);
+      if (threatScanCredits > 0) {
+        billTeam(
+          req.auth.team_id,
+          threatScanCredits,
+          req.acuc?.api_key_id ?? null,
+          { endpoint: "crawl" },
+        ).catch(error => {
+          _logger.error(
+            `Failed to bill team ${req.auth.team_id} for ${threatScanCredits} threat scan credit(s): ${error}`,
+          );
+        });
+      }
+      const error = new UnsafeDomainBlockedError(req.body.url, decision);
+      emitRejectedScrapeActivityEvent({
+        scrapeId: uuidv7(),
+        requestId: id,
+        endpoint: "crawl",
+        teamId: req.auth.team_id,
+        apiKeyId: req.acuc?.api_key_id ?? null,
+        auditMetadata: req.body.scrapeOptions?.auditMetadata,
+        url: req.body.url,
+        error,
+        threatDecisions: [decision],
+        origin: req.body.origin ?? "api",
+        integration: req.body.integration,
+        zeroDataRetention: zeroDataRetention ?? false,
+      });
+      return res.status(403).json({
+        success: false,
+        code: error.code,
+        error: error.message,
+      });
+    }
+  }
 
-  const id = uuidv7();
+  const keyRestriction = await checkKeyFormatRestriction(
+    formatTypesOf(req.body.scrapeOptions?.formats),
+    actionTypesOf(req.body.scrapeOptions?.actions),
+    req.acuc?.api_key_id,
+    req.acuc?.flags ?? null,
+  );
+  if (!keyRestriction.allowed) {
+    return res.status(keyRestriction.status).json({
+      success: false,
+      error: keyRestriction.error,
+    });
+  }
+
   const logger = _logger.child({
     crawlId: id,
     module: "api/v2",
@@ -75,7 +160,10 @@ export async function crawlController(
     api_key_id: req.acuc?.api_key_id ?? null,
   });
 
-  let { remainingCredits } = req.account!;
+  // checkCreditsMiddleware (always runs before this controller) is the source
+  // of truth: Infinity when Autumn allows the request, the real remaining when
+  // it clamps a low-credit crawl. Default to no clamp if it's somehow unset.
+  let remainingCredits = req.account?.remainingCredits ?? Infinity;
   const useDbAuthentication = config.USE_DB_AUTHENTICATION;
   if (!useDbAuthentication) {
     remainingCredits = Infinity;
@@ -97,6 +185,7 @@ export async function crawlController(
         basePrompt: req.body.prompt,
         url: req.body.url,
         teamId: req.auth.team_id,
+        orgId: req.acuc?.org_id ?? null,
         flags: req.acuc?.flags ?? null,
         logger,
         limit: 50,
@@ -182,6 +271,10 @@ export async function crawlController(
     originalBodyLimit: preNormalizedBody.limit,
   });
 
+  const effectiveConcurrency = await getEffectiveConcurrencyLimit(
+    req.auth.team_id,
+    req.acuc?.org_id,
+  );
   const sc: StoredCrawl = {
     originUrl: req.body.url,
     crawlerOptions: toV0CrawlerOptions(finalCrawlerOptions),
@@ -189,17 +282,17 @@ export async function crawlController(
     internalOptions: {
       disableSmartWaitCache: true,
       teamId: req.auth.team_id,
+      orgId: req.acuc?.org_id ?? null,
       saveScrapeResultToGCS: config.GCS_FIRE_ENGINE_BUCKET_NAME ? true : false,
       zeroDataRetention,
       agentIndexOnly: (req as any).agentIndexOnly ?? false,
+      threatProtection: threatProtection.policy ?? undefined,
     },
     team_id: req.auth.team_id,
     createdAt: Date.now(),
     maxConcurrency:
       req.body.maxConcurrency !== undefined
-        ? req.acuc?.concurrency !== undefined
-          ? Math.min(req.body.maxConcurrency, req.acuc.concurrency)
-          : req.body.maxConcurrency
+        ? Math.min(req.body.maxConcurrency, effectiveConcurrency)
         : undefined,
     zeroDataRetention,
     v1: true,

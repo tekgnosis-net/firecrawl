@@ -415,6 +415,25 @@ describe("Scrape tests", () => {
     );
   });
 
+  describeIf(ALLOW_TEST_SUITE_WEBSITE)("text/plain scrape support", () => {
+    it.concurrent(
+      "does not escape underscores in text/plain markdown",
+      async () => {
+        const response = await scrape(
+          {
+            url: `${base}/llms-underscore.txt`,
+            formats: ["markdown"],
+          },
+          identity,
+        );
+
+        expect(response.markdown).toContain("access_policies");
+        expect(response.markdown).not.toContain("access\\_policies");
+      },
+      scrapeTimeout,
+    );
+  });
+
   describeIf(TEST_PRODUCTION)("Fire-Engine scraping", () => {
     it.concurrent(
       "scrape status works",

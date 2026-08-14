@@ -2,6 +2,14 @@ import { config } from "../../../config";
 import type { BrowserCookie, Meta } from "..";
 import type { Postprocessor } from ".";
 import type { EngineScrapeResult } from "../engines";
+import { throwIfMediaAccessDenied } from "../error";
+
+// Transcript enrichment is best-effort: the postprocessor loop swallows its
+// errors and returns the page without a transcript. But an unbounded fetch to
+// avgrab can hang on a slow extraction and silently consume the entire scrape
+// budget, turning "no transcript" into a scrape timeout (SCRAPE_TIMEOUT 500s).
+// A bound lets the graceful degradation actually fire.
+const METADATA_FETCH_TIMEOUT_MS = 45_000;
 
 type YouTubeMetadataResponse = {
   thumbnail_image: {
@@ -111,12 +119,14 @@ async function getYouTubeMetadata(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(requestBody),
+    signal: AbortSignal.timeout(METADATA_FETCH_TIMEOUT_MS),
   });
 
   if (!response.ok) {
     const error = await response
       .json()
       .catch(() => ({ detail: "Unknown error" }));
+    throwIfMediaAccessDenied(error);
     throw new Error(`YouTube metadata extraction failed: ${error.detail}`);
   }
 

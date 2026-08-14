@@ -566,7 +566,10 @@ def prepare_scrape_options(options: Optional[ScrapeOptions]) -> Optional[Dict[st
         "block_ads": "blockAds",
         "store_in_cache": "storeInCache",
         "max_age": "maxAge",
+        "min_age": "minAge",
         "redact_pii": "redactPII",
+        "threat_protection": "threatProtection",
+        "audit_metadata": "auditMetadata",
     }
     
     # Apply field mappings
@@ -581,6 +584,18 @@ def prepare_scrape_options(options: Optional[ScrapeOptions]) -> Optional[Dict[st
             scrape_data["redactPII"]["replaceStyle"] = scrape_data["redactPII"].pop(
                 "replace_style"
             )
+
+    # threatProtection is a nested object whose inner fields also need
+    # camel-casing.
+    if isinstance(scrape_data.get("threatProtection"), dict):
+        threat_data = scrape_data["threatProtection"]
+        for snake_case, camel_case in (
+            ("risk_score_threshold", "riskScoreThreshold"),
+            ("blocked_tlds", "blockedTlds"),
+            ("failure_policy", "failurePolicy"),
+        ):
+            if snake_case in threat_data:
+                threat_data[camel_case] = threat_data.pop(snake_case)
     
     # Handle special cases
     for key, value in options_data.items():
@@ -804,4 +819,4 @@ def prepare_scrape_options(options: Optional[ScrapeOptions]) -> Optional[Dict[st
                 # For fields that don't need conversion, use as-is
                 scrape_data[key] = value
     
-    return scrape_data  
+    return scrape_data

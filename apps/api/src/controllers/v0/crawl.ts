@@ -39,6 +39,10 @@ import {
 } from "../../services/worker/nuq-router";
 import { logRequest } from "../../services/logging/log_job";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
+import {
+  isThreatProtectionForced,
+  THREAT_PROTECTION_V0_UNSUPPORTED_MESSAGE,
+} from "../../lib/threat-protection/request";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
 
 export async function crawlController(req: Request, res: Response) {
@@ -55,6 +59,12 @@ export async function crawlController(req: Request, res: Response) {
       return res.status(400).json({
         error:
           "Your team has zero data retention enabled. This is not supported on the v0 API. Please update your code to use the v1 API.",
+      });
+    }
+
+    if (isThreatProtectionForced(chunk?.flags)) {
+      return res.status(403).json({
+        error: THREAT_PROTECTION_V0_UNSUPPORTED_MESSAGE,
       });
     }
 
@@ -132,7 +142,7 @@ export async function crawlController(req: Request, res: Response) {
     const autumnResult = await autumnService.checkCredits({
       teamId: team_id,
       value: limitCheck,
-      properties: { source: "v0/crawl" },
+      properties: { source: "v0/crawl", apiKeyId: chunk?.api_key_id ?? null },
     });
 
     if (autumnResult !== null && !autumnResult.allowed) {
@@ -170,6 +180,7 @@ export async function crawlController(req: Request, res: Response) {
     if (
       isUrlBlocked(url, auth.chunk?.flags ?? null, {
         team_id: auth.chunk?.team_id ?? team_id,
+        org_id: auth.chunk?.org_id ?? null,
         origin: req.body?.origin ?? null,
       })
     ) {
@@ -214,6 +225,7 @@ export async function crawlController(req: Request, res: Response) {
       team_id,
     );
     internalOptions.disableSmartWaitCache = true; // NOTE: smart wait disabled for crawls to ensure contentful scrape, speed does not matter
+    internalOptions.orgId = auth.chunk?.org_id ?? null;
     internalOptions.saveScrapeResultToGCS = process.env
       .GCS_FIRE_ENGINE_BUCKET_NAME
       ? true

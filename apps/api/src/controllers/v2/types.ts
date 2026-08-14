@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { config } from "../../config";
 import { z } from "zod";
 import { protocolIncluded, checkUrl } from "../../lib/validateUrl";
+import { hasReachableHost } from "../../lib/url-utils";
 import { countries } from "../../lib/validate-country";
 import { includesFormat } from "../../lib/format-utils";
 import {
@@ -28,10 +29,19 @@ import {
 import { BrandingProfile } from "../../types/branding";
 import { ProductProfile } from "../../types/product";
 import { MenuProfile } from "../../types/menu";
+import { threatProtectionOverrideSchema } from "../../lib/threat-protection/config";
+import { auditMetadataSchema } from "../../lib/siem-logging/types";
 
 // Base URL schema with common validation logic
-export const URL = z.preprocess(
-  x => {
+export const URL = z
+  .string()
+  // .overwrite must stay after .string(). It interpolates x into a template, so
+  // a non-string url would become the string "http://undefined" — a valid URL
+  // whose only failure is the TLD check below, which would blame a field the
+  // caller never sent. Letting .string() reject it first gives the real error.
+  // .overwrite rather than .transform, so this stays a ZodString and .url() /
+  // .regex() can still chain onto it.
+  .overwrite(x => {
     if (!protocolIncluded(x as string)) {
       x = `http://${x}`;
     }
@@ -47,34 +57,33 @@ export const URL = z.preprocess(
     // }
 
     return x;
-  },
-  z
-    .url()
-    .regex(/^https?:\/\//i, "URL uses unsupported protocol")
-    .refine(x => {
-      if (config.TEST_SUITE_SELF_HOSTED && config.ALLOW_LOCAL_WEBHOOKS) {
-        if (
-          /^https?:\/\/(localhost|127\.0\.0\.1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(:\d+)?([\/?#]|$)/i.test(
-            x as string,
-          )
-        ) {
-          return true;
-        }
-      }
-      return /(\.[a-zA-Z0-9-\u0400-\u04FF\u0500-\u052F\u2DE0-\u2DFF\uA640-\uA69F]{2,}|\.xn--[a-zA-Z0-9-]{1,})(:\d+)?([\/?#]|$)/i.test(
-        x,
-      );
-    }, "URL must have a valid top-level domain or be a valid path")
-    .refine(x => {
-      try {
-        checkUrl(x as string);
+  })
+  .url()
+  .regex(/^https?:\/\//i, "URL uses unsupported protocol")
+  .refine(x => {
+    if (config.TEST_SUITE_SELF_HOSTED && config.ALLOW_LOCAL_WEBHOOKS) {
+      if (
+        /^https?:\/\/(localhost|127\.0\.0\.1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(:\d+)?([\/?#]|$)/i.test(
+          x as string,
+        )
+      ) {
         return true;
-      } catch (_) {
-        return false;
       }
-    }, "Invalid URL"),
-  // .refine((x) => !isUrlBlocked(x as string), UNSUPPORTED_SITE_MESSAGE),
-);
+    }
+    // Same TLD-shaped check as before, plus IP literals — which the old
+    // inline regex accepted only when the last octet had 2+ digits, so
+    // 8.8.8.8 was rejected while 169.254.169.254 passed.
+    return hasReachableHost(x as string);
+  }, "URL must have a valid top-level domain or be an IP address")
+  .refine(x => {
+    try {
+      checkUrl(x as string);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }, "Invalid URL");
+// .refine((x) => !isUrlBlocked(x as string), UNSUPPORTED_SITE_MESSAGE)
 
 const strictMessage =
   "Unrecognized key in body -- please review the v2 API documentation for request body changes";
@@ -473,6 +482,8 @@ const pdfParserWithOptions = z.strictObject({
   type: z.literal("pdf"),
   mode: pdfModeSchema.optional(),
   maxPages: z.int().positive().finite().max(10000).optional(),
+  /** Include physical per-page markdown alongside document markdown. */
+  pageMarkdown: z.boolean().optional(),
   // Experimental: route this request through the fire-pdf async pipeline
   // (POST /jobs + poll) instead of the sync POST /ocr endpoint. Falls back
   // to sync on any async-path failure, so user-visible behavior is unchanged
@@ -520,6 +531,16 @@ export function getPDFMode(parsers?: Parsers): PDFMode {
     }
   }
   return "auto";
+}
+
+export function getPDFPageMarkdown(parsers?: Parsers): boolean {
+  if (!parsers) return false;
+  for (const parser of parsers) {
+    if (typeof parser === "object" && parser.type === "pdf") {
+      return parser.pageMarkdown === true;
+    }
+  }
+  return false;
 }
 
 export function getFirePdfAsync(parsers?: Parsers): boolean {
@@ -692,6 +713,10 @@ const baseScrapeOptions = z.strictObject({
   storeInCache: z.boolean().prefault(true),
   lockdown: z.boolean().prefault(false),
   redactPII: redactPIISchema,
+  // Enterprise: per-request field-level override of the org's threat
+  // protection policy. Gated on the team flag + org config (checkPermissions).
+  threatProtection: threatProtectionOverrideSchema.optional(),
+  auditMetadata: auditMetadataSchema.optional(),
 
   profile: z
     .object({
@@ -880,6 +905,7 @@ const extractOptions = z
     __experimental_showCostTracking: z.boolean().prefault(false),
     ignoreInvalidURLs: z.boolean().prefault(true),
     webhook: webhookSchema.optional(),
+    threatProtection: threatProtectionOverrideSchema.optional(),
   })
   .refine(obj => obj.urls || obj.prompt, {
     error: "Either 'urls' or 'prompt' must be provided.",
@@ -940,6 +966,8 @@ export const agentRequestSchema = z.strictObject({
 
   overrideWhitelist: z.string().optional(),
   model: z.enum(["spark-1-pro", "spark-1-mini"]).default("spark-1-pro"),
+  threatProtection: threatProtectionOverrideSchema.optional(),
+  auditMetadata: auditMetadataSchema.optional(),
 });
 
 export type AgentRequest = z.infer<typeof agentRequestSchema>;
@@ -1191,6 +1219,8 @@ const mapRequestSchemaBase = crawlerOptions
     ignoreCache: z.boolean().prefault(false),
     location: locationSchema,
     headers: z.record(z.string(), z.string()).optional(),
+    threatProtection: threatProtectionOverrideSchema.optional(),
+    auditMetadata: auditMetadataSchema.optional(),
   });
 
 export const mapRequestSchema = strictWithMessage(mapRequestSchemaBase);
@@ -1208,6 +1238,8 @@ export type Document = {
   description?: string;
   url?: string;
   markdown?: string;
+  /** Physical PDF pages, present only for `parsers[].pageMarkdown`. */
+  pages?: Array<{ pageNumber: number; markdown: string }>;
   html?: string;
   rawHtml?: string;
   links?: string[];
@@ -1302,6 +1334,7 @@ export type Document = {
     scrapeId?: string;
     error?: string;
     numPages?: number;
+    totalPages?: number;
     contentType?: string;
     timezone?: string;
     proxyUsed: "basic" | "stealth";
@@ -1377,6 +1410,7 @@ export interface URLTrace {
 
 export interface ExtractResponse {
   success: boolean;
+  code?: ErrorCodes;
   error?: string;
   data?: any;
   scrape_id?: string;
@@ -1533,6 +1567,8 @@ type Account = {
 export type TeamFlags = {
   ignoreRobots?: "disabled" | "allowed" | "forced";
   customRobotsAgent?: "disabled" | "allowed";
+  threatProtection?: "disabled" | "allowed" | "forced";
+  siemLogging?: boolean;
   unblockedDomains?: string[];
   forceZDR?: boolean;
   allowZDR?: boolean;
@@ -1542,13 +1578,29 @@ export type TeamFlags = {
   checkRobotsOnScrape?: boolean;
   crawlTtlHours?: number;
   ipWhitelist?: boolean;
+  // gates the per-team API key IP allowlist (ip_restriction_config table)
+  ipRestriction?: boolean;
+  // gates the per-key scope/format lockdown (key_restriction_config table)
+  keyRestriction?: boolean;
   bypassCreditChecks?: boolean;
   debugBranding?: boolean;
   maxBrowserSessions?: number;
   researchBeta?: boolean;
-  highlightsBeta?: boolean;
   menuBeta?: boolean;
   enrichBeta?: boolean;
+  professionalProfileCompanyDataBeta?: boolean;
+  organizationDataSourceAccess?: Record<
+    string,
+    {
+      status?: "enabled" | "disabled" | "suspended" | string | null;
+      termsKey?: string | null;
+      termsVersion?: string | null;
+      termsAcceptedAt?: string | null;
+      enabledAt?: string | null;
+      disabledAt?: string | null;
+      disabledReason?: string | null;
+    }
+  >;
 } | null;
 
 interface RequestWithMaybeACUC<
@@ -1637,6 +1689,7 @@ function fromV0CrawlerOptions(
     internalOptions: {
       v0CrawlOnlyUrls: x.returnOnlyUrls,
       teamId,
+      orgId: null,
     },
   };
 }
@@ -1701,6 +1754,7 @@ export function fromV0ScrapeOptions(
       atsv: pageOptions.atsv,
       v0DisableJsDom: pageOptions.disableJsDom,
       teamId,
+      orgId: null,
       ...(extractorOptions !== undefined &&
       extractorOptions.mode.includes("llm-extraction")
         ? {
@@ -1813,6 +1867,7 @@ export function fromV1ScrapeOptions(
     }),
     internalOptions: {
       teamId,
+      orgId: null,
       v1Agent: v1ScrapeOptions.agent,
       v1JSONSystemPrompt: (
         v1ScrapeOptions.jsonOptions || v1ScrapeOptions.extract
@@ -1875,6 +1930,53 @@ const pdfCategoryOptions = z.strictObject({
   type: z.literal("pdf"),
 });
 
+const developerCategoryOptions = z.strictObject({
+  type: z.literal("developer"),
+});
+
+const developerCategoryAliases = new Set([
+  "repo",
+  "code",
+  "developer",
+  "docs",
+  "devdex",
+  "repo_search",
+  "developer_index",
+]);
+
+function isDeveloperCategoryAlias(value: unknown): value is string {
+  return typeof value === "string" && developerCategoryAliases.has(value);
+}
+
+function normalizeDeveloperCategoryAliases(value: unknown): unknown {
+  if (!Array.isArray(value)) return value;
+  let seenString = false;
+  let seenObject = false;
+  const normalized: unknown[] = [];
+  for (const category of value) {
+    if (isDeveloperCategoryAlias(category)) {
+      if (seenString) continue;
+      seenString = true;
+      normalized.push("developer");
+    } else if (
+      typeof category === "object" &&
+      category !== null &&
+      isDeveloperCategoryAlias((category as { type?: unknown }).type)
+    ) {
+      if (Object.keys(category).length === 1) {
+        if (seenObject) continue;
+        seenObject = true;
+        normalized.push({ type: "developer" });
+      } else {
+        normalized.push({ ...category, type: "developer" });
+      }
+    } else {
+      normalized.push(category);
+    }
+  }
+  return normalized;
+}
+
 const searchDomainSchema = z
   .string()
   .trim()
@@ -1909,22 +2011,25 @@ export const searchRequestSchema = z
       .optional()
       .prefault(["web"]),
     categories: z
-      .union([
-        // Array of strings (simple format)
-        z.array(z.enum(["github", "research", "pdf"])),
-        // Array of objects (advanced format)
-        z.array(
-          z.union([
-            githubCategoryOptions,
-            researchCategoryOptions,
-            pdfCategoryOptions,
-          ]),
-        ),
-      ])
+      .preprocess(
+        normalizeDeveloperCategoryAliases,
+        z.union([
+          z.array(z.enum(["github", "research", "pdf", "developer"])),
+          z.array(
+            z.union([
+              githubCategoryOptions,
+              researchCategoryOptions,
+              pdfCategoryOptions,
+              developerCategoryOptions,
+            ]),
+          ),
+        ]),
+      )
       .optional(),
     includeDomains: z.array(searchDomainSchema).optional(),
     excludeDomains: z.array(searchDomainSchema).optional(),
     lang: z.string().optional().prefault("en"),
+    safe: z.boolean().optional(),
     enterprise: z.array(z.enum(["default", "anon", "zdr"])).optional(),
     country: z.string().optional(),
     location: z.string().optional(),
@@ -1933,11 +2038,12 @@ export const searchRequestSchema = z
     timeout: z.int().positive().finite().prefault(60000),
     ignoreInvalidURLs: z.boolean().optional().prefault(false),
     asyncScraping: z.boolean().optional().prefault(false),
-    // Experimental: replace each result's snippet with query-relevant
-    // highlights pulled from our index (last 30 days), out-of-line from
-    // scrapeURL. Falls back to the provider snippet when the URL isn't indexed.
-    highlights: z.boolean().optional().prefault(false),
+    // Replace each result's snippet with query-relevant highlights pulled from
+    // our index. When omitted, the caller integration and rollout cohort decide
+    // whether generated highlights are returned or only run in shadow mode.
+    highlights: z.boolean().optional(),
     __searchPreviewToken: z.string().optional(),
+    threatProtection: threatProtectionOverrideSchema.optional(),
     scrapeOptions: baseScrapeOptions
       .extend({
         formats: z
@@ -2050,6 +2156,10 @@ export const searchRequestSchema = z
             case "pdf":
               return {
                 type: "pdf" as const,
+              };
+            case "developer":
+              return {
+                type: "developer" as const,
               };
             default:
               return { type: c as any };

@@ -61,6 +61,8 @@ export type FireEngineScrapeRequestChromeCDP = {
   skipTlsVerification?: boolean;
   actions?: InternalAction[];
   blockMedia?: boolean;
+  /** Opt out of render-engine routing (blockMedia: false normally forces it). */
+  forceNonRender?: boolean;
   mobile?: boolean;
   disableSmartWaitCache?: boolean;
   persistentStorage?: { uniqueId: string };
@@ -269,10 +271,11 @@ export async function fireEngineScrape<
       );
     } else if (
       typeof status.error === "string" &&
-      (status.error.includes("File size exceeds") ||
-        status.error.includes("File exceeds size limit"))
+      status.error.includes("File exceeds size limit")
     ) {
-      throw new UnsupportedFileError("File exceeds size limit");
+      throw new UnsupportedFileError(
+        status.error.slice(status.error.indexOf("File exceeds size limit")),
+      );
     } else if (
       typeof status.error === "string" &&
       status.error.includes("failed to finish without timing out")
