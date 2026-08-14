@@ -1,9 +1,12 @@
 # ---------- build stage: toolchain + compile native deps + tsc ----------
-FROM node:20-slim AS build
+# node >= 22 required since camoufox-js 0.12.0: its better-sqlite3 ^13 dep
+# ships prebuilt binaries that segfault node 20 at require-time (engines
+# says >= 22, but npm ci only warns). Keep both stages on the same major.
+FROM node:22-slim AS build
 
-# build-essential + python3: node-gyp compiles better-sqlite3 (a transitive
-# camoufox-js dep with no prebuilt for this platform). They live ONLY in this
-# stage and never reach the runtime image.
+# build-essential + python3: node-gyp fallback for any native dep that lacks
+# a prebuilt for this platform. They live ONLY in this stage and never reach
+# the runtime image.
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates build-essential python3 \
   && rm -rf /var/lib/apt/lists/*
@@ -21,7 +24,7 @@ RUN npm run build \
   && npm prune --omit=dev
 
 # ---------- runtime stage: slim, no compiler toolchain ----------
-FROM node:20-slim
+FROM node:22-slim
 
 # ca-certificates: HTTPS download of the Camoufox binary (`camoufox-js fetch`).
 RUN apt-get update \

@@ -12,7 +12,7 @@
   "author": "Jeff Pereira",
   "license": "ISC",
   "dependencies": {
-    "camoufox-js": "0.11.1",
+    "camoufox-js": "0.12.0",
     "dotenv": "^16.4.5",
     "express": "^5.2.1",
     "ipaddr.js": "^2.3.0",
