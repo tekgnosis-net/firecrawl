@@ -1,7 +1,7 @@
 from typing import Any, Dict, List, Literal, Optional, Union
 import time
 
-from ..types import AgentResponse, AgentWebhookConfig
+from ..types import AgentResponse, AgentWebhookConfig, AuditMetadata, ThreatProtectionOptions
 from ..utils.http_client import HttpClient
 from ..utils.error_handler import handle_response_error
 from ..utils.validation import _normalize_schema
@@ -17,6 +17,8 @@ def _prepare_agent_request(
     strict_constrain_to_urls: Optional[bool] = None,
     model: Optional[Literal["spark-1-pro", "spark-1-mini"]] = None,
     webhook: Optional[Union[str, AgentWebhookConfig]] = None,
+    threat_protection: Optional[ThreatProtectionOptions] = None,
+    audit_metadata: Optional[AuditMetadata] = None,
 ) -> Dict[str, Any]:
     body: Dict[str, Any] = {}
     if urls is not None:
@@ -44,6 +46,12 @@ def _prepare_agent_request(
             body["webhook"] = webhook
         else:
             body["webhook"] = webhook.model_dump(exclude_none=True)
+    if threat_protection is not None:
+        body["threatProtection"] = threat_protection.model_dump(
+            by_alias=True, exclude_none=True
+        )
+    if audit_metadata is not None:
+        body["auditMetadata"] = audit_metadata.model_dump()
     return body
 
 
@@ -67,6 +75,8 @@ def start_agent(
     strict_constrain_to_urls: Optional[bool] = None,
     model: Optional[Literal["spark-1-pro", "spark-1-mini"]] = None,
     webhook: Optional[Union[str, AgentWebhookConfig]] = None,
+    threat_protection: Optional[ThreatProtectionOptions] = None,
+    audit_metadata: Optional[AuditMetadata] = None,
 ) -> AgentResponse:
     body = _prepare_agent_request(
         urls,
@@ -77,6 +87,8 @@ def start_agent(
         strict_constrain_to_urls=strict_constrain_to_urls,
         model=model,
         webhook=webhook,
+        threat_protection=threat_protection,
+        audit_metadata=audit_metadata,
     )
     resp = client.post("/v2/agent", body)
     if not resp.ok:
@@ -123,6 +135,8 @@ def agent(
     strict_constrain_to_urls: Optional[bool] = None,
     model: Optional[Literal["spark-1-pro", "spark-1-mini"]] = None,
     webhook: Optional[Union[str, AgentWebhookConfig]] = None,
+    threat_protection: Optional[ThreatProtectionOptions] = None,
+    audit_metadata: Optional[AuditMetadata] = None,
 ) -> AgentResponse:
     started = start_agent(
         client,
@@ -134,6 +148,8 @@ def agent(
         strict_constrain_to_urls=strict_constrain_to_urls,
         model=model,
         webhook=webhook,
+        threat_protection=threat_protection,
+        audit_metadata=audit_metadata,
     )
     job_id = getattr(started, "id", None)
     if not job_id:

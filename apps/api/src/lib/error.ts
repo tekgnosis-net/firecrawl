@@ -1,4 +1,5 @@
 export type ErrorCodes =
+  | "THIRD_PARTY_DATA_TERMS_REQUIRED"
   | "SCRAPE_TIMEOUT"
   | "MAP_TIMEOUT"
   | "UNKNOWN_ERROR"
@@ -27,12 +28,16 @@ export type ErrorCodes =
   | "AGENT_INDEX_ONLY"
   | "SCRAPE_AUDIO_UNSUPPORTED_URL"
   | "SCRAPE_VIDEO_UNSUPPORTED_URL"
+  | "SCRAPE_MEDIA_ACCESS_DENIED"
   | "SCRAPE_X_TWITTER_CONFIGURATION_ERROR"
   | "PARSE_UNSUPPORTED_OPTIONS"
   | "CRAWL_DENIAL"
   | "MAP_FAILED"
   | "BAD_REQUEST_INVALID_JSON"
-  | "BAD_REQUEST";
+  | "BAD_REQUEST"
+  // Threat protection (enterprise domain risk blocking). Lowercase by design:
+  // this is the documented, user-facing error code for the feature.
+  | "unsafe_domain_blocked";
 
 export class TransportableError extends Error {
   public readonly code: ErrorCodes;

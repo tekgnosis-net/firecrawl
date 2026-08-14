@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { config } from "../../config";
 import { z } from "zod";
 import { protocolIncluded, checkUrl } from "../../lib/validateUrl";
+import { hasReachableHost } from "../../lib/url-utils";
 import { countries } from "../../lib/validate-country";
 import {
   ExtractorOptions,
@@ -19,6 +20,8 @@ import { webhookSchema } from "../../services/webhook/schema";
 import { BrandingProfile } from "../../types/branding";
 import { ProductProfile } from "../../types/product";
 import { MenuProfile } from "../../types/menu";
+import { threatProtectionOverrideSchema } from "../../lib/threat-protection/config";
+import { auditMetadataSchema } from "../../lib/siem-logging/types";
 
 type Format =
   | "markdown"
@@ -35,8 +38,15 @@ type Format =
   | "product"
   | "menu";
 
-export const url = z.preprocess(
-  x => {
+export const url = z
+  .string()
+  // .overwrite must stay after .string(). It interpolates x into a template, so
+  // a non-string url would become the string "http://undefined" — a valid URL
+  // whose only failure is the TLD check below, which would blame a field the
+  // caller never sent. Letting .string() reject it first gives the real error.
+  // .overwrite rather than .transform, so this stays a ZodString and .url() /
+  // .regex() can still chain onto it.
+  .overwrite(x => {
     if (!protocolIncluded(x as string)) {
       x = `http://${x}`;
     }
@@ -52,34 +62,33 @@ export const url = z.preprocess(
     // }
 
     return x;
-  },
-  z
-    .url()
-    .regex(/^https?:\/\//i, "URL uses unsupported protocol")
-    .refine(x => {
-      if (config.TEST_SUITE_SELF_HOSTED && config.ALLOW_LOCAL_WEBHOOKS) {
-        if (
-          /^https?:\/\/(localhost|127\.0\.0\.1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(:\d+)?([\/?#]|$)/i.test(
-            x as string,
-          )
-        ) {
-          return true;
-        }
-      }
-      return /(\.[a-zA-Z0-9-\u0400-\u04FF\u0500-\u052F\u2DE0-\u2DFF\uA640-\uA69F]{2,}|\.xn--[a-zA-Z0-9-]{1,})(:\d+)?([\/?#]|$)/i.test(
-        x,
-      );
-    }, "URL must have a valid top-level domain or be a valid path")
-    .refine(x => {
-      try {
-        checkUrl(x as string);
+  })
+  .url()
+  .regex(/^https?:\/\//i, "URL uses unsupported protocol")
+  .refine(x => {
+    if (config.TEST_SUITE_SELF_HOSTED && config.ALLOW_LOCAL_WEBHOOKS) {
+      if (
+        /^https?:\/\/(localhost|127\.0\.0\.1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})(:\d+)?([\/?#]|$)/i.test(
+          x as string,
+        )
+      ) {
         return true;
-      } catch (_) {
-        return false;
       }
-    }, "Invalid URL"),
-  // .refine((x) => !isUrlBlocked(x as string), UNSUPPORTED_SITE_MESSAGE),
-);
+    }
+    // Same TLD-shaped check as before, plus IP literals — which the old
+    // inline regex accepted only when the last octet had 2+ digits, so
+    // 8.8.8.8 was rejected while 169.254.169.254 passed.
+    return hasReachableHost(x as string);
+  }, "URL must have a valid top-level domain or be an IP address")
+  .refine(x => {
+    try {
+      checkUrl(x as string);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }, "Invalid URL");
+// .refine((x) => !isUrlBlocked(x as string), UNSUPPORTED_SITE_MESSAGE)
 
 const agentExtractModelValue = "fire-1";
 export const isAgentExtractModelValid = (x: string | undefined) =>
@@ -528,6 +537,10 @@ const baseScrapeOptions = z.strictObject({
     .gte(0)
     .prefault(1 * 24 * 60 * 60 * 1000),
   storeInCache: z.boolean().prefault(true),
+  // Enterprise: per-request field-level override of the org's threat
+  // protection policy. Gated on the team flag + org config (checkPermissions).
+  threatProtection: threatProtectionOverrideSchema.optional(),
+  auditMetadata: auditMetadataSchema.optional(),
   // @deprecated
   __experimental_cache: z.boolean().prefault(false).optional(),
   __searchPreviewToken: z.string().optional(),
@@ -744,6 +757,7 @@ const extractV1Options = z
     __experimental_showCostTracking: z.boolean().prefault(false),
     ignoreInvalidURLs: z.boolean().prefault(false),
     webhook: webhookSchema.optional(),
+    threatProtection: threatProtectionOverrideSchema.optional(),
   })
   .refine(obj => obj.urls || obj.prompt, {
     error: "Either 'urls' or 'prompt' must be provided.",
@@ -972,6 +986,8 @@ const mapRequestSchemaBase = crawlerOptions
     ignoreCache: z.boolean().prefault(false),
     location: locationSchema,
     headers: z.record(z.string(), z.string()).optional(),
+    threatProtection: threatProtectionOverrideSchema.optional(),
+    auditMetadata: auditMetadataSchema.optional(),
   });
 
 export const mapRequestSchema = mapRequestSchemaBase.strict();
@@ -989,6 +1005,8 @@ export type Document = {
   description?: string;
   url?: string;
   markdown?: string;
+  /** Physical PDF pages, populated by the v2 pageMarkdown parser option. */
+  pages?: Array<{ pageNumber: number; markdown: string }>;
   html?: string;
   rawHtml?: string;
   links?: string[];
@@ -1073,6 +1091,7 @@ export type Document = {
     scrapeId?: string;
     error?: string;
     numPages?: number;
+    totalPages?: number;
     contentType?: string;
     timezone?: string;
     proxyUsed: "basic" | "stealth";
@@ -1132,6 +1151,7 @@ export interface URLTrace {
 
 export interface ExtractResponse {
   success: boolean;
+  code?: ErrorCodes;
   error?: string;
   data?: any;
   scrape_id?: string;
@@ -1247,45 +1267,15 @@ type Account = {
 export type AuthCreditUsageChunk = {
   api_key: string;
   api_key_id: number;
+  api_key_id_text?: string;
   team_id: string;
-  org_id?: string | null;
-  sub_id: string | null;
-  sub_current_period_start: string | null;
-  sub_current_period_end: string | null;
-  sub_user_id: string | null;
-  price_id: string | null;
-  price_credits: number; // credit limit with assoicated price, or free_credits (500) if free plan
-  price_should_be_graceful: boolean;
-  price_associated_auto_recharge_price_id: string | null;
-  credits_used: number;
-  coupon_credits: number; // do not rely on this number to be up to date after calling a billTeam
-  adjusted_credits_used: number; // credits this period minus coupons used
-  remaining_credits: number;
-  total_credits_sum: number;
-  plan_priority: {
-    bucketLimit: number;
-    planModifier: number;
-  };
-  rate_limits: {
-    crawl: number;
-    scrape: number;
-    search: number;
-    map: number;
-    extract: number;
-    preview: number;
-    crawlStatus: number;
-    extractStatus: number;
-    extractAgentPreview?: number;
-    scrapeAgentPreview?: number;
-    browser?: number;
-    browserExecute?: number;
-    account?: number;
-    supportAsk?: number;
-    supportDocsSearch?: number;
-    research?: number;
-  };
-  concurrency: number;
+  org_id: string;
   flags: TeamFlags;
+
+  // teams.banned surfaced from auth_chunk_1 — banned teams are rejected (403)
+  // in supaAuthenticateUser. Optional because pre-rollout cached ACUC entries
+  // and the bypass/preview mocks omit it (treated as not banned).
+  is_banned?: boolean;
 
   // appended on JS-side
   is_extract?: boolean;
@@ -1301,6 +1291,8 @@ export type AuthCreditUsageChunk = {
 export type TeamFlags = {
   ignoreRobots?: "disabled" | "allowed" | "forced";
   customRobotsAgent?: "disabled" | "allowed";
+  threatProtection?: "disabled" | "allowed" | "forced";
+  siemLogging?: boolean;
   unblockedDomains?: string[];
   forceZDR?: boolean;
   allowZDR?: boolean;
@@ -1310,6 +1302,10 @@ export type TeamFlags = {
   checkRobotsOnScrape?: boolean;
   crawlTtlHours?: number;
   ipWhitelist?: boolean;
+  // gates the per-team API key IP allowlist (ip_restriction_config table)
+  ipRestriction?: boolean;
+  // gates the per-key scope/format lockdown (key_restriction_config table)
+  keyRestriction?: boolean;
   skipCountryCheck?: boolean;
   browserBeta?: boolean;
   bypassCreditChecks?: boolean;
@@ -1318,8 +1314,22 @@ export type TeamFlags = {
   // POST /v2/search/:jobId/feedback returns 403 TEAM_OPTED_OUT when true.
   searchFeedbackOptOut?: boolean;
   researchBeta?: boolean;
-  highlightsBeta?: boolean;
   enrichBeta?: boolean;
+  labsSearch?: boolean;
+  exchangeRetrieve?: boolean;
+  professionalProfileCompanyDataBeta?: boolean;
+  organizationDataSourceAccess?: Record<
+    string,
+    {
+      status?: "enabled" | "disabled" | "suspended" | string | null;
+      termsKey?: string | null;
+      termsVersion?: string | null;
+      termsAcceptedAt?: string | null;
+      enabledAt?: string | null;
+      disabledAt?: string | null;
+      disabledReason?: string | null;
+    }
+  >;
   // routes the team's new queue work to the FoundationDB backend
   nuqFdb?: boolean;
 } | null;
@@ -1439,6 +1449,7 @@ function fromLegacyCrawlerOptions(
     internalOptions: {
       v0CrawlOnlyUrls: x.returnOnlyUrls,
       teamId,
+      orgId: null,
     },
   };
 }
@@ -1504,6 +1515,7 @@ export function fromLegacyScrapeOptions(
       atsv: pageOptions.atsv,
       v0DisableJsDom: pageOptions.disableJsDom,
       teamId,
+      orgId: null,
     },
     // TODO: fallback, fetchPageContent, replaceAllPathsWithAbsolutePaths, includeLinks
   };
@@ -1554,6 +1566,7 @@ export const searchRequestSchema = z
     timeout: z.int().positive().finite().prefault(60000),
     ignoreInvalidURLs: z.boolean().optional().prefault(false),
     __searchPreviewToken: z.string().optional(),
+    threatProtection: threatProtectionOverrideSchema.optional(),
     scrapeOptions: baseScrapeOptions
       .extend({
         formats: z

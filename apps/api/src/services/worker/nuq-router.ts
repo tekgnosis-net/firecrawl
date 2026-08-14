@@ -3,8 +3,10 @@ import { logger as _logger } from "../../lib/logger";
 import { config } from "../../config";
 import { RateLimiterMode, ScrapeJobData } from "../../types";
 import { getACUCTeam } from "../../controllers/auth";
+import { autumnService } from "../autumn/autumn.service";
 import { redisEvictConnection } from "../../services/redis";
 import { isSelfHosted } from "../../lib/deployment";
+import { getApiKeyConcurrencyLimit } from "../../lib/api-key-concurrency";
 import {
   getTeamQueueLimit,
   getConcurrencyLimitActiveJobsCount,
@@ -247,15 +249,29 @@ export async function fdbEnqueueScrapeJobs(
 }> {
   let teamLimit: number | null = null;
   if (!isSelfHosted() && !fdbForced()) {
-    const acuc = await getACUCTeam(teamId, false, true, RateLimiterMode.Crawl);
-    teamLimit = acuc?.concurrency ?? 2;
+    teamLimit = (await autumnService.getConcurrencyLimit(teamId)) ?? 2;
   } else if (!isSelfHosted()) {
-    const acuc = await getACUCTeam(teamId, false, true, RateLimiterMode.Crawl);
-    teamLimit = acuc?.concurrency ?? null;
+    // fdbForced: leave unlimited (null) when Autumn has no concurrency value.
+    teamLimit = await autumnService.getConcurrencyLimit(teamId);
   }
 
   const queueCap =
     teamLimit === null ? Number.MAX_SAFE_INTEGER : getTeamQueueLimit(teamLimit);
+
+  // API-key-scoped concurrency: applies when every job in the batch was
+  // requested with the same key (batches always are; child jobs inherit the
+  // kickoff's apiKeyId) and that key has a limit configured.
+  let keyGate: { id: string; limit: number } | null = null;
+  if (teamLimit !== null) {
+    const keyIds = new Set(jobs.map(j => j.data.apiKeyId ?? null));
+    const apiKeyId = keyIds.size === 1 ? [...keyIds][0] : null;
+    if (apiKeyId !== null) {
+      const keyLimit = await getApiKeyConcurrencyLimit(apiKeyId);
+      if (keyLimit !== null) {
+        keyGate = { id: String(apiKeyId), limit: keyLimit };
+      }
+    }
+  }
 
   const results = await optionalFdb(() =>
     scrapeQueueFdb.addJobs(
@@ -274,7 +290,7 @@ export async function fdbEnqueueScrapeJobs(
           timesOutAt: new Date(Date.now() + j.backlogTimeoutMs),
         },
       })),
-      { teamLimit, queueCap },
+      { teamLimit, queueCap, key: keyGate },
     ),
   );
 

@@ -42,6 +42,8 @@ def search(
             out.news = _transform_array(data["news"], SearchResultNews)
         if "images" in data:
             out.images = _transform_array(data["images"], SearchResultImages)
+        if "developer" in data:
+            out.developer = _transform_array(data["developer"], SearchResultWeb)
         return out
     except Exception as err:
         # If the error is an HTTP error from requests, handle it
@@ -133,7 +135,7 @@ def _validate_search_request(request: SearchRequest) -> SearchRequest:
     
     # Validate categories (if provided)
     if request.categories is not None:
-        valid_categories = {"github", "research", "pdf"}
+        valid_categories = {"github", "research", "pdf", "developer"}
         for category in request.categories:
             if isinstance(category, str):
                 if category not in valid_categories:
@@ -201,6 +203,13 @@ def _prepare_search_request(request: SearchRequest) -> Dict[str, Any]:
         data["excludeDomains"] = validated_request.exclude_domains
         data.pop("exclude_domains", None)
     
+    # threat_protection → threatProtection
+    if validated_request.threat_protection is not None:
+        data["threatProtection"] = validated_request.threat_protection.model_dump(
+            by_alias=True, exclude_none=True
+        )
+        data.pop("threat_protection", None)
+
     # scrape_options → scrapeOptions
     if validated_request.scrape_options is not None:
         scrape_data = prepare_scrape_options(validated_request.scrape_options)

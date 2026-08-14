@@ -43,7 +43,6 @@ import {
   NoCachedDataError,
   LockdownMissError,
   DNSResolutionError,
-  ZDRViolationError,
   PDFPrefetchFailed,
   DocumentPrefetchFailed,
   FEPageLoadFailed,
@@ -83,22 +82,44 @@ import {
 import { htmlTransform } from "./lib/removeUnwantedElements";
 import { postprocessors } from "./postprocessors";
 import { rewriteUrl } from "./lib/rewriteUrl";
+import {
+  DOCUMENT_EXTENSIONS,
+  documentContentTypeFromExtension,
+  documentExtensionFromContentType,
+  documentExtensionFromUrlPath,
+} from "../../lib/document-formats";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
-import type { DataLayerScrapeMetadata } from "../../lib/data-layer";
+import type { ExchangeScrapeMetadata } from "../../lib/exchange";
+import {
+  checkUrl,
+  type ThreatCheckDedup,
+  type ThreatDecision,
+  type ThreatProtectionPolicy,
+} from "../../lib/threat-protection";
+import { UnsafeDomainBlockedError } from "../../lib/threat-protection/error";
+import { canonicalizeUrl } from "../../lib/threat-protection/providers/web-risk/canonicalize";
 
 export type ScrapeUrlResponse =
   | {
       success: true;
       document: Document;
       unsupportedFeatures?: Set<FeatureFlag>;
-      dataLayer?: DataLayerScrapeMetadata;
+      exchange?: ExchangeScrapeMetadata;
+      /**
+       * Threat protection decisions made for this scrape (initial domain
+       * check + any redirect re-checks, in order). Read by the billing layer
+       * (`providerConsulted` drives +2/+3 credits) and the security-logging
+       * layer. Only set when a threat protection policy was active.
+       */
+      threatDecisions?: ThreatDecision[];
     }
   | {
       success: false;
       error: any;
+      threatDecisions?: ThreatDecision[];
     };
 
 export type BrowserCookie = {
@@ -157,6 +178,8 @@ export type Meta = {
   winnerEngine?: Engine;
   abortHandle?: NodeJS.Timeout;
   audioCookies?: BrowserCookie[];
+  /** Threat protection decisions made during this scrape, in order (mutable, like logs). */
+  threatDecisions: ThreatDecision[];
 };
 
 function buildFeatureFlags(
@@ -228,19 +251,7 @@ function buildFeatureFlags(
   const lowerPath = urlO.pathname.toLowerCase();
 
   // Check for document types first (they take precedence over PDF)
-  const isDocument =
-    lowerPath.endsWith(".docx") ||
-    lowerPath.endsWith(".odt") ||
-    lowerPath.endsWith(".rtf") ||
-    lowerPath.endsWith(".xlsx") ||
-    lowerPath.endsWith(".xls") ||
-    lowerPath.includes(".docx/") ||
-    lowerPath.includes(".odt/") ||
-    lowerPath.includes(".rtf/") ||
-    lowerPath.includes(".xlsx/") ||
-    lowerPath.includes(".xls/");
-
-  if (isDocument) {
+  if (documentExtensionFromUrlPath(lowerPath) !== null) {
     flags.add("document");
   } else if (lowerPath.endsWith(".pdf") || lowerPath.includes(".pdf/")) {
     // Only add PDF flag if it's not a document
@@ -259,15 +270,6 @@ function buildFeatureFlags(
 // The meta object is usually immutable, except for the logs array, and in edge cases (e.g. a new feature is suddenly required)
 // Having a meta object that is treated as immutable helps the code stay clean and easily tracable,
 // while also retaining the benefits that WebScraper had from its OOP design.
-const DOCUMENT_EXTENSIONS = new Set([
-  ".docx",
-  ".doc",
-  ".odt",
-  ".rtf",
-  ".xlsx",
-  ".xls",
-]);
-
 const HTML_EXTENSIONS = new Set([".html", ".htm", ".xhtml"]);
 
 async function writeUploadedFileToTemp(
@@ -297,20 +299,9 @@ function isPdfUpload(filename: string, contentType?: string): boolean {
 
 function isDocumentUpload(filename: string, contentType?: string): boolean {
   const ext = path.extname(filename).toLowerCase();
-  const normalizedType = contentType?.toLowerCase() ?? "";
   return (
     DOCUMENT_EXTENSIONS.has(ext) ||
-    normalizedType.includes(
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ) ||
-    normalizedType.includes("application/vnd.ms-excel") ||
-    normalizedType.includes(
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ) ||
-    normalizedType.includes("application/msword") ||
-    normalizedType.includes("application/vnd.oasis.opendocument.text") ||
-    normalizedType.includes("application/rtf") ||
-    normalizedType.includes("text/rtf")
+    documentExtensionFromContentType(contentType) !== null
   );
 }
 
@@ -402,6 +393,7 @@ async function buildMetaObject(
         proxyUsed: "basic",
         contentType:
           contentType ||
+          documentContentTypeFromExtension(fallbackExtension) ||
           "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       };
     } else if (isHtmlUpload(filename, contentType)) {
@@ -451,6 +443,7 @@ async function buildMetaObject(
     documentPrefetch,
     fetchPrefetch,
     costTracking,
+    threatDecisions: [],
   };
 }
 
@@ -474,6 +467,24 @@ export type InternalOptions = {
   bypassBilling?: boolean;
   zeroDataRetention?: boolean;
   teamFlags?: TeamFlags;
+  /** Team's org, snapshotted from the request ACUC at acceptance (same
+   * pattern as teamFlags). Rides the job payload so org-scoped blocklist
+   * checks work without re-fetching the chunk. Required so a payload
+   * builder cannot silently omit the org and skip org-scoped enforcement;
+   * pass null when the caller genuinely has no org (internal/system work). */
+  orgId: string | null;
+  /** Team's sold concurrency, snapshotted from the request ACUC at
+   * acceptance (same pattern as teamFlags). Rides the job payload so
+   * downstream engines (FirePDF async account context) never re-fetch. */
+  teamConcurrency?: number | null;
+
+  /**
+   * Effective threat protection policy for this scrape, resolved at the
+   * controller layer (org config + per-request override). When set (and mode
+   * is not "off"), the target domain is checked before any engine work, and
+   * redirect destinations are re-checked. Absent => zero enforcement overhead.
+   */
+  threatProtection?: ThreatProtectionPolicy;
 
   v1Agent?: ScrapeOptionsV1["agent"];
   v1JSONAgent?: Exclude<ScrapeOptionsV1["jsonOptions"], undefined>["agent"];
@@ -651,37 +662,20 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
       "engine.features": Array.from(meta.featureFlags).join(","),
     });
 
-    if (meta.internalOptions.zeroDataRetention) {
-      if (meta.featureFlags.has("screenshot")) {
-        throw new ZDRViolationError("screenshot");
-      }
-
-      if (meta.featureFlags.has("screenshot@fullScreen")) {
-        throw new ZDRViolationError("screenshot@fullScreen");
-      }
-
-      if (
-        meta.options.actions &&
-        meta.options.actions.find(x => x.type === "screenshot")
-      ) {
-        throw new ZDRViolationError("screenshot action");
-      }
-
-      if (
-        meta.options.actions &&
-        meta.options.actions.find(x => x.type === "pdf")
-      ) {
-        throw new ZDRViolationError("pdf action");
-      }
-    }
-
     // TODO: handle sitemap data, see WebScraper/index.ts:280
     // TODO: ScrapeEvents
 
     const fallbackList = await buildFallbackList(meta);
 
-    // Check if actions are requested but no engines support them
-    if (meta.featureFlags.has("actions")) {
+    // Check if actions are requested but no engines support them.
+    // Skip when the content was already prefetched (a browser engine already
+    // ran the actions and downloaded the file); the re-run only needs the
+    // document/pdf engine to parse it, which does not support actions.
+    if (
+      meta.featureFlags.has("actions") &&
+      meta.pdfPrefetch === undefined &&
+      meta.documentPrefetch === undefined
+    ) {
       if (
         fallbackList.length === 0 ||
         fallbackList.every(engine => engine.unsupportedFeatures.has("actions"))
@@ -822,6 +816,15 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
                   error: error.error,
                 },
               );
+            } else if (error.error instanceof EngineUnsuccessfulError) {
+              // Deliberately silent. An engine declining the page is a normal
+              // waterfall outcome and is already recorded elsewhere: the
+              // success-factor check logs "deemed unsuccessful" with its reasoning,
+              // and engines that recognise the body as none of their business
+              // (pdf/document finding HTML) are preceded by "Scraping via X...".
+              // Logging again only duplicated that, ~48k lines/hour across all
+              // engines. Recognised here purely so it doesn't fall through to the
+              // catch-all branch and get reported as an unexpected error.
             } else if (
               error.error instanceof AddFeatureError ||
               error.error instanceof RemoveFeatureError ||
@@ -981,6 +984,7 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
 
     let document: Document = {
       markdown: engineResult.markdown,
+      pages: engineResult.pages,
       rawHtml: engineResult.html,
       json: engineResult.json,
       screenshot: engineResult.screenshot,
@@ -992,6 +996,9 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
         statusCode: engineResult.statusCode,
         error: engineResult.error,
         numPages: engineResult.pdfMetadata?.numPages,
+        ...(engineResult.pdfMetadata?.totalPages !== undefined
+          ? { totalPages: engineResult.pdfMetadata.totalPages }
+          : {}),
         ...(engineResult.pdfMetadata?.title
           ? { title: engineResult.pdfMetadata.title }
           : {}),
@@ -1043,7 +1050,7 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
       success: true,
       document,
       unsupportedFeatures: result.unsupportedFeatures,
-      dataLayer: engineResult.dataLayer,
+      exchange: engineResult.exchange,
     };
   });
 }
@@ -1080,6 +1087,39 @@ export async function scrapeURL(
     });
 
     meta.logger.info("scrapeURL entered");
+
+    // Threat protection: check the target URL BEFORE any engine selection
+    // or outbound fetch. The policy is resolved at the controller layer and
+    // threaded through internalOptions; absent policy = zero overhead.
+    // The dedup map is scoped to this one scrape: the initial check and any
+    // redirect re-check on the same URL share a single scan (one fee); a
+    // redirect to a different URL is a second scan and bills a second fee
+    // (see calculateThreatScanCredits).
+    const threatPolicy = internalOptions.threatProtection;
+    const threatDedup: ThreatCheckDedup = new Map();
+    if (threatPolicy && threatPolicy.mode !== "off") {
+      const initialUrl = meta.rewrittenUrl ?? meta.url;
+      const decision = await checkUrl(initialUrl, threatPolicy, {
+        teamId: internalOptions.teamId,
+        dedup: threatDedup,
+      });
+      meta.threatDecisions.push(decision);
+      if (!decision.allowed) {
+        meta.logger.info("URL blocked by threat protection policy", {
+          url: initialUrl,
+          domain: decision.domain,
+          rule: decision.rule,
+        });
+        setSpanAttributes(span, {
+          "scrape.blocked_by_threat_protection": true,
+        });
+        return {
+          success: false,
+          error: new UnsafeDomainBlockedError(initialUrl, decision),
+          threatDecisions: meta.threatDecisions,
+        };
+      }
+    }
 
     if (meta.rewrittenUrl) {
       meta.logger.info("Rewriting URL");
@@ -1266,6 +1306,40 @@ export async function scrapeURL(
         }
       }
 
+      // Threat protection: if the scrape ended up on a different URL than
+      // requested (redirect), re-check the destination URL. This closes the
+      // "clean URL redirects to a blocked URL" bypass vector — including
+      // same-domain redirects onto a flagged path.
+      if (threatPolicy && threatPolicy.mode !== "off" && result.success) {
+        const initialUrl = meta.rewrittenUrl ?? meta.url;
+        const finalUrl = result.document.metadata.url;
+        if (
+          finalUrl &&
+          canonicalizeUrl(finalUrl) !== canonicalizeUrl(initialUrl)
+        ) {
+          const decision = await checkUrl(finalUrl, threatPolicy, {
+            teamId: internalOptions.teamId,
+            dedup: threatDedup,
+          });
+          meta.threatDecisions.push(decision);
+          if (!decision.allowed) {
+            meta.logger.info(
+              "Redirect destination blocked by threat protection policy",
+              {
+                url: finalUrl,
+                domain: decision.domain,
+                initialUrl,
+                rule: decision.rule,
+              },
+            );
+            setSpanAttributes(span, {
+              "scrape.blocked_by_threat_protection": true,
+            });
+            throw new UnsafeDomainBlockedError(finalUrl, decision);
+          }
+        }
+      }
+
       meta.logger.debug("scrapeURL metrics", {
         module: "scrapeURL/metrics",
         timeTaken: Date.now() - startTime,
@@ -1312,7 +1386,9 @@ export async function scrapeURL(
           result.success && result.document.metadata.cacheState === "hit",
       });
 
-      return result;
+      return meta.threatDecisions.length > 0
+        ? { ...result, threatDecisions: meta.threatDecisions }
+        : result;
     } catch (error) {
       // if (Object.values(meta.results).length > 0 && Object.values(meta.results).every(x => x.state === "error" && x.error instanceof FEPageLoadFailed)) {
       //   throw new FEPageLoadFailed();
@@ -1430,6 +1506,16 @@ export async function scrapeURL(
           error,
           retryStats: error.stats,
         });
+      } else if (error instanceof UnsafeDomainBlockedError) {
+        errorType = "UnsafeDomainBlockedError";
+        meta.logger.warn(
+          "scrapeURL: Domain blocked by threat protection policy",
+          {
+            error,
+            domain: error.domain,
+            rule: error.decision.rule,
+          },
+        );
       } else if (error instanceof AbortManagerThrownError) {
         errorType = "AbortManagerThrownError";
         throw error.inner;
@@ -1453,6 +1539,9 @@ export async function scrapeURL(
       return {
         success: false,
         error,
+        ...(meta.threatDecisions.length > 0
+          ? { threatDecisions: meta.threatDecisions }
+          : {}),
       };
     }
   });

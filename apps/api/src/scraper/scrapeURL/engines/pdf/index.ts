@@ -18,6 +18,7 @@ import {
   shouldParsePDF,
   getPDFMaxPages,
   getPDFMode,
+  getPDFPageMarkdown,
   getFirePdfAsync,
 } from "../../../../controllers/v2/types";
 import type { PDFMode } from "../../../../controllers/v2/types";
@@ -37,6 +38,7 @@ import { withSpan, setSpanAttributes } from "../../../../lib/otel-tracer";
 import { scrapePDFWithRunPodMU } from "./runpodMU";
 import { reconcilePageCountWithFirePdf, scrapePDFWithFirePDF } from "./firePDF";
 import { scrapePDFWithFirePDFAsync } from "./fire-pdf/async";
+import { decideFirePdfAsyncRoute } from "./fire-pdf/routing";
 import { scrapePDFWithParsePDF } from "./pdfParse";
 import { captureExceptionWithZdrCheck } from "../../../../services/sentry";
 import { isPdfBuffer, PDF_SNIFF_WINDOW } from "./pdfUtils";
@@ -58,6 +60,13 @@ export async function scrapePDF(meta: Meta): Promise<EngineScrapeResult> {
   const shouldParse = shouldParsePDF(meta.options.parsers);
   const maxPages = getPDFMaxPages(meta.options.parsers);
   const mode: PDFMode = getPDFMode(meta.options.parsers);
+  const includePageMarkdown = getPDFPageMarkdown(meta.options.parsers);
+
+  if (includePageMarkdown && !config.FIRE_PDF_BASE_URL) {
+    throw new Error(
+      "Physical page markdown is unavailable because FirePDF is not configured",
+    );
+  }
 
   if (!shouldParse) {
     if (meta.pdfPrefetch !== undefined && meta.pdfPrefetch !== null) {
@@ -157,6 +166,9 @@ export async function scrapePDF(meta: Meta): Promise<EngineScrapeResult> {
 
     let result: PDFProcessorResult | null = null;
     let effectivePageCount: number = 0;
+    // True page count of the document before maxPages capping. Stays undefined
+    // when native detection fails, so it can be omitted from the response.
+    let totalPageCount: number | undefined;
     let metadataTitle: string | undefined;
     let rustMarkdownForShadow: string | undefined;
     let shadowPdfType: string | undefined;
@@ -166,7 +178,8 @@ export async function scrapePDF(meta: Meta): Promise<EngineScrapeResult> {
     let shadowPagesNeedingOcr: number[] | undefined;
 
     const forceFirePDF =
-      !!meta.options.__forceFirePDF && !!config.FIRE_PDF_BASE_URL;
+      (!!meta.options.__forceFirePDF || includePageMarkdown) &&
+      !!config.FIRE_PDF_BASE_URL;
     const rustEnabled = !!config.PDF_RUST_EXTRACT_ENABLE;
     const logger = meta.logger.child({ method: "scrapePDF/processPdf" });
 
@@ -215,6 +228,7 @@ export async function scrapePDF(meta: Meta): Promise<EngineScrapeResult> {
           mode,
         });
 
+        totalPageCount = detection.pageCount;
         effectivePageCount = maxPages
           ? Math.min(detection.pageCount, maxPages)
           : detection.pageCount;
@@ -271,6 +285,7 @@ export async function scrapePDF(meta: Meta): Promise<EngineScrapeResult> {
           mode,
         });
 
+        totalPageCount = pdfResult.pageCount;
         effectivePageCount = maxPages
           ? Math.min(pdfResult.pageCount, maxPages)
           : pdfResult.pageCount;
@@ -368,7 +383,8 @@ export async function scrapePDF(meta: Meta): Promise<EngineScrapeResult> {
     // OCR / MU fallback.
     // Skipped only when Rust extraction is enabled AND mode is "fast",
     // unless we explicitly routed to MinerU via MINERU_PERCENT.
-    const skipOCR = rustEnabled && mode === "fast" && !routeToMinerU;
+    const skipOCR =
+      rustEnabled && mode === "fast" && !routeToMinerU && !forceFirePDF;
     if (!result && !skipOCR) {
       const pdfBuffer = await readFile(tempFilePath);
       const fileSizeBytes = pdfBuffer.length;
@@ -404,27 +420,89 @@ export async function scrapePDF(meta: Meta): Promise<EngineScrapeResult> {
           Math.random() * 100 < config.FIRE_PDF_PERCENT);
 
       if (useFirePDF) {
-        // Per-request opt-in to async fire-pdf pipeline. Async client falls
-        // back to sync on any failure, so behaviour stays bounded by the
-        // sync path.
-        const useAsync = getFirePdfAsync(meta.options.parsers);
+        // Async is a server-controlled cohort within traffic already selected
+        // for FirePDF. ZDR and short-deadline requests are always kept out.
+        const asyncDecision = decideFirePdfAsyncRoute({
+          scrapeId: meta.id,
+          teamId: meta.internalOptions.teamId,
+          zeroDataRetention: meta.internalOptions.zeroDataRetention ?? false,
+          remainingMs: meta.abort.scrapeTimeout(),
+          requestOptIn: getFirePdfAsync(meta.options.parsers),
+          percentage: config.FIRE_PDF_ASYNC_PERCENT,
+          forceTeamIds: config.FIRE_PDF_ASYNC_FORCE_TEAM_IDS,
+          disableTeamIds: config.FIRE_PDF_ASYNC_DISABLE_TEAM_IDS,
+          allowRequestOverride: config.FIRE_PDF_ASYNC_ALLOW_REQUEST_OVERRIDE,
+        });
+        const useAsync = asyncDecision.enabled;
+        if (useAsync) {
+          meta.logger.info("Routing FirePDF request to async jobs", {
+            method: "scrapePDF",
+            event: "fire_pdf_async_routed",
+            reason: asyncDecision.reason,
+            percentage: config.FIRE_PDF_ASYNC_PERCENT,
+            scrape_id: meta.id,
+            team_id: meta.internalOptions.teamId,
+          });
+        }
         try {
-          result = await (
-            useAsync ? scrapePDFWithFirePDFAsync : scrapePDFWithFirePDF
-          )(
-            {
-              ...meta,
-              logger: meta.logger.child({
-                method: useAsync
-                  ? "scrapePDF/firePDFAsync"
-                  : "scrapePDF/firePDF",
-              }),
-            },
-            base64Content,
-            maxPages,
-            effectivePageCount,
-            mode,
-          );
+          const firePdfMeta = {
+            ...meta,
+            logger: meta.logger.child({
+              method: useAsync ? "scrapePDF/firePDFAsync" : "scrapePDF/firePDF",
+            }),
+          };
+          if (useAsync) {
+            try {
+              result = await scrapePDFWithFirePDFAsync(
+                firePdfMeta,
+                base64Content,
+                maxPages,
+                effectivePageCount,
+                mode,
+                undefined,
+                includePageMarkdown,
+              );
+            } catch (error) {
+              if (
+                !includePageMarkdown ||
+                error instanceof RemoveFeatureError ||
+                error instanceof AbortManagerThrownError
+              ) {
+                throw error;
+              }
+              meta.logger.warn(
+                "FirePDF async page markdown failed -- retrying synchronously",
+                {
+                  method: "scrapePDF/firePDFFallback",
+                  error,
+                  scrape_id: meta.id,
+                  team_id: meta.internalOptions.teamId,
+                },
+              );
+              result = await scrapePDFWithFirePDF(
+                {
+                  ...firePdfMeta,
+                  logger: meta.logger.child({
+                    method: "scrapePDF/firePDFSyncFallback",
+                  }),
+                },
+                base64Content,
+                maxPages,
+                effectivePageCount,
+                mode,
+                true,
+              );
+            }
+          } else {
+            result = await scrapePDFWithFirePDF(
+              firePdfMeta,
+              base64Content,
+              maxPages,
+              effectivePageCount,
+              mode,
+              includePageMarkdown,
+            );
+          }
           effectivePageCount = reconcilePageCountWithFirePdf(
             effectivePageCount,
             result,
@@ -604,8 +682,17 @@ export async function scrapePDF(meta: Meta): Promise<EngineScrapeResult> {
       statusCode: response.status,
       html: result?.html ?? "",
       markdown: result?.markdown ?? "",
+      ...(includePageMarkdown && result?.pageMarkdown
+        ? {
+            pages: result.pageMarkdown.map(page => ({
+              pageNumber: page.page,
+              markdown: page.markdown,
+            })),
+          }
+        : {}),
       pdfMetadata: {
         numPages: effectivePageCount,
+        totalPages: totalPageCount,
         title: metadataTitle,
       },
 

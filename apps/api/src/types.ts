@@ -154,10 +154,13 @@ export enum RateLimiterMode {
   ExtractAgentPreview = "extractAgentPreview",
   Browser = "browser",
   BrowserExecute = "browserExecute",
+  BrowserReplay = "browserReplay",
   Account = "account",
   SupportAsk = "supportAsk",
   SupportDocsSearch = "supportDocsSearch",
   Research = "research",
+  DeveloperSearch = "developerSearch",
+  Labs = "labs",
 }
 
 export type AuthResponse =
@@ -175,6 +178,9 @@ export type AuthResponse =
       // When true, send the agent OAuth-discovery WWW-Authenticate header even on
       // non-401 responses (e.g. keyless cap 429s) so agents can find the key flow.
       agentAuthDiscovery?: boolean;
+      // Machine-readable keyless quota details for trusted MCP recovery.
+      keylessReason?: "requests" | "credits";
+      retryAfterSeconds?: number;
     };
 
 export enum NotificationType {

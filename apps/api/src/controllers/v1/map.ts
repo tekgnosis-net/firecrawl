@@ -31,6 +31,11 @@ import {
 import { MapTimeoutError } from "../../lib/error";
 import { checkPermissions } from "../../lib/permissions";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
+import {
+  checkUrlsAgainstThreatPolicy,
+  resolveThreatProtection,
+} from "../../lib/threat-protection/request";
+import { calculateThreatScanCredits } from "../../lib/scrape-billing";
 
 configDotenv();
 const redis = new Redis(config.REDIS_URL!);
@@ -88,6 +93,7 @@ export async function getMapResults({
   includeSubdomains = true,
   crawlerOptions = {},
   teamId,
+  orgId,
   origin,
   includeMetadata = false,
   allowExternalLinks,
@@ -109,6 +115,7 @@ export async function getMapResults({
   includeSubdomains?: boolean;
   crawlerOptions?: any;
   teamId: string;
+  orgId?: string | null;
   origin?: string;
   includeMetadata?: boolean;
   allowExternalLinks?: boolean;
@@ -141,7 +148,7 @@ export async function getMapResults({
       ...(location ? { location } : {}),
       ...(headers ? { headers } : {}),
     }),
-    internalOptions: { teamId },
+    internalOptions: { teamId, orgId: orgId ?? null },
     team_id: teamId,
     createdAt: Date.now(),
   };
@@ -379,7 +386,22 @@ export async function mapController(
     });
   }
 
-  const permissions = checkPermissions(req.body, req.acuc?.flags);
+  const threatProtection = await resolveThreatProtection({
+    teamId: req.auth.team_id,
+    orgId: req.acuc?.org_id ?? null,
+    flags: req.acuc?.flags ?? null,
+    override: req.body.threatProtection,
+  });
+  if (threatProtection.error) {
+    return res.status(403).json({
+      success: false,
+      error: threatProtection.error,
+    });
+  }
+
+  const permissions = checkPermissions(req.body, req.acuc?.flags, {
+    threatProtectionOrgConfig: threatProtection.orgConfig,
+  });
   if (permissions.error) {
     return res.status(403).json({
       success: false,
@@ -425,6 +447,7 @@ export async function mapController(
         crawlerOptions: req.body,
         origin: req.body.origin,
         teamId: req.auth.team_id,
+        orgId: req.acuc?.org_id ?? null,
         abort: abort.signal,
         mock: req.body.useMock,
         filterByPath: req.body.filterByPath !== false,
@@ -464,16 +487,39 @@ export async function mapController(
     }
   }
 
+  // Threat protection: remove blocked links from the returned URL list
+  // entirely. Checks are URL-level; scan fees bill +2 per unique scanned
+  // URL (see calculateThreatScanCredits).
+  //
+  // "zscaler" mode evaluates map results against local rules only, same as
+  // the v2 map controller: one map can return thousands of URLs, and inline
+  // classification would burn the tenant's 400/hour urlLookup budget on
+  // links that may never be fetched.
+  let threatScanCredits = 0;
+  if (threatProtection.policy && result.links.length > 0) {
+    const { decisionsByUrl } = await checkUrlsAgainstThreatPolicy(
+      result.links,
+      threatProtection.policy,
+      {
+        teamId: req.auth.team_id,
+        localRulesOnly: threatProtection.policy.mode === "zscaler",
+      },
+    );
+    threatScanCredits = calculateThreatScanCredits(decisionsByUrl.values());
+    result.links = result.links.filter(x => {
+      const decision = decisionsByUrl.get(x);
+      return decision === undefined || decision.allowed;
+    });
+  }
+
   // Bill the team
-  billTeam(
-    req.auth.team_id,
-    req.acuc?.sub_id,
-    1,
-    req.acuc?.api_key_id ?? null,
-    { endpoint: "map", jobId: mapId },
-  ).catch(error => {
+  const creditsToBill = 1 + threatScanCredits;
+  billTeam(req.auth.team_id, creditsToBill, req.acuc?.api_key_id ?? null, {
+    endpoint: "map",
+    jobId: mapId,
+  }).catch(error => {
     logger.error(
-      `Failed to bill team ${req.auth.team_id} for 1 credit: ${error}`,
+      `Failed to bill team ${req.auth.team_id} for ${creditsToBill} credit(s): ${error}`,
     );
   });
 
@@ -494,7 +540,7 @@ export async function mapController(
       location: req.body.location,
     },
     results: result.links,
-    credits_cost: 1,
+    credits_cost: creditsToBill,
     zeroDataRetention: false, // not supported
   });
 

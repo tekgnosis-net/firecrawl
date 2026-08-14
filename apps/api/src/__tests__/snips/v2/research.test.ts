@@ -173,7 +173,7 @@ describeIf(HAS_RESEARCH)("Research API", () => {
   });
 
   describeIf(TEST_PRODUCTION)("research billing", () => {
-    it("bills read-paper as one scrape-like credit", async () => {
+    it("research read-paper remains zero-credit", async () => {
       const identity = await idmux({
         name: "research/bills read paper",
         credits: 100,
@@ -190,10 +190,10 @@ describeIf(HAS_RESEARCH)("Research API", () => {
 
       await sleepForBilling();
       const after = (await creditUsage(identity)).remainingCredits;
-      expect(before - after).toBe(1);
+      expect(before - after).toBe(0);
     }, 180000);
 
-    it("bills search-like endpoints by returned result count", async () => {
+    it("research search-like endpoints remain zero-credit", async () => {
       const identity = await idmux({
         name: "research/bills search papers",
         credits: 100,
@@ -212,7 +212,7 @@ describeIf(HAS_RESEARCH)("Research API", () => {
 
       await sleepForBilling();
       const after = (await creditUsage(identity)).remainingCredits;
-      expect(before - after).toBe(expectedCredits);
+      expect(before - after).toBe(0);
     }, 180000);
   });
 });

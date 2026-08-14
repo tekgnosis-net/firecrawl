@@ -68,6 +68,7 @@ export async function getLinksFromSitemap(
       try {
         const { buffer } = await fetchFileToBuffer(sitemapUrl, false, {
           headers,
+          signal: abort,
         });
         const decompressed = await gunzipAsync(buffer);
         content = decompressed.toString("utf-8");
@@ -115,6 +116,7 @@ export async function getLinksFromSitemap(
           {
             forceEngine,
             v0DisableJsDom: true,
+            orgId: null,
             externalAbort: abort
               ? {
                   signal: abort,

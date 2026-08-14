@@ -2,7 +2,12 @@ import { Meta } from "..";
 import { Document } from "../../../controllers/v2/types";
 import { config } from "../../../config";
 import { hasFormatOfType } from "../../../lib/format-utils";
-import { AudioUnsupportedUrlError } from "../error";
+import { AudioUnsupportedUrlError, throwIfMediaAccessDenied } from "../error";
+
+// Downloads can be large (long videos → hundreds of MB), so this is generous —
+// but an unbounded fetch that hangs would consume the whole scrape budget and
+// surface as an opaque timeout rather than a clean failure.
+const DOWNLOAD_FETCH_TIMEOUT_MS = 240_000;
 
 let cachedUrlRegex: RegExp | null = null;
 let cacheTimestamp = 0;
@@ -72,12 +77,14 @@ export async function fetchAudio(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(requestBody),
+    signal: AbortSignal.timeout(DOWNLOAD_FETCH_TIMEOUT_MS),
   });
 
   if (!response.ok) {
     const error = await response
       .json()
       .catch(() => ({ detail: "Unknown error" }));
+    throwIfMediaAccessDenied(error);
     throw new Error(`Audio download failed: ${error.detail}`);
   }
 

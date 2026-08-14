@@ -24,7 +24,7 @@ import {
   processOMCEJobs,
   queryDomainsForPrecrawl,
 } from "..";
-import { queryTopUrlsForDomain, updateTallyTeam } from "../../db/rpc";
+import { queryTopUrlsForDomain } from "../../db/rpc";
 import { getSearchIndexClient } from "../../lib/search-index-client";
 // Search indexing is now handled by the separate search service
 // import { processSearchIndexJobs } from "../../lib/search-index/queue";
@@ -42,6 +42,8 @@ import { crawlGroup, resolveNewGroupBackend } from "../worker/nuq-router";
 import { getACUCTeam } from "../../controllers/auth";
 import { processEngpickerJob } from "../../lib/engpicker";
 import { logRequest } from "../logging/log_job";
+import { startSiemLoggingConsumer } from "../siem-logging/worker";
+import { closeSiemLoggingTransport } from "../../lib/siem-logging/transport";
 
 const workerLockDuration = config.WORKER_LOCK_DURATION;
 const workerStalledCheckInterval = config.WORKER_STALLED_CHECK_INTERVAL;
@@ -82,13 +84,13 @@ const processBillingJobInternal = async (token: string, job: Job) => {
       // This is an individual billing operation that should be queued for batch processing
       const {
         team_id,
-        subscription_id,
         credits,
         billing,
         endpoint,
         is_extract,
         api_key_id,
         autumnTrackInRequest,
+        exchangeAccessEventId,
       } = job.data;
 
       logger.info(`Adding team ${team_id} billing operation to batch queue`, {
@@ -100,7 +102,6 @@ const processBillingJobInternal = async (token: string, job: Job) => {
       // Add to the REDIS batch queue
       await queueBillingOperation(
         team_id,
-        subscription_id,
         credits,
         api_key_id ?? null,
         resolveBillingMetadata({
@@ -109,6 +110,13 @@ const processBillingJobInternal = async (token: string, job: Job) => {
         }),
         is_extract,
         autumnTrackInRequest,
+        typeof exchangeAccessEventId === "string" &&
+          exchangeAccessEventId.length > 0
+          ? {
+              accessEventId: exchangeAccessEventId,
+              billingReference: String(job.id),
+            }
+          : undefined,
       );
     } else {
       logger.warn(`Unknown billing job type: ${job.name}`);
@@ -497,6 +505,7 @@ const processPrecrawlJob = async (token: string, job: Job) => {
               internalOptions: {
                 disableSmartWaitCache: true, // NOTE: smart wait disabled for crawls to ensure contentful scrape, speed does not matter
                 teamId,
+                orgId: null, // internal pre-crawl team, no org applies
                 saveScrapeResultToGCS: !!config.GCS_FIRE_ENGINE_BUCKET_NAME,
                 zeroDataRetention: false,
                 isPreCrawl: true, // NOTE: must be added to internal options for indexing, if not it will be treated as a normal scrape in the index
@@ -580,15 +589,27 @@ const processPrecrawlJob = async (token: string, job: Job) => {
 
 let isShuttingDown = false;
 
+// The SIEM consumer is a subscription rather than a loop, so it has to be torn
+// down from the signal path: workerFun exits the process once its own jobs
+// drain, so anything after the worker Promise.all never runs. Unacked batches go
+// back to the broker for another replica.
+function shutdownSiemLoggingTransport(): void {
+  closeSiemLoggingTransport().catch(error => {
+    logger.warn("Failed to close the SIEM logging transport", { error });
+  });
+}
+
 if (require.main === module) {
   process.on("SIGINT", () => {
     logger.info("Received SIGINT. Shutting down gracefully...");
     isShuttingDown = true;
+    shutdownSiemLoggingTransport();
   });
 
   process.on("SIGTERM", () => {
     logger.info("Received SIGTERM. Shutting down gracefully...");
     isShuttingDown = true;
+    shutdownSiemLoggingTransport();
   });
 }
 
@@ -668,41 +689,6 @@ const workerFun = async (
   process.exit(0);
 };
 
-async function tallyBilling() {
-  const logger = _logger.child({
-    module: "index-worker",
-    method: "tallyBilling",
-  });
-  // get up to 100 teams and remove them from set
-  const billedTeams = await getRedisConnection().srandmember(
-    "billed_teams",
-    100,
-  );
-
-  if (!billedTeams || billedTeams.length === 0) {
-    logger.debug("No billed teams to process");
-    return;
-  }
-
-  await getRedisConnection().srem("billed_teams", billedTeams);
-  logger.info("Starting to update tallies", {
-    billedTeams: billedTeams.length,
-  });
-
-  for (const teamId of billedTeams) {
-    logger.info("Updating tally for team", { teamId });
-
-    try {
-      await updateTallyTeam(teamId);
-      logger.info("Updated tally for team", { teamId });
-    } catch (error) {
-      logger.warn("Failed to update tally for team", { teamId, error });
-    }
-  }
-
-  logger.info("Finished updating tallies");
-}
-
 const INDEX_INSERT_INTERVAL = 3000;
 const WEBHOOK_INSERT_INTERVAL = 15000;
 const OMCE_INSERT_INTERVAL = 5000;
@@ -726,6 +712,11 @@ const BROWSER_ACTIVITY_INSERT_INTERVAL = 10000;
     : (async () => {
         logger.warn("PRECRAWL_TEAM_ID not set, skipping precrawl worker");
       })();
+  // A RabbitMQ consumer registration, not a polling loop: it returns once
+  // subscribed and the transport reconnects itself on a broker drop.
+  startSiemLoggingConsumer().catch(error => {
+    logger.error("Failed to start the SIEM logging consumer", { error });
+  });
 
   const indexInserterInterval = setInterval(async () => {
     if (isShuttingDown) {
@@ -765,16 +756,6 @@ const BROWSER_ACTIVITY_INSERT_INTERVAL = 10000;
       await processOMCEJobs();
     });
   }, OMCE_INSERT_INTERVAL);
-
-  const billingTallyInterval = setInterval(
-    async () => {
-      if (isShuttingDown) {
-        return;
-      }
-      await tallyBilling();
-    },
-    5 * 60 * 1000,
-  );
 
   const engpickerPromise = (async () => {
     if (config.DISABLE_ENGPICKER) {
@@ -824,6 +805,5 @@ const BROWSER_ACTIVITY_INSERT_INTERVAL = 10000;
   clearInterval(webhookInserterInterval);
   clearInterval(browserActivityInterval);
   clearInterval(omceInserterInterval);
-  clearInterval(billingTallyInterval);
   logger.info("All workers shut down, exiting process");
 })();

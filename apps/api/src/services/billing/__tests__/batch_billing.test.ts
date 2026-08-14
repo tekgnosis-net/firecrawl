@@ -10,9 +10,7 @@ const {
   withAuth,
   trackCredits,
   refundCredits,
-  billTeam6,
-  setCachedACUC,
-  setCachedACUCTeam,
+  billTeam7,
 } = vi.hoisted(() => {
   const logger: any = {
     info: vi.fn(),
@@ -26,9 +24,7 @@ const {
     withAuth: vi.fn((fn: any) => fn),
     trackCredits: vi.fn<(args: any) => Promise<boolean>>(),
     refundCredits: vi.fn<(args: any) => Promise<void>>(),
-    billTeam6: vi.fn<(params: any) => Promise<{ api_key: string }[]>>(),
-    setCachedACUC: vi.fn(),
-    setCachedACUCTeam: vi.fn(),
+    billTeam7: vi.fn<(params: any) => Promise<{ api_key: string }[]>>(),
   };
 });
 
@@ -54,12 +50,7 @@ vi.mock("../../autumn/autumn.service", () => ({
 }));
 
 vi.mock("../../../db/rpc", () => ({
-  billTeam6,
-}));
-
-vi.mock("../../../controllers/auth", () => ({
-  setCachedACUC,
-  setCachedACUCTeam,
+  billTeam7,
 }));
 
 let queue: string[] = [];
@@ -130,7 +121,6 @@ import { processBillingBatch } from "../batch_billing";
 function makeOp(overrides: Record<string, unknown> = {}) {
   return JSON.stringify({
     team_id: "team-1",
-    subscription_id: "sub-1",
     credits: 10,
     billing: { endpoint: "extract" },
     is_extract: false,
@@ -145,7 +135,7 @@ beforeEach(() => {
   queue = [];
   billedTeams.clear();
   locks.clear();
-  billTeam6.mockResolvedValue([]);
+  billTeam7.mockResolvedValue([]);
   trackCredits.mockResolvedValue(true);
   refundCredits.mockResolvedValue(undefined);
 });
@@ -159,7 +149,7 @@ describe("processBillingBatch", () => {
 
     await processBillingBatch();
 
-    expect(billTeam6).toHaveBeenCalled();
+    expect(billTeam7).toHaveBeenCalled();
     expect(trackCredits).not.toHaveBeenCalled();
     expect(captureException).not.toHaveBeenCalled();
   });
@@ -169,13 +159,13 @@ describe("processBillingBatch", () => {
 
     await processBillingBatch();
 
-    expect(billTeam6).toHaveBeenCalled();
+    expect(billTeam7).toHaveBeenCalled();
     expect(trackCredits).not.toHaveBeenCalled();
   });
 
   it("refunds request-tracked credits when billing returns success false", async () => {
     queue = [makeOp({ autumnTrackInRequest: true })];
-    billTeam6.mockRejectedValueOnce(new Error("db failed"));
+    billTeam7.mockRejectedValueOnce(new Error("db failed"));
 
     await processBillingBatch();
 
@@ -186,7 +176,6 @@ describe("processBillingBatch", () => {
         source: "processBillingBatch",
         endpoint: "extract",
         apiKeyId: 123,
-        subscriptionId: "sub-1",
       },
       featureId: "CREDITS",
     });
@@ -195,7 +184,7 @@ describe("processBillingBatch", () => {
 
   it("captures exceptions and refunds when billing throws", async () => {
     queue = [makeOp({ autumnTrackInRequest: true })];
-    billTeam6.mockRejectedValueOnce(new Error("rpc exploded"));
+    billTeam7.mockRejectedValueOnce(new Error("rpc exploded"));
 
     await processBillingBatch();
 
@@ -206,7 +195,6 @@ describe("processBillingBatch", () => {
         source: "processBillingBatch",
         endpoint: "extract",
         apiKeyId: 123,
-        subscriptionId: "sub-1",
       },
       featureId: "CREDITS",
     });
@@ -217,16 +205,14 @@ describe("processBillingBatch", () => {
     queue = [
       makeOp({
         team_id: "team-1",
-        subscription_id: "sub-1",
         autumnTrackInRequest: true,
       }),
       makeOp({
         team_id: "team-2",
-        subscription_id: "sub-2",
         autumnTrackInRequest: true,
       }),
     ];
-    billTeam6
+    billTeam7
       .mockRejectedValueOnce(new Error("db failed"))
       .mockResolvedValueOnce([]);
     refundCredits.mockRejectedValueOnce(new Error("refund failed"));
@@ -240,11 +226,10 @@ describe("processBillingBatch", () => {
         source: "processBillingBatch",
         endpoint: "extract",
         apiKeyId: 123,
-        subscriptionId: "sub-1",
       },
       featureId: "CREDITS",
     });
-    expect(billTeam6).toHaveBeenCalledTimes(2);
+    expect(billTeam7).toHaveBeenCalledTimes(2);
     // The batch never tracks usage to Autumn, regardless of the request-time flag.
     expect(trackCredits).not.toHaveBeenCalled();
     expect(captureException).toHaveBeenCalled();

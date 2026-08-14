@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { z } from "zod";
+import { getMcpActionLogConfigErrors } from "./lib/mcp-action-log-config";
 
 /* Codecs */
 const delimitedList = (separator = ",") => {
@@ -30,7 +31,17 @@ const configSchema = z.object({
   FIRECRAWL_DASHBOARD_URL: z.url().default("https://www.firecrawl.dev"),
   SUPPORT_AGENT_URL: z.string().url().optional(),
   SUPPORT_AGENT_VERCEL_BYPASS_SECRET: z.string().optional(),
+  FIREBRAIN_TRACKS_URL: z.preprocess(
+    v => (typeof v === "string" && v.trim() === "" ? undefined : v),
+    z.string().url().optional(),
+  ),
+  FIREBRAIN_TRACKS_API_KEY: z.preprocess(
+    v => (typeof v === "string" && v.trim() === "" ? undefined : v),
+    z.string().trim().optional(),
+  ),
   RESEARCH_PROXY_URL: z.string().url().optional(),
+  LABS_SEARCH_URL: z.string().url().optional(),
+  LABS_SEARCH_SECRET: z.string().optional(),
 
   // Express
   EXPRESS_TRUST_PROXY: z.coerce.number().optional(),
@@ -43,11 +54,58 @@ const configSchema = z.object({
   // forward the real client IP for keyless rate-limiting via the
   // `x-firecrawl-keyless-ip` header. Untrusted callers can't override their IP.
   KEYLESS_PROXY_SECRET: z.string().optional(),
+  // Dedicated HMAC key for joining keyless quota-exhaustion events to the
+  // existing privacy-controlled conversion pipeline. Never use the proxy or
+  // credential secrets here: this value is only an analytics pseudonymizer.
+  KEYLESS_CONVERSION_HMAC_SECRET: emptyStringAsUndefined(z.string().min(32)),
+  // Dedicated signer/verifier secret for short-lived MCP delegated credentials.
+  // Keep separate from KEYLESS_PROXY_SECRET because delegated credentials can
+  // authorize billed requests for a managed OAuth connection.
+  MCP_DELEGATED_CREDENTIAL_SECRET: emptyStringAsUndefined(z.string().min(32)),
   // Optional Spur Context API token (https://docs.spur.us/context-api). When
   // set, keyless requests have their client IP checked against Spur and are
   // refused if the IP fronts anonymizing/rotating infrastructure (VPN/proxy/
   // TOR). Unset disables the check entirely (keyless behaves as before).
   SPUR_API_KEY: z.string().optional(),
+
+  // Threat protection (enterprise domain risk blocking). "normal" mode uses
+  // Google Web Risk. An unset key disables the provider (lookups then fail
+  // per the org's failurePolicy).
+  GOOGLE_WEB_RISK_API_KEY: z.string().optional(),
+  GOOGLE_WEB_RISK_API_URL: z
+    .string()
+    .url()
+    .default("https://webrisk.googleapis.com"),
+  // Google Web Risk Update API sync tuning. ZDR: "normal" mode checks run
+  // against a locally synced hash-prefix database (threatLists:computeDiff)
+  // instead of sending URLs to Google, and verdicts are never persisted.
+  //
+  // Floor for how often threatLists:computeDiff may run per list. Google's
+  // recommendedNextDiff is respected when it is later than this floor.
+  THREAT_LIST_SYNC_MIN_INTERVAL_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(60),
+  // A synced threat list older than this is treated as unavailable
+  // (provider-failure semantics → the org's failurePolicy decides).
+  THREAT_LIST_STALENESS_SECONDS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(6 * 60 * 60),
+
+  // Zscaler ZIA provider ("zscaler" threat protection mode). Base-URL
+  // overrides exist for tests (mock ZIA server); production always uses the
+  // real endpoints derived from the org's vanity domain and cloud name.
+  ZSCALER_TOKEN_URL_OVERRIDE: z.string().url().optional(),
+  ZSCALER_API_URL_OVERRIDE: z.string().url().optional(),
+
+  // Organization SIEM logging delivery. The encryption key must decode to
+  // exactly 32 bytes; validation happens when a secret is encrypted/decrypted
+  // so self-hosted deployments that do not use this feature need no key.
+  SIEM_LOGGING_ENCRYPTION_KEY: z.string().optional(),
+  PARTNER_EGRESS_PROXY_URL: z.string().url().optional(),
 
   // API Keys & Authentication
   BULL_AUTH_KEY: z.string().optional(),
@@ -75,6 +133,9 @@ const configSchema = z.object({
   // OAuth token introspection
   OAUTH_INTROSPECT_URL: z.string().optional(),
   OAUTH_INTROSPECT_SECRET: z.string().optional(),
+  MCP_ACTION_LOG_SECRET: z.string().optional(),
+  MCP_ACTION_LOG_STORAGE_ENABLED: z.stringbool().default(false),
+  MCP_ACTION_LOG_WRITES_ENABLED: z.stringbool().default(false),
 
   // Agent auth discovery (RFC 9728 WWW-Authenticate on 401)
   AGENT_AUTH_RESOURCE_METADATA_URL: z
@@ -132,11 +193,16 @@ const configSchema = z.object({
   CLICKHOUSE_ANALYTICS_URL: z.string().optional(),
   CLICKHOUSE_ANALYTICS_DATABASE: z.string().optional(),
 
-  // Search highlights (beta): query-highlights model service. URL is the base
-  // (e.g. https://firecrawl--query-highlights.modal.run); TOKEN is the bearer
-  // token sent on every request.
+  // Search highlights: highlighter service base URL. TOKEN is optional
+  // bearer auth for legacy/external services; the in-cluster service omits it.
   HIGHLIGHT_MODEL_URL: z.string().optional(),
   HIGHLIGHT_MODEL_TOKEN: z.string().optional(),
+  // Stable percentage of non-MCP/CLI cohorts whose generated highlights are
+  // returned. The remaining eligible traffic still runs in shadow mode.
+  HIGHLIGHT_ROLLOUT_PERCENT: z.coerce.number().min(0).max(100).default(0),
+
+  // Exchange (routed data sources service)
+  FIRE_EXCHANGE_URL: z.url().optional(),
 
   // Fire Engine
   FIRE_ENGINE_BETA_URL: z.string().optional(),
@@ -217,6 +283,12 @@ const configSchema = z.object({
   FIRE_PDF_PERCENT: z.coerce.number().min(0).max(100).default(10),
   FIRE_PDF_BASE_URL: z.string().optional(),
   FIRE_PDF_API_KEY: z.string().optional(),
+  // Async /jobs rollout is a separate, server-controlled cohort inside
+  // traffic already selected for FirePDF. It is disabled by default.
+  FIRE_PDF_ASYNC_PERCENT: z.coerce.number().min(0).max(100).default(0),
+  FIRE_PDF_ASYNC_FORCE_TEAM_IDS: z.string().optional(),
+  FIRE_PDF_ASYNC_DISABLE_TEAM_IDS: z.string().optional(),
+  FIRE_PDF_ASYNC_ALLOW_REQUEST_OVERRIDE: z.stringbool().default(false),
 
   // RunPod
   RUNPOD_MU_API_KEY: z.string().optional(),
@@ -232,6 +304,26 @@ const configSchema = z.object({
   SLACK_WEBHOOK_URL: z.string().optional(),
   SLACK_ADMIN_WEBHOOK_URL: z.string().optional(),
   DISABLE_WEBHOOK_DELIVERY: z.stringbool().optional(),
+
+  // Slack integration ("Add to Slack" for monitor notifications + /monitor
+  // slash command). Credentials come from the Firecrawl Slack app.
+  SLACK_CLIENT_ID: z.string().optional(),
+  SLACK_CLIENT_SECRET: z.string().optional(),
+  SLACK_SIGNING_SECRET: z.string().optional(),
+  // Bot scopes requested during install. Override only if the Slack app manifest
+  // changes; keep in sync with slack-app-manifest.json.
+  SLACK_OAUTH_SCOPES: z
+    .string()
+    .default(
+      "chat:write,chat:write.public,commands,channels:read,groups:read,team:read,incoming-webhook",
+    ),
+  // Absolute URL Slack redirects back to after authorize. Must exactly match a
+  // Redirect URL configured on the Slack app (e.g.
+  // https://api.firecrawl.dev/v2/slack/oauth/callback).
+  SLACK_OAUTH_REDIRECT_URL: z.string().optional(),
+  // 32-byte key (hex or base64) used to AES-256-GCM encrypt stored bot tokens.
+  // If unset, tokens are stored with a `plain:` prefix (self-hosted only).
+  SLACK_TOKEN_ENCRYPTION_KEY: z.string().optional(),
   ALLOW_LOCAL_WEBHOOKS: z.stringbool().optional(),
   WEBHOOK_USE_RABBITMQ: z.stringbool().optional(),
 
@@ -332,4 +424,14 @@ const configSchema = z.object({
   CODE_SANDBOX_URL: z.string().default("ws://code-sandbox:3001"),
 });
 
-export const config = configSchema.parse(process.env);
+const validatedConfigSchema = configSchema.superRefine((value, context) => {
+  for (const error of getMcpActionLogConfigErrors(value)) {
+    context.addIssue({
+      code: "custom",
+      path: [error.path],
+      message: error.message,
+    });
+  }
+});
+
+export const config = validatedConfigSchema.parse(process.env);

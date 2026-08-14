@@ -10,6 +10,7 @@ import { ScrapeJobData } from "../types";
 import { SearchV2Response } from "../lib/entities";
 import type { BillingMetadata } from "../services/billing/types";
 import { getScrapeZDR } from "../lib/zdr-helpers";
+import type { ThreatProtectionPolicy } from "../lib/threat-protection/types";
 
 export interface DocumentWithCostTracking {
   document: Document;
@@ -30,6 +31,7 @@ interface ScrapeItem {
 
 interface ScrapeSearchOptions {
   teamId: string;
+  orgId?: string | null;
   origin: string;
   timeout: number;
   scrapeOptions: ScrapeOptions;
@@ -40,6 +42,7 @@ interface ScrapeSearchOptions {
   billing?: BillingMetadata;
   agentIndexOnly?: boolean;
   keylessReserved?: boolean;
+  threatProtectionPolicy?: ThreatProtectionPolicy | null;
 }
 
 async function scrapeSearchResultDirect(
@@ -77,10 +80,12 @@ async function scrapeSearchResultDirect(
         },
         internalOptions: {
           teamId: options.teamId,
+          orgId: options.orgId ?? null,
           bypassBilling: options.bypassBilling ?? true,
           zeroDataRetention,
           teamFlags: flags,
           agentIndexOnly: options.agentIndexOnly ?? false,
+          threatProtection: options.threatProtectionPolicy ?? undefined,
         },
         skipNuq: true,
         origin: options.origin,
@@ -144,7 +149,11 @@ async function scrapeSearchResultDirect(
 export function getItemsToScrape(
   searchResponse: SearchV2Response,
   flags: TeamFlags,
-  context?: { team_id?: string | null; origin?: string | null },
+  context?: {
+    team_id?: string | null;
+    org_id?: string | null;
+    origin?: string | null;
+  },
 ): ScrapeItem[] {
   const items: ScrapeItem[] = [];
 

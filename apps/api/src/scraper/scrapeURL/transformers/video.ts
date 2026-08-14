@@ -2,6 +2,11 @@ import { Meta } from "..";
 import { Document, VideoItem } from "../../../controllers/v2/types";
 import { config } from "../../../config";
 import { hasFormatOfType } from "../../../lib/format-utils";
+import { throwIfMediaAccessDenied } from "../error";
+
+// Video downloads can be large; generous but bounded so a hung fetch can't
+// silently consume the whole scrape budget.
+const DOWNLOAD_FETCH_TIMEOUT_MS = 240_000;
 
 let cachedUrlRegex: RegExp | null = null;
 let cacheTimestamp = 0;
@@ -170,12 +175,14 @@ async function fetchLegacyVideoIfSupported(meta: Meta, document: Document) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(requestBody),
+    signal: AbortSignal.timeout(DOWNLOAD_FETCH_TIMEOUT_MS),
   });
 
   if (!response.ok) {
     const error = await response
       .json()
       .catch(() => ({ detail: "Unknown error" }));
+    throwIfMediaAccessDenied(error);
     throw new Error(`Video download failed: ${error.detail}`);
   }
 
