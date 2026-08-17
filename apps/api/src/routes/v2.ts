@@ -54,6 +54,8 @@ import { deprecationMiddleware } from "../lib/deprecations";
 import { agentController } from "../controllers/v2/agent";
 import { agentStatusController } from "../controllers/v2/agent-status";
 import { agentCancelController } from "../controllers/v2/agent-cancel";
+import { agentTraceController } from "../controllers/v2/agent-trace";
+import { agentSnapshotController } from "../controllers/v2/agent-snapshot";
 import {
   browserCreateController,
   browserExecuteController,
@@ -387,6 +389,20 @@ v2Router.get(
   authMiddleware(RateLimiterMode.ExtractStatus),
   validateJobIdParam,
   wrap(agentStatusController),
+);
+
+v2Router.get(
+  "/agent/:jobId/trace",
+  authMiddleware(RateLimiterMode.ExtractStatus),
+  validateJobIdParam,
+  wrap(agentTraceController),
+);
+
+v2Router.get(
+  "/agent/:jobId/snapshots/:snapshotId",
+  authMiddleware(RateLimiterMode.ExtractStatus),
+  validateJobIdParam,
+  wrap(agentSnapshotController),
 );
 
 v2Router.delete(
