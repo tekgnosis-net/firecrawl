@@ -965,7 +965,9 @@ export const agentRequestSchema = z.strictObject({
   webhook: agentWebhookSchema.optional(),
 
   overrideWhitelist: z.string().optional(),
-  model: z.enum(["spark-1-pro", "spark-1-mini"]).default("spark-1-pro"),
+  model: z
+    .enum(["spark-1-pro", "spark-1-mini", "spark-2"])
+    .default("spark-1-pro"),
   threatProtection: threatProtectionOverrideSchema.optional(),
   auditMetadata: auditMetadataSchema.optional(),
 });
@@ -1438,9 +1440,35 @@ export type AgentStatusResponse =
       status: "processing" | "completed" | "failed";
       error?: string;
       data?: any;
-      model?: "spark-1-pro" | "spark-1-mini";
+      model?: "spark-1-pro" | "spark-1-mini" | "spark-2";
       expiresAt: string;
       creditsUsed?: number;
+    };
+
+export type AgentTraceResponse =
+  | ErrorResponse
+  | {
+      success: true;
+      id: string;
+      events: object[];
+      creditsUsed: number;
+      activeBrowserSessions?: Array<{
+        id: string;
+        liveViewUrl: string;
+        viewport: {
+          width: number;
+          height: number;
+        };
+      }>;
+    };
+
+export type AgentSnapshotResponse =
+  | ErrorResponse
+  | {
+      success: true;
+      id: string;
+      snapshotId: string;
+      snapshot: string;
     };
 
 export type AgentCancelResponse =

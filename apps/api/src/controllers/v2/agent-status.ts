@@ -25,11 +25,12 @@ export async function agentStatusController(
 
   const agent = await supabaseGetAgentByIdDirect(req.params.jobId);
 
-  let model: "spark-1-pro" | "spark-1-mini";
+  let model: "spark-1-pro" | "spark-1-mini" | "spark-2";
   if (agent) {
     model = (agent.options?.model ?? "spark-1-pro") as
       | "spark-1-pro"
-      | "spark-1-mini";
+      | "spark-1-mini"
+      | "spark-2";
   } else {
     try {
       const optionsRequest = await fetch(
@@ -55,7 +56,8 @@ export async function agentStatusController(
       } else {
         model = ((await optionsRequest.json()).model ?? "spark-1-pro") as
           | "spark-1-pro"
-          | "spark-1-mini";
+          | "spark-1-mini"
+          | "spark-2";
       }
     } catch (error) {
       logger.warn("Failed to get agent request details", {
