@@ -1,6 +1,7 @@
 import { RateLimiterRedis } from "rate-limiter-flexible";
 import { config } from "../config";
 import { RateLimiterMode } from "../types";
+import type { TeamFlags } from "../controllers/v1/types";
 import Redis from "ioredis";
 
 export const redisRateLimitClient = new Redis(config.REDIS_RATE_LIMIT_URL!, {
@@ -73,15 +74,44 @@ export function getRateLimiter(mode: RateLimiterMode): RateLimiterRedis {
 }
 
 /**
+ * Reads the per-minute override for one mode from the org flags. Returns
+ * undefined when there is no usable override.
+ *
+ * Bad config is skipped, not thrown on: the value is validated on write, but a
+ * broken entry must never break authentication. Only a finite integer above
+ * zero counts.
+ */
+export function getRateLimitOverride(
+  mode: RateLimiterMode,
+  overrides: unknown,
+): number | undefined {
+  if (typeof overrides !== "object" || overrides === null) return undefined;
+  const value = (overrides as Record<string, unknown>)[mode];
+  if (typeof value !== "number") return undefined;
+  if (!Number.isInteger(value) || value <= 0) return undefined;
+  return value;
+}
+
+/**
  * Builds the per-minute rate limiter for an authenticated team from its Autumn
  * rate-limit multiplier: the effective limit is `base × multiplier` for
  * multiplier-scaled modes (default ×1). Modes without a base fall back to the
  * static table.
+ *
+ * An org-level override for the mode replaces that whole computation, so the
+ * multiplier and the base table are both discarded. Modes without an override
+ * keep the normal result.
  */
 export function getAutumnRateLimiter(
   mode: RateLimiterMode,
   multiplier: number = 1,
+  flags?: TeamFlags,
 ): RateLimiterRedis {
+  const override = getRateLimitOverride(mode, flags?.rateLimitOverrides);
+  if (override !== undefined) {
+    return createRateLimiter(`${mode}`, override);
+  }
+
   const base = BASE_RATE_LIMITS[mode];
   let rateLimit: number;
   if (base !== undefined) {

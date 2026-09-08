@@ -20,6 +20,7 @@ import {
 } from "../v2/types";
 import { createWebhookSender, WebhookEvent } from "../../services/webhook";
 import { logRequest } from "../../services/logging/log_job";
+import { externalRequestId } from "../../lib/external-request-id";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 
 import { config } from "../../config";
@@ -192,7 +193,12 @@ export async function extractController(
         req.auth.team_id,
         threatScanCredits,
         req.acuc?.api_key_id ?? null,
-        { endpoint: "extract" },
+        {
+          endpoint: "extract",
+          // Suffixed: the extract's MAIN charge (fire-0) uses the bare
+          // extractId — a shared key would collapse the two into one charge.
+          chargeId: `${extractId}:threat`,
+        },
       ).catch(error => {
         _logger.error(
           `Failed to bill team ${req.auth.team_id} for ${threatScanCredits} threat scan credit(s): ${error}`,
@@ -248,6 +254,7 @@ export async function extractController(
     id: extractId,
     kind: "extract",
     api_version: "v1",
+    external_request_id: externalRequestId(req),
     team_id: req.auth.team_id,
     origin: req.body.origin ?? "api",
     integration: req.body.integration,

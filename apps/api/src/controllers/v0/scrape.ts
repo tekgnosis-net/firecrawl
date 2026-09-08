@@ -25,6 +25,7 @@ import { ScrapeJobTimeoutError } from "../../lib/error";
 import { scrapeQueue } from "../../services/worker/nuq-router";
 import { getErrorContactMessage } from "../../lib/deployment";
 import { logRequest } from "../../services/logging/log_job";
+import { externalRequestId } from "../../lib/external-request-id";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 import {
   isThreatProtectionForced,
@@ -219,6 +220,7 @@ export async function scrapeController(req: Request, res: Response) {
       id: jobId,
       kind: "scrape",
       api_version: "v0",
+      external_request_id: externalRequestId(req),
       team_id,
       origin: req.body.origin ?? "api",
       integration: req.body.integration,

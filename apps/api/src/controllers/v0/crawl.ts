@@ -38,6 +38,7 @@ import {
   resolveNewGroupBackend,
 } from "../../services/worker/nuq-router";
 import { logRequest } from "../../services/logging/log_job";
+import { externalRequestId } from "../../lib/external-request-id";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 import {
   isThreatProtectionForced,
@@ -74,6 +75,7 @@ export async function crawlController(req: Request, res: Response) {
       id,
       kind: "crawl",
       api_version: "v0",
+      external_request_id: externalRequestId(req),
       team_id,
       origin: req.body.origin ?? "api",
       integration: req.body.integration,

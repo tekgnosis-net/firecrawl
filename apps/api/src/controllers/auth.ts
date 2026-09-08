@@ -5,7 +5,11 @@ import { logger } from "../lib/logger";
 import { parseApi } from "../lib/parseApi";
 import { withAuth } from "../lib/withAuth";
 import { getAgentSponsorStatus } from "../services/agent-sponsor";
-import { getRateLimiter, getAutumnRateLimiter } from "../services/rate-limiter";
+import {
+  getRateLimiter,
+  getAutumnRateLimiter,
+  getRateLimitOverride,
+} from "../services/rate-limiter";
 import {
   KEYLESS_FREE_TIER_LIMIT_MESSAGE,
   consumeKeylessRequest,
@@ -13,6 +17,7 @@ import {
   keylessExhaustionTelemetry,
   isKeylessIpEligible,
   keylessTeamId,
+  normalizeKeylessIpv4,
 } from "../lib/keyless";
 import { isKeylessIpSuspicious } from "../lib/spur";
 import { checkIpRestriction } from "../lib/ip-restriction";
@@ -26,7 +31,11 @@ import {
   AuthCreditUsageChunkRow,
 } from "../db/rpc";
 import { AuthResponse, RateLimiterMode } from "../types";
-import { AuthCreditUsageChunk, AuthCreditUsageChunkFromTeam } from "./v1/types";
+import {
+  AuthCreditUsageChunk,
+  AuthCreditUsageChunkFromTeam,
+  TeamFlags,
+} from "./v1/types";
 import {
   FIRECRAWL_REST_RESOURCE,
   OAuthIntrospectionUnavailableError,
@@ -35,6 +44,7 @@ import {
 import type { OAuthIntrospectionResponse } from "../services/oauth-token-introspection";
 import { verifyMcpDelegatedCredential } from "../lib/mcp-delegated-credential";
 import { autumnService } from "../services/autumn/autumn.service";
+import { ReplyError } from "ioredis";
 
 function normalizedApiIsUuid(potentialUuid: string): boolean {
   // Check if the string is a valid UUID
@@ -75,7 +85,9 @@ async function setCachedACUC(
       await setValue(cacheKeyACUC, JSON.stringify(acuc), 600, true);
     });
   } catch (error) {
-    logger.error(`Error updating cached ACUC ${cacheKeyACUC}: ${error}`);
+    logger.error("Error updating cached ACUC", {
+      error,
+    });
   }
 }
 
@@ -163,18 +175,38 @@ async function getACUC(
   const cacheKeyACUC = `acuc_${credentialPurpose}_${api_key}_${isExtract ? "extract" : "scrape"}`;
 
   if (useCache) {
-    const cachedACUC = await getValue(cacheKeyACUC);
+    let cachedACUC: string | null;
+    try {
+      cachedACUC = await getValue(cacheKeyACUC);
+    } catch (error) {
+      if (
+        error instanceof ReplyError ||
+        (error instanceof Error &&
+          (error as any).address &&
+          (error as any).code &&
+          error.name === "Error") ||
+        (error instanceof Error && error.name === "MaxRetriesPerRequestError")
+      ) {
+        logger.warn(
+          "Reading ACUC out of cache redis failed, treating as miss",
+          {
+            error,
+          },
+        );
+        cachedACUC = null;
+      } else {
+        throw error;
+      }
+    }
     if (cachedACUC !== null) {
       try {
         return JSON.parse(cachedACUC);
       } catch (error) {
         logger.warn("Ignoring malformed ACUC cache entry", {
-          cacheKey: cacheKeyACUC,
           error,
         });
         void deleteKey(cacheKeyACUC).catch(deleteError => {
           logger.warn("Failed to delete malformed ACUC cache entry", {
-            cacheKey: cacheKeyACUC,
             error: deleteError,
           });
         });
@@ -187,11 +219,11 @@ async function getACUC(
     let retries = 0;
     const maxRetries = 5;
     while (retries < maxRetries) {
-      const database = requiresPrimaryRead
-        ? db
-        : Math.random() > 2 / 3
-          ? dbRr
-          : db;
+      // General-purpose reads prefer the replica: the result is Redis-cached
+      // for 10 minutes, so sub-second replication lag is irrelevant. Fall back
+      // to the primary on replica error. hosted_mcp_oauth must stay on the
+      // primary — revocation has to observe fresh state.
+      const database = requiresPrimaryRead ? db : retries === 0 ? dbRr : db;
       try {
         data = await authCreditUsageChunk(database, api_key, credentialPurpose);
         break;
@@ -270,7 +302,10 @@ async function setCachedACUCTeam(
       await setValue(cacheKeyACUC, JSON.stringify(acuc), 600, true);
     });
   } catch (error) {
-    logger.error(`Error updating cached ACUC ${cacheKeyACUC}: ${error}`);
+    logger.error("Error updating cached ACUC", {
+      cacheKey: cacheKeyACUC,
+      error,
+    });
   }
 }
 
@@ -299,7 +334,30 @@ export async function getACUCTeam(
   const cacheKeyACUC = `acuc_team_${team_id}_${isExtract ? "extract" : "scrape"}`;
 
   if (useCache) {
-    const cachedACUC = await getValue(cacheKeyACUC);
+    let cachedACUC: string | null;
+    try {
+      cachedACUC = await getValue(cacheKeyACUC);
+    } catch (error) {
+      if (
+        error instanceof ReplyError ||
+        (error instanceof Error &&
+          (error as any).address &&
+          (error as any).code &&
+          error.name === "Error") ||
+        (error instanceof Error && error.name === "MaxRetriesPerRequestError")
+      ) {
+        logger.warn(
+          "Reading ACUC out of cache redis failed, treating as miss",
+          {
+            cacheKey: cacheKeyACUC,
+            error,
+          },
+        );
+        cachedACUC = null;
+      } else {
+        throw error;
+      }
+    }
     if (cachedACUC !== null) {
       return JSON.parse(cachedACUC);
     }
@@ -311,7 +369,9 @@ export async function getACUCTeam(
     const maxRetries = 5;
 
     while (retries < maxRetries) {
-      const database = Math.random() > 2 / 3 ? dbRr : db;
+      // Prefer the replica (10-minute Redis cache makes lag irrelevant); fall
+      // back to the primary on replica error.
+      const database = retries === 0 ? dbRr : db;
       try {
         data = await authCreditUsageChunkFromTeam(database, team_id);
         break;
@@ -451,6 +511,10 @@ async function handleKeylessAuth(
   // usable as arbitrary limiter buckets. Anything else falls through to 401.
   if (!isKeylessIpEligible(ip)) return unauthorized;
 
+  // Canonicalize `::ffff:`-mapped IPv4 so a client gets one Spur cache entry,
+  // one quota bucket, and one team id regardless of how the socket reported it.
+  ip = normalizeKeylessIpv4(ip);
+
   // Optional Spur Context check (only when SPUR_API_KEY is set): refuse keyless
   // for IPs fronting anonymizing/rotating infrastructure (VPN/proxy/TOR), the
   // main way the per-IP caps get bypassed. Fails open on any Spur error, and
@@ -570,14 +634,23 @@ export async function authenticateUser(
  * Builds the rate limiter for an authenticated team from its Autumn rate-limit
  * multiplier. Shared by the OAuth and API-key paths so their limiter setup
  * can't diverge.
+ *
+ * The org flags carry the optional per-endpoint override, so they are passed
+ * on to getAutumnRateLimiter, which stays the only place deciding the final
+ * limit. An override makes the multiplier irrelevant, so we skip fetching it
+ * from Autumn in that case rather than paying for a value that is discarded.
  */
 async function buildAuthenticatedRateLimiter(
   teamId: string,
   orgId: string | null | undefined,
   mode: RateLimiterMode,
+  flags: TeamFlags,
 ): Promise<RateLimiterRedis> {
-  const multiplier = await autumnService.getRateLimitMultiplier(teamId, orgId);
-  return getAutumnRateLimiter(mode, multiplier);
+  const multiplier =
+    getRateLimitOverride(mode, flags?.rateLimitOverrides) !== undefined
+      ? 1
+      : await autumnService.getRateLimitMultiplier(teamId, orgId);
+  return getAutumnRateLimiter(mode, multiplier, flags);
 }
 
 async function supaAuthenticateUser(
@@ -663,6 +736,7 @@ async function supaAuthenticateUser(
       teamId,
       chunk.org_id,
       mode,
+      chunk.flags,
     );
   } else if (token.startsWith("fco_")) {
     // OAuth access token — resolve via introspection endpoint
@@ -731,6 +805,7 @@ async function supaAuthenticateUser(
       teamId,
       chunk.org_id,
       mode,
+      chunk.flags,
     );
   } else {
     normalizedApi = parseApi(token);
@@ -761,6 +836,7 @@ async function supaAuthenticateUser(
       teamId,
       chunk.org_id,
       mode,
+      chunk.flags,
     );
   }
 

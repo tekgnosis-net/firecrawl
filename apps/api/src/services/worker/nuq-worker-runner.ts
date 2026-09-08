@@ -7,6 +7,7 @@ import { register } from "prom-client";
 import Express from "express";
 import { initializeBlocklist } from "../../scraper/WebScraper/utils/blocklist";
 import { initializeEngineForcing } from "../../scraper/WebScraper/utils/engine-forcing";
+import { shutdownPubSubLogging } from "../logging/log_job";
 
 export type WorkerQueue = {
   getJobToProcess(logger?: any): Promise<NuQJob<any, any> | null>;
@@ -68,6 +69,7 @@ export async function runNuqWorker(options: {
   }
 
   let isShuttingDown = false;
+  let shutdownStartedAt: number | undefined;
 
   const app = Express();
 
@@ -109,7 +111,12 @@ export async function runNuqWorker(options: {
   });
 
   function shutdown() {
+    if (isShuttingDown) return;
     isShuttingDown = true;
+    shutdownStartedAt = Date.now();
+    _logger.info("NuQ worker stopping after active work", {
+      module: options.serviceName,
+    });
   }
 
   process.on("SIGINT", shutdown);
@@ -199,11 +206,15 @@ export async function runNuqWorker(options: {
     }
   }
 
-  _logger.info("NuQ worker shutting down", { module: options.serviceName });
+  _logger.info("NuQ worker shutting down", {
+    module: options.serviceName,
+    workDrainMs: Date.now() - shutdownStartedAt!,
+  });
 
   server.close(async () => {
     await options.beforeShutdown?.();
     await options.shutdown?.();
+    await shutdownPubSubLogging();
     _logger.info("NuQ worker shut down", { module: options.serviceName });
     process.exit(0);
   });

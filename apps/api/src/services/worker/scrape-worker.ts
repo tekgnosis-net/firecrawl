@@ -18,6 +18,7 @@ import {
   addCrawlJobs,
   addCrawlJobDone,
   crawlToCrawler,
+  queueCrawlJobDoneRepair,
   recordRobotsBlocked,
   recordThreatBlocked,
   finishCrawlKickoff,
@@ -170,14 +171,31 @@ async function billScrapeJob(
       job.data.team_id !== config.BACKGROUND_INDEX_TEAM_ID! &&
       config.USE_DB_AUTHENTICATION
     ) {
+      // Resolved outside the try so the catch's refund decision can see it.
+      let routedToFirebill = false;
       try {
+        routedToFirebill = await autumnService.isRoutedThroughFirebill(
+          job.data.team_id,
+        );
         trackedInRequest = await autumnService.trackCredits({
           teamId: job.data.team_id,
           value: creditsToBeBilled,
           properties: autumnProperties,
           featureId,
+          // The worker job id is the one identity that is unique per charge
+          // (a crawl id is shared by every page — keying on it would collapse
+          // a crawl's pages into one billed event) AND survives a stall
+          // requeue, which re-runs the job under the same id: with this key,
+          // the re-run dedupes instead of double-billing (firebill route).
+          idempotencyKey: `fc:track:${billing.endpoint}:${job.id}`,
         });
-        const billingJobId = uuidv7();
+        // On the firebill route the ledger enqueue must be idempotent by the
+        // originating job: a stalled job reruns under the same job.id, the
+        // track dedupes in firebill, and a fresh random billing job id would
+        // debit the ledger twice (the same pattern monitors already use with
+        // their deterministic monitor-bill-{id}). Off the route, behavior is
+        // unchanged.
+        const billingJobId = routedToFirebill ? `bill-${job.id}` : uuidv7();
         logger.debug(
           `Adding billing job to queue for team ${job.data.team_id}`,
           {
@@ -192,26 +210,48 @@ async function billScrapeJob(
         // the rest, including confirming the Exchange access event once the
         // debit actually commits. A failed commit leaves the event pending
         // for reconciliation - it is never voided on an ambiguous outcome.
-        await getBillingQueue().add(
-          "bill_team",
-          {
-            team_id: job.data.team_id,
-            credits: creditsToBeBilled,
-            billing,
-            is_extract: false,
-            timestamp: new Date().toISOString(),
-            originating_job_id: job.id,
-            api_key_id: job.data.apiKeyId,
-            autumnTrackInRequest: trackedInRequest,
-            ...(exchange?.accessEventId === undefined
-              ? {}
-              : { exchangeAccessEventId: exchange.accessEventId }),
-          },
-          {
-            jobId: billingJobId,
-            priority: 10,
-          },
-        );
+        //
+        // On the firebill route the enqueue is retried a few times before
+        // giving up: the Autumn charge is durable and will not be refunded
+        // (see the catch below), so a dropped enqueue would leave the ledger
+        // permanently un-debited. Retries are safe there BECAUSE the job id
+        // is deterministic — a duplicate add dedupes in BullMQ. Off the
+        // route the id is random, so it keeps today's single attempt (the
+        // compensating refund covers it).
+        const enqueueAttempts = routedToFirebill ? 3 : 1;
+        for (let attempt = 1; ; attempt++) {
+          try {
+            await getBillingQueue().add(
+              "bill_team",
+              {
+                team_id: job.data.team_id,
+                credits: creditsToBeBilled,
+                billing,
+                is_extract: false,
+                timestamp: new Date().toISOString(),
+                originating_job_id: job.id,
+                api_key_id: job.data.apiKeyId,
+                autumnTrackInRequest: trackedInRequest,
+                ...(exchange?.accessEventId === undefined
+                  ? {}
+                  : { exchangeAccessEventId: exchange.accessEventId }),
+              },
+              {
+                jobId: billingJobId,
+                priority: 10,
+              },
+            );
+            break;
+          } catch (enqueueError) {
+            if (attempt >= enqueueAttempts) throw enqueueError;
+            logger.warn("billing enqueue failed; retrying", {
+              attempt,
+              billingJobId,
+              error: enqueueError,
+            });
+            await new Promise(resolve => setTimeout(resolve, 250 * attempt));
+          }
+        }
 
         return creditsToBeBilled;
       } catch (error) {
@@ -220,12 +260,36 @@ async function billScrapeJob(
           { error },
         );
         if (trackedInRequest && creditsToBeBilled !== null) {
-          await autumnService.refundCredits({
-            teamId: job.data.team_id,
-            value: creditsToBeBilled,
-            properties: autumnProperties,
-            featureId,
-          });
+          if (routedToFirebill) {
+            // No compensating refund on the firebill route: the tracked charge
+            // is durable and correct (the scrape ran), and refunding it here
+            // poisons any rerun — its track would dedupe against the intent
+            // row (no new charge) while the enqueue succeeds, leaving Autumn
+            // net-zero for work the ledger billed. Reaching this line means
+            // the bounded enqueue retries above were exhausted: the ledger is
+            // un-debited for this charge until reconciliation (or a stall
+            // rerun's deterministic bill-{job.id} enqueue) repairs it — hence
+            // error level, with everything needed to replay by hand.
+            logger.error(
+              "billing enqueue failed after retries on the firebill route; charge stands, ledger un-debited pending reconciliation",
+              {
+                jobId: job.id,
+                teamId: job.data.team_id,
+                credits: creditsToBeBilled,
+                billing,
+              },
+            );
+          } else {
+            await autumnService.refundCredits({
+              teamId: job.data.team_id,
+              value: creditsToBeBilled,
+              properties: autumnProperties,
+              featureId,
+              // Distinct from the track key: a refund is its own charge event
+              // (same key would 409 as a duplicate of the track and be dropped).
+              idempotencyKey: `fc:refund:${billing.endpoint}:${job.id}`,
+            });
+          }
         }
         // The billing operation never reached the queue, so no debit will
         // commit and no confirmation will ever arrive: void the Exchange
@@ -275,6 +339,10 @@ function billThreatBlockedDiscoveries(
     blocked.map(x => x.decision),
   );
   if (threatScanCredits <= 0) return;
+  // Deliberately no chargeId: MULTIPLE legitimate charges share this exact
+  // billing metadata (each page job that discovers new blocked URLs bills its
+  // own batch under the same crawl id) — a shared key would collapse them
+  // into one charge, i.e. underbill. Keyless until per-batch identity exists.
   billTeam(args.teamId, threatScanCredits, args.apiKeyId, args.billing).catch(
     error => {
       logger.error(
@@ -767,7 +835,22 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
       await recordMonitorScrapeSuccess(job, doc);
 
       logger.debug("Declaring job as done...");
-      await addCrawlJobDone(job.data.crawl_id, job.id, true, logger);
+      try {
+        await addCrawlJobDone(job.data.crawl_id, job.id, true, logger);
+      } catch (e) {
+        // The scrape succeeded and its success webhook already went out —
+        // a bookkeeping failure must not route this job through the
+        // failure path (contradictory failure webhook, misrecorded job).
+        // Already logged canonically inside addCrawlJobDone.
+        logger.error("Failed to mark successful crawl job as done", {
+          crawlId: job.data.crawl_id,
+          jobId: job.id,
+          error: e,
+        });
+        // Durable fallback so the crawl's completion marker is retried by
+        // the reconciler instead of being lost for good.
+        await queueCrawlJobDoneRepair(job.data.crawl_id, job.id, true, logger);
+      }
     } else {
       try {
         signal?.throwIfAborted();
@@ -877,7 +960,18 @@ async function processJob(job: NuQJob<ScrapeJobSingleUrls>) {
       const sc = (await getCrawl(job.data.crawl_id)) as StoredCrawl;
 
       logger.debug("Declaring job as done...");
-      await addCrawlJobDone(job.data.crawl_id, job.id, false, logger);
+      try {
+        await addCrawlJobDone(job.data.crawl_id, job.id, false, logger);
+      } catch (e) {
+        // Already logged canonically inside addCrawlJobDone; a throw here
+        // must not escape the error handler and fail the job a second time.
+        logger.error("Failed to declare failed crawl job as done", {
+          crawlId: job.data.crawl_id,
+          jobId: job.id,
+          error: e,
+        });
+        await queueCrawlJobDoneRepair(job.data.crawl_id, job.id, false, logger);
+      }
       await redisEvictConnection.srem(
         "crawl:" + job.data.crawl_id + ":visited_unique",
         normalizeURL(job.data.url, sc),

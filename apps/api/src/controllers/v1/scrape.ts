@@ -25,6 +25,7 @@ import { processJobInternal } from "../../services/worker/scrape-worker";
 import { ScrapeJobData } from "../../types";
 import { AbortManagerThrownError } from "../../scraper/scrapeURL/lib/abortManager";
 import { logRequest } from "../../services/logging/log_job";
+import { externalRequestId } from "../../lib/external-request-id";
 import { getErrorContactMessage } from "../../lib/deployment";
 import { captureExceptionWithZdrCheck } from "../../services/sentry";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
@@ -115,6 +116,7 @@ export async function scrapeController(
     id: jobId,
     kind: "scrape",
     api_version: "v1",
+    external_request_id: externalRequestId(req),
     team_id: req.auth.team_id,
     origin: req.body.origin,
     integration: req.body.integration,
@@ -156,9 +158,9 @@ export async function scrapeController(
     );
     if (!reservation.ok) {
       applyAgentAuthDiscoveryHeader(res);
-      return res.status(429).json(
-        await keylessLimitBody(req.auth.team_id, "v1_scrape"),
-      );
+      return res
+        .status(429)
+        .json(await keylessLimitBody(req.auth.team_id, "v1_scrape"));
     }
     reservedKeylessCredits = projectedKeylessCredits;
   }
@@ -257,7 +259,8 @@ export async function scrapeController(
     }
 
     const timeoutErr =
-      e instanceof TransportableError && e.code === "SCRAPE_TIMEOUT";
+      e instanceof TransportableError &&
+      (e.code === "SCRAPE_TIMEOUT" || e.code === "CONCURRENCY_QUEUE_TIMEOUT");
 
     if (e instanceof TransportableError) {
       if (!timeoutErr) {
@@ -309,7 +312,23 @@ export async function scrapeController(
         });
       }
 
-      return res.status(e.code === "SCRAPE_TIMEOUT" ? 408 : 500).json({
+      if (e.code === "SCRAPE_PROMPT_INJECTION_DETECTED") {
+        return res.status(403).json({
+          success: false,
+          code: e.code,
+          error: e.message,
+        });
+      }
+
+      if (e.code === "SCRAPE_JSON_CONTENT_TOO_LARGE") {
+        return res.status(400).json({
+          success: false,
+          code: e.code,
+          error: e.message,
+        });
+      }
+
+      return res.status(timeoutErr ? 408 : 500).json({
         success: false,
         code: e.code,
         error: e.message,

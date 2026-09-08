@@ -34,6 +34,7 @@ import {
   consumeMonitorCheckJobs,
   consumeMonitorSearchCheckJobs,
 } from "./monitoring/queue";
+import { shutdownPubSubLogging } from "./logging/log_job";
 
 configDotenv();
 
@@ -521,5 +522,6 @@ app.listen(workerPort, (error?: Error) => {
   }
 
   _logger.info("All jobs finished. Shutting down...");
+  await shutdownPubSubLogging();
   process.exit(0);
 })();

@@ -6,6 +6,7 @@ import * as Sentry from "@sentry/node";
 import { saveDeepResearch } from "../../lib/deep-research/deep-research-redis";
 import { z } from "zod";
 import { logRequest } from "../../services/logging/log_job";
+import { externalRequestId } from "../../lib/external-request-id";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 
 const deepResearchRequestSchema = z
@@ -98,6 +99,7 @@ export async function deepResearchController(
     id: researchId,
     kind: "deep_research",
     api_version: "v1",
+    external_request_id: externalRequestId(req),
     team_id: req.auth.team_id,
     origin: "api",
     target_hint: req.body.query ?? "",

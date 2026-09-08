@@ -4,6 +4,7 @@ import { autumnService } from "../../services/autumn/autumn.service";
 import { authenticateUser } from "../auth";
 import { RateLimiterMode, ScrapeJobSingleUrls } from "../../types";
 import { logSearch, logRequest } from "../../services/logging/log_job";
+import { externalRequestId } from "../../lib/external-request-id";
 import { PageOptions, SearchOptions } from "../../lib/entities";
 import { search } from "../../search";
 import { isUrlBlocked } from "../../scraper/WebScraper/utils/blocklist";
@@ -90,7 +91,7 @@ async function searchHelper(
       team_id,
       searchCredits,
       api_key_id,
-      { endpoint: "search", jobId },
+      { endpoint: "search", jobId, chargeId: jobId },
       logger,
     ).catch(error => {
       logger.error(
@@ -209,6 +210,7 @@ export async function searchController(req: Request, res: Response) {
       id: jobId,
       kind: "search",
       api_version: "v0",
+      external_request_id: externalRequestId(req),
       team_id,
       origin: req.body.origin ?? "api",
       integration: req.body.integration,
