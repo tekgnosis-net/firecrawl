@@ -216,6 +216,9 @@ async function refundCredits(params: {
     await autumnService.refundCredits({
       teamId: req.auth.team_id,
       value: cappedRefund,
+      // One refund per feedback record; a retried refund dedupes (firebill
+      // route) instead of crediting twice.
+      idempotencyKey: `fc:refund:feedback:${feedbackId}`,
       featureId:
         options.refundFeatureId ??
         featureIdForBillingEndpoint(options.endpoint),

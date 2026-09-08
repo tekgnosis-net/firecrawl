@@ -8,6 +8,7 @@ import {
   applyScrapeOptionsDefaults,
   type Document,
   getPDFMaxPages,
+  shouldParseImages,
   scrapeOptions,
   type ScrapeOptions,
   type TeamFlags,
@@ -23,6 +24,7 @@ import {
   scrapeURLWithEngine,
   shouldUseIndex,
 } from "./engines";
+import { applyHandoffFeatureFlags } from "./lib/handoffFeatureFlags";
 import { parseMarkdown } from "../../lib/html-to-markdown";
 import { hasFormatOfType } from "../../lib/format-utils";
 import {
@@ -32,7 +34,9 @@ import {
   EngineError,
   NoEnginesLeftError,
   PDFAntibotError,
+  PDFFetchProxyError,
   DocumentAntibotError,
+  DocumentFetchProxyError,
   RemoveFeatureError,
   SiteError,
   UnsupportedFileError,
@@ -76,6 +80,7 @@ import {
 } from "./lib/abortManager";
 import {
   ScrapeJobTimeoutError,
+  composeTimeoutProcessing,
   CrawlDenialError,
   ActionsNotSupportedError,
 } from "../../lib/error";
@@ -88,6 +93,13 @@ import {
   documentExtensionFromContentType,
   documentExtensionFromUrlPath,
 } from "../../lib/document-formats";
+import {
+  IMAGE_EXTENSIONS,
+  imageContentTypeFromExtension,
+  imageExtensionFromContentType,
+  imageExtensionFromUrlPath,
+} from "../../lib/image-formats";
+import { imageOcrGate, type ImageOcrGate } from "../../lib/image-ocr-gate";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
@@ -144,6 +156,13 @@ export type Meta = {
   abort: AbortManager;
   featureFlags: Set<FeatureFlag>;
   mock: MockState | null;
+  /** Whether this scrape may OCR raster images: the request's parsers
+   * include `image` (the default; a parse upload of an image always counts)
+   * and the team has the imageOcr flag with FirePDF configured. Lazy and
+   * memoized: the browser handoff, the image engine and the index only ask
+   * once a request actually looks like an image, so plain documents never
+   * pay for the team lookup. */
+  imageOcrEnabled: ImageOcrGate;
   pdfPrefetch:
     | {
         filePath: string;
@@ -151,9 +170,51 @@ export type Meta = {
         status: number;
         proxyUsed: "basic" | "stealth";
         contentType?: string;
+        /** Set when fire-engine handed the file off by GCS reference (large
+         * PDFs): the object it uploaded, so the FirePDF by-reference path
+         * can server-side copy it instead of re-uploading the bytes. The
+         * local filePath is still materialized (sniffing and page-count
+         * detection need bytes on disk). */
+        gcsReference?: {
+          uri: string;
+          sha256?: string;
+          sizeBytes?: number;
+          /** int64 as the SDK's string form — never rounded through a JS
+           * number. */
+          generation?: string;
+        };
       }
     | null
     | undefined; // undefined: no prefetch yet, null: prefetch came back empty
+  // (null is preserved through the retry loop's AddFeatureError handler so
+  // antibot/proxy-failure handling can tell "never attempted" apart from
+  // "attempted, browser delivered no file")
+  /** Live state of a by-reference FirePDF job (large PDFs) this scrape
+   * submitted or adopted. Such jobs outlive an abandoned scrape BY
+   * DESIGN (see fire-pdf/async.ts's cancel policy), so a SCRAPE_TIMEOUT
+   * uses this to tell the caller processing continues and when a retry
+   * of the same URL will pick up the finished result.
+   *
+   * Shaped as a mutable container (like `threatDecisions`) on purpose:
+   * engine dispatch and the pdf engine hand out SPREAD COPIES of meta,
+   * and only the shared inner object makes writes from those copies
+   * visible to the outer timeout handler here. Set by fire-pdf/async.ts;
+   * `current` is cleared when the job reaches a terminal state within
+   * this scrape's lifetime. */
+  largePdfProcessing?: {
+    current?: {
+      jobScrapeId: string;
+      pagesEstimate?: number;
+      submittedAtMs: number;
+      jobDeadlineAtMs?: number;
+      lastStatus: "queued" | "published" | "running";
+      /** fire-pdf's live remaining estimate from the last poll that
+       * carried one, with its observation time — one atomic datum,
+       * preferred over the static per-page math when composing the
+       * timeout message. */
+      serverEstimate?: { remainingMs: number; observedAtMs: number };
+    };
+  };
   documentPrefetch:
     | {
         filePath: string;
@@ -164,6 +225,20 @@ export type Meta = {
       }
     | null
     | undefined; // undefined: no prefetch yet, null: prefetch came back empty
+  // (null preserved through the retry loop, same as pdfPrefetch)
+  /** Raster image handed off by the browser engine for OCR (see
+   * engines/image). Same shape and null/undefined semantics as
+   * documentPrefetch. */
+  imagePrefetch:
+    | {
+        filePath: string;
+        url?: string;
+        status: number;
+        proxyUsed: "basic" | "stealth";
+        contentType?: string;
+      }
+    | null
+    | undefined;
   fetchPrefetch:
     | {
         url?: string;
@@ -186,6 +261,7 @@ function buildFeatureFlags(
   url: string,
   options: ScrapeOptions,
   internalOptions: InternalOptions,
+  imageOcrEnabled: boolean,
 ): Set<FeatureFlag> {
   const flags: Set<FeatureFlag> = new Set();
 
@@ -256,6 +332,12 @@ function buildFeatureFlags(
   } else if (lowerPath.endsWith(".pdf") || lowerPath.includes(".pdf/")) {
     // Only add PDF flag if it's not a document
     flags.add("pdf");
+  } else if (imageExtensionFromUrlPath(lowerPath) !== null && imageOcrEnabled) {
+    // Raster images are OCR'd through FirePDF when the request's parsers
+    // include `image` (the default) and the team has the imageOcr flag (see
+    // engines/image). Everyone else stays on the ordinary waterfall and
+    // fails as an unsupported file, exactly as before.
+    flags.add("image");
   }
 
   if (options.blockAds === false) {
@@ -302,6 +384,14 @@ function isDocumentUpload(filename: string, contentType?: string): boolean {
   return (
     DOCUMENT_EXTENSIONS.has(ext) ||
     documentExtensionFromContentType(contentType) !== null
+  );
+}
+
+function isImageUpload(filename: string, contentType?: string): boolean {
+  const ext = path.extname(filename).toLowerCase();
+  return (
+    IMAGE_EXTENSIONS.has(ext) ||
+    imageExtensionFromContentType(contentType) !== null
   );
 }
 
@@ -362,6 +452,7 @@ async function buildMetaObject(
 
   let pdfPrefetch: Meta["pdfPrefetch"] = undefined;
   let documentPrefetch: Meta["documentPrefetch"] = undefined;
+  let imagePrefetch: Meta["imagePrefetch"] = undefined;
   let fetchPrefetch: Meta["fetchPrefetch"] = undefined;
 
   if (internalOptions.uploadedFile) {
@@ -396,6 +487,27 @@ async function buildMetaObject(
           documentContentTypeFromExtension(fallbackExtension) ||
           "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
       };
+    } else if (isImageUpload(filename, contentType)) {
+      const ext = path.extname(filename).toLowerCase();
+      const fallbackExtension =
+        ext && IMAGE_EXTENSIONS.has(ext)
+          ? ext
+          : (imageExtensionFromContentType(contentType) ?? ".png");
+      const filePath = await writeUploadedFileToTemp(
+        filename,
+        buffer,
+        fallbackExtension,
+      );
+      imagePrefetch = {
+        filePath,
+        status: 200,
+        url: prefetchUrl,
+        proxyUsed: "basic",
+        contentType:
+          contentType ||
+          imageContentTypeFromExtension(fallbackExtension) ||
+          "image/png",
+      };
     } else if (isHtmlUpload(filename, contentType)) {
       fetchPrefetch = {
         url: prefetchUrl,
@@ -412,6 +524,21 @@ async function buildMetaObject(
   }
 
   const effectiveOptions = applyScrapeOptionsDefaults(options);
+  // Image OCR follows the parsers option: on by default, off when the caller
+  // sends a list without `image`. A parse upload of an image is a request to
+  // parse that file, so it counts regardless. The team flag is checked lazily
+  // behind this.
+  const imageOcrEnabled = imageOcrGate(
+    internalOptions.teamId,
+    internalOptions.teamFlags,
+    shouldParseImages(effectiveOptions.parsers) ||
+      internalOptions.uploadedFile?.kind === "image",
+  );
+  // Only an image-extension URL needs the answer up front; everything else
+  // resolves lazily on an image handoff, if one ever happens.
+  const imageOcrForUrl =
+    imageExtensionFromUrlPath(new URL(url).pathname) !== null &&
+    (await imageOcrEnabled());
 
   return {
     id,
@@ -434,16 +561,24 @@ async function buildMetaObject(
           }
         : undefined,
     ),
-    featureFlags: buildFeatureFlags(url, effectiveOptions, internalOptions),
+    featureFlags: buildFeatureFlags(
+      url,
+      effectiveOptions,
+      internalOptions,
+      imageOcrForUrl,
+    ),
     mock:
       options.useMock !== undefined
         ? await loadMock(options.useMock, _logger)
         : null,
     pdfPrefetch,
     documentPrefetch,
+    imagePrefetch,
     fetchPrefetch,
+    imageOcrEnabled,
     costTracking,
     threatDecisions: [],
+    largePdfProcessing: {},
   };
 }
 
@@ -498,7 +633,7 @@ export type InternalOptions = {
     buffer: Buffer;
     filename: string;
     contentType?: string;
-    kind?: "html" | "pdf" | "document";
+    kind?: "html" | "pdf" | "document" | "image";
   };
 };
 
@@ -535,6 +670,7 @@ async function scrapeURLLoopIter(
     const hasQuestion = hasFormatOfType(meta.options.formats, "question");
     const hasHighlights = hasFormatOfType(meta.options.formats, "highlights");
     const hasQuery = hasFormatOfType(meta.options.formats, "query");
+    const hasRawBase64 = hasFormatOfType(meta.options.formats, "rawBase64");
     const needsMarkdown =
       hasMarkdown ||
       hasChangeTracking ||
@@ -548,7 +684,9 @@ async function scrapeURLLoopIter(
     const htmlSize = engineResult.html?.length ?? 0;
     const shouldSkipMarkdownCheck = htmlSize > MAX_HTML_SIZE_FOR_MARKDOWN_CHECK;
 
-    if (
+    if (hasRawBase64) {
+      checkMarkdown = engineResult.rawBase64 !== undefined ? "rawBase64" : "";
+    } else if (
       meta.internalOptions.teamId === "sitemap" ||
       meta.internalOptions.teamId === "robots-txt"
     ) {
@@ -597,6 +735,16 @@ async function scrapeURLLoopIter(
       (engineResult.statusCode >= 200 && engineResult.statusCode < 300) ||
       engineResult.statusCode === 304;
     const hasNoPageError = engineResult.error === undefined;
+    // A parsed image is a complete result even when OCR found no text: the
+    // image engine has already verified the bytes and run them through OCR,
+    // so a blank scan or a photo legitimately comes back as an empty document.
+    // Without this it would be "deemed unsuccessful" below and, as the last
+    // engine in its waterfall, surface as an all-engines failure.
+    const isParsedImage =
+      engine === "image" && isGoodStatusCode && hasNoPageError;
+    const hasRequiredOutput = hasRawBase64
+      ? engineResult.rawBase64 !== undefined
+      : isParsedImage || isLongEnough || !isGoodStatusCode;
     const isLikelyProxyError = [401, 403, 429].includes(
       engineResult.statusCode,
     );
@@ -622,9 +770,14 @@ async function scrapeURLLoopIter(
     // NOTE: TODO: what to do when status code is bad is tough...
     // we cannot just rely on text because error messages can be brief and not hit the limit
     // should we just use all the fallbacks and pick the one with the longest text? - mogery
-    if (isLongEnough || !isGoodStatusCode) {
+    if (hasRequiredOutput) {
       meta.logger.info("Scrape via " + engine + " deemed successful.", {
-        factors: { isLongEnough, isGoodStatusCode, hasNoPageError },
+        factors: {
+          isLongEnough,
+          isGoodStatusCode,
+          hasNoPageError,
+          isParsedImage,
+        },
       });
       return engineResult;
     } else {
@@ -671,10 +824,17 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
     // Skip when the content was already prefetched (a browser engine already
     // ran the actions and downloaded the file); the re-run only needs the
     // document/pdf engine to parse it, which does not support actions.
+    // Skip when a browser engine already ran the actions — i.e. any
+    // prefetch state exists, including the null sentinel (browser ran,
+    // delivered no file): the re-run only needs the pdf/document engine
+    // to parse the file, and the actions check must not preempt the
+    // antibot/proxy recovery paths below with a misleading
+    // ActionsNotSupportedError after the actions already executed.
     if (
       meta.featureFlags.has("actions") &&
       meta.pdfPrefetch === undefined &&
-      meta.documentPrefetch === undefined
+      meta.documentPrefetch === undefined &&
+      meta.imagePrefetch === undefined
     ) {
       if (
         fallbackList.length === 0 ||
@@ -834,8 +994,10 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
               error.error instanceof ActionError ||
               error.error instanceof UnsupportedFileError ||
               error.error instanceof PDFAntibotError ||
+              error.error instanceof PDFFetchProxyError ||
               error.error instanceof PDFOCRRequiredError ||
               error.error instanceof DocumentAntibotError ||
+              error.error instanceof DocumentFetchProxyError ||
               error.error instanceof PDFInsufficientTimeError ||
               error.error instanceof ProxySelectionError ||
               error.error instanceof NoCachedDataError ||
@@ -954,6 +1116,7 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
 
     for (const postprocessor of postprocessors) {
       if (
+        !hasFormatOfType(meta.options.formats, "rawBase64") &&
         postprocessor.shouldRun(
           meta,
           new URL(engineResult.url),
@@ -985,7 +1148,9 @@ async function scrapeURLLoop(meta: Meta): Promise<ScrapeUrlResponse> {
     let document: Document = {
       markdown: engineResult.markdown,
       pages: engineResult.pages,
+      blocks: engineResult.blocks,
       rawHtml: engineResult.html,
+      rawBase64: engineResult.rawBase64,
       json: engineResult.json,
       screenshot: engineResult.screenshot,
       actions: engineResult.actions,
@@ -1135,7 +1300,7 @@ export async function scrapeURL(
     }
 
     if (shouldCheckRobots(options, internalOptions)) {
-      await withSpan("scrape.robots_check", async robotsSpan => {
+      const result = await withSpan("scrape.robots_check", async robotsSpan => {
         const urlToCheck = meta.rewrittenUrl || meta.url;
         meta.logger.info("Checking robots.txt", { url: urlToCheck });
 
@@ -1199,14 +1364,20 @@ export async function scrapeURL(
           }
         }
       }).catch(error => {
-        if (error.message === "URL blocked by robots.txt") {
+        if (error instanceof CrawlDenialError) {
           return {
-            success: false,
+            success: false as const,
             error,
           };
         }
         throw error;
       });
+      if (result) {
+        return {
+          ...result,
+          threatDecisions: meta.threatDecisions,
+        };
+      }
     }
 
     // Initialize retry tracker with configured limits
@@ -1234,19 +1405,42 @@ export async function scrapeURL(
               Array.isArray(meta.internalOptions.forceEngine))
           ) {
             retryTracker.record("feature_toggle", error);
+            // A file handoff names the one parser that can open the file;
+            // the file flag the URL extension implied earlier gives way to it.
+            const nextFeatureFlags = applyHandoffFeatureFlags(
+              meta.featureFlags,
+              error.featureFlags,
+            );
             meta.logger.debug(
               "More feature flags requested by scraper: adding " +
                 error.featureFlags.join(", "),
-              { error, existingFlags: meta.featureFlags },
+              {
+                error,
+                existingFlags: meta.featureFlags,
+                droppedFlags: [...meta.featureFlags].filter(
+                  flag => !nextFeatureFlags.has(flag),
+                ),
+              },
             );
-            meta.featureFlags = new Set(
-              [...meta.featureFlags].concat(error.featureFlags),
-            );
+            meta.featureFlags = nextFeatureFlags;
             if (error.pdfPrefetch) {
               meta.pdfPrefetch = error.pdfPrefetch;
+            } else if (error.pdfPrefetch === null) {
+              // Browser round trip ran but delivered no file. Preserve the
+              // null sentinel: the antibot branches below still retry (the
+              // empty handoff may be transient), but the proxy-failure
+              // branches fail fast instead of re-running the browser.
+              meta.pdfPrefetch = null;
             }
             if (error.documentPrefetch) {
               meta.documentPrefetch = error.documentPrefetch;
+            } else if (error.documentPrefetch === null) {
+              meta.documentPrefetch = null;
+            }
+            if (error.imagePrefetch) {
+              meta.imagePrefetch = error.imagePrefetch;
+            } else if (error.imagePrefetch === null) {
+              meta.imagePrefetch = null;
             }
           } else if (
             error instanceof RemoveFeatureError &&
@@ -1268,7 +1462,10 @@ export async function scrapeURL(
             error instanceof PDFAntibotError &&
             meta.internalOptions.forceEngine === undefined
           ) {
-            if (meta.pdfPrefetch !== undefined) {
+            // null = browser ran but delivered no file (possibly transient) —
+            // still worth one more browser round trip, so only a real
+            // prefetch object fails here.
+            if (meta.pdfPrefetch != null) {
               meta.logger.error(
                 "PDF was prefetched and still blocked by antibot, failing",
               );
@@ -1283,10 +1480,36 @@ export async function scrapeURL(
               );
             }
           } else if (
+            error instanceof PDFFetchProxyError &&
+            meta.internalOptions.forceEngine === undefined
+          ) {
+            // meta.pdfPrefetch distinguishes "browser never attempted"
+            // (undefined — clear the pdf flag so the browser engine fetches
+            // the file through fire-engine's proxies) from "browser attempted,
+            // came back empty" (null — fail fast: another round trip would
+            // only burn the shared antibot+proxy prefetch budget).
+            if (meta.pdfPrefetch !== undefined) {
+              meta.logger.error(
+                "PDF was prefetched and the direct fetch still failed at the proxy, failing",
+              );
+              throw error;
+            } else {
+              retryTracker.record("pdf_fetch_proxy", error);
+              meta.logger.debug(
+                "PDF direct download failed at the proxy, prefetching with chrome-cdp",
+              );
+              meta.featureFlags = new Set(
+                [...meta.featureFlags].filter(x => x !== "pdf"),
+              );
+            }
+          } else if (
             error instanceof DocumentAntibotError &&
             meta.internalOptions.forceEngine === undefined
           ) {
-            if (meta.documentPrefetch !== undefined) {
+            // null = browser ran but delivered no file (possibly transient) —
+            // still worth one more browser round trip, so only a real
+            // prefetch object fails here.
+            if (meta.documentPrefetch != null) {
               meta.logger.error(
                 "Document was prefetched and still blocked by antibot, failing",
               );
@@ -1295,6 +1518,25 @@ export async function scrapeURL(
               retryTracker.record("document_antibot", error);
               meta.logger.debug(
                 "Document was blocked by anti-bot, prefetching with chrome-cdp",
+              );
+              meta.featureFlags = new Set(
+                [...meta.featureFlags].filter(x => x !== "document"),
+              );
+            }
+          } else if (
+            error instanceof DocumentFetchProxyError &&
+            meta.internalOptions.forceEngine === undefined
+          ) {
+            // Same undefined-vs-null distinction as the PDF branch above.
+            if (meta.documentPrefetch !== undefined) {
+              meta.logger.error(
+                "Document was prefetched and the direct fetch still failed at the proxy, failing",
+              );
+              throw error;
+            } else {
+              retryTracker.record("document_fetch_proxy", error);
+              meta.logger.debug(
+                "Document direct download failed at the proxy, prefetching with chrome-cdp",
               );
               meta.featureFlags = new Set(
                 [...meta.featureFlags].filter(x => x !== "document"),
@@ -1393,6 +1635,27 @@ export async function scrapeURL(
       // if (Object.values(meta.results).length > 0 && Object.values(meta.results).every(x => x.state === "error" && x.error instanceof FEPageLoadFailed)) {
       //   throw new FEPageLoadFailed();
       // } else
+      // A timed-out large-PDF scrape leaves its fire-pdf job running by
+      // design (fire-pdf/async.ts cancel policy); upgrade the timeout
+      // error IN PLACE so the caller learns processing continues and
+      // when a retry of the same URL picks the result up. Covers both
+      // the engine race's own timer and the abort manager's inner
+      // timeout, which exits through the early rethrow below.
+      const timeoutCandidate =
+        error instanceof AbortManagerThrownError ? error.inner : error;
+      if (
+        meta.largePdfProcessing?.current &&
+        timeoutCandidate instanceof ScrapeJobTimeoutError &&
+        timeoutCandidate.processing === undefined
+      ) {
+        const composed = composeTimeoutProcessing({
+          ...meta.largePdfProcessing.current,
+          nowMs: Date.now(),
+        });
+        timeoutCandidate.processing = composed.details;
+        timeoutCandidate.message = composed.message;
+      }
+
       meta.logger.debug("scrapeURL metrics", {
         module: "scrapeURL/metrics",
         timeTaken: Date.now() - startTime,
@@ -1487,6 +1750,18 @@ export async function scrapeURL(
         errorType = "DocumentPrefetchFailed";
         meta.logger.warn(
           "scrapeURL: Failed to prefetch document that is protected by anti-bot",
+          { error },
+        );
+      } else if (error instanceof PDFFetchProxyError) {
+        errorType = "PDFFetchProxyError";
+        meta.logger.warn(
+          "scrapeURL: PDF download failed at the proxy and could not be recovered via browser prefetch",
+          { error },
+        );
+      } else if (error instanceof DocumentFetchProxyError) {
+        errorType = "DocumentFetchProxyError";
+        meta.logger.warn(
+          "scrapeURL: Document download failed at the proxy and could not be recovered via browser prefetch",
           { error },
         );
       } else if (error instanceof BrandingNotSupportedError) {

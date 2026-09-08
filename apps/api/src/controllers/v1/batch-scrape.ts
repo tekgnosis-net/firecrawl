@@ -43,6 +43,7 @@ import {
   resolveNewGroupBackend,
 } from "../../services/worker/nuq-router";
 import { logRequest } from "../../services/logging/log_job";
+import { externalRequestId } from "../../lib/external-request-id";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 import { emitRejectedScrapeActivityEvents } from "../../lib/siem-logging";
 import { CrawlDenialError } from "../../lib/error";
@@ -214,7 +215,14 @@ export async function batchScrapeController(
           req.auth.team_id,
           threatScanCredits,
           req.acuc?.api_key_id ?? null,
-          { endpoint: "batch_scrape", jobId: id },
+          {
+            endpoint: "batch_scrape",
+            jobId: id,
+            // Appends reuse the batch id but each append's threat scans are a
+            // fresh charge — a shared key would underbill them. Appends stay
+            // keyless (per-request UUID in firebill).
+            ...(req.body.appendToId ? {} : { chargeId: `${id}:threat` }),
+          },
         ).catch(error => {
           logger.error(
             `Failed to bill team ${req.auth.team_id} for ${threatScanCredits} threat scan credit(s): ${error}`,
@@ -284,6 +292,7 @@ export async function batchScrapeController(
       id,
       kind: "batch_scrape",
       api_version: "v1",
+      external_request_id: externalRequestId(req),
       team_id: req.auth.team_id,
       origin: req.body.origin ?? "api",
       integration: req.body.integration,
