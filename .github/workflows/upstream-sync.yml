@@ -5,8 +5,11 @@ name: Upstream Sync
 # This fork carries local enhancements (camoufox stealth engine, GHCR/Redis
 # infra, OpenAI support, autumn hardening). The sync script auto-resolves only
 # the deterministic "workflows we deleted" conflict class and gates on a clean
-# `tsc` build before pushing a branch. A human reviews and merges the PR — the
-# workflow never writes to main directly.
+# `tsc` build before pushing a branch. The PR is then AUTO-MERGED (decided
+# 2026-09-08 after two multi-week stalls waiting on a human merge — issues #13
+# and #19): the tsc build gate is the quality bar, the PR remains the audit
+# trail, and `git revert -m 1 <merge sha>` is the rollback. Non-deterministic
+# conflicts still stop for a human via the escalation issue.
 
 on:
   schedule:
@@ -22,6 +25,9 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  # For dispatching the deploy workflows after an auto-merge (a merge pushed
+  # with GITHUB_TOKEN does not fire push-triggered workflows — anti-recursion).
+  actions: write
 
 concurrency:
   group: upstream-sync
@@ -48,7 +54,7 @@ jobs:
           # This monorepo has no root package.json, so action-setup can't find
           # the packageManager field (it lives in apps/api/package.json). Pin it
           # explicitly — keep in sync with apps/api/package.json "packageManager".
-          version: 10.16.1
+          version: 11.4.0
 
       - name: Set up Node
         uses: actions/setup-node@v5
@@ -97,10 +103,32 @@ jobs:
           set -euo pipefail
           case "$RESULT" in
             ready)
-              if ! gh pr list --head "$BRANCH" --json number --jq '.[0].number' | grep -q .; then
+              if [ -z "$(gh pr list --head "$BRANCH" --json number --jq '.[0].number')" ]; then
                 gh pr create --base main --head "$BRANCH" \
                   --title "chore(sync): merge upstream firecrawl ($(date +%Y-%m-%d))" \
-                  --body $'Automated upstream merge.\n\n- `tsc` build gate passed\n- only deterministic (deleted-workflow) conflicts auto-resolved\n- fork enhancements expected intact\n\nReview the diff before merging.'
+                  --body $'Automated upstream merge, auto-merged on a green build gate.\n\n- `tsc` build gate passed\n- only deterministic (deleted-workflow) conflicts auto-resolved\n- fork enhancements expected intact\n\nRollback: `git revert -m 1 <merge sha>`.'
+              fi
+              gh pr merge "$BRANCH" --merge --delete-branch
+
+              # The GITHUB_TOKEN-authored merge does not fire push-triggered
+              # workflows, so dispatch the deploys whose path filters the sync
+              # touched. Keep these patterns in sync with the deploy workflows'
+              # `on.push.paths`. (camoufox-service is fork-only — never synced.)
+              DIFF="$(git diff --name-only "origin/main...$BRANCH")"
+              if grep -qE '^apps/api/(src/|native/|sharedLibs/|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|tsconfig\.json|Dockerfile)' <<<"$DIFF"; then
+                gh workflow run deploy-image.yml --ref main
+              fi
+              if grep -qE '^apps/playwright-service-ts/' <<<"$DIFF"; then
+                gh workflow run deploy-playwright.yml --ref main
+              fi
+              if grep -qE '^apps/nuq-postgres/' <<<"$DIFF"; then
+                gh workflow run deploy-nuq-postgres.yml --ref main
+              fi
+              if grep -qE '^apps/redis/' <<<"$DIFF"; then
+                gh workflow run deploy-redis.yml --ref main
+              fi
+              if grep -qE '^apps/go-html-to-md-service/' <<<"$DIFF"; then
+                gh workflow run deploy-go-service.yaml --ref main
               fi
               ;;
             uptodate)
