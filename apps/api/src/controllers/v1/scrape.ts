@@ -1,5 +1,6 @@
 import { Response } from "express";
 import { config } from "../../config";
+import { timingSafeSecretEqual } from "../../lib/secret-compare";
 import { logger as _logger } from "../../lib/logger";
 import {
   Document,
@@ -12,8 +13,14 @@ import { v7 as uuidv7 } from "uuid";
 import { getJobPriority } from "../../lib/job-priority";
 import { fromV1ScrapeOptions } from "../v2/types";
 import { TransportableError } from "../../lib/error";
+import { ThirdPartyDataTermsRequiredError } from "../../lib/exchange";
 import { NuQJob } from "../../services/worker/nuq";
 import { checkPermissions } from "../../lib/permissions";
+import {
+  resolveSafeMode,
+  applySafeMode,
+  isLockdownZeroDataRetention,
+} from "../../lib/safe-mode";
 import {
   actionTypesOf,
   checkKeyFormatRestriction,
@@ -27,8 +34,14 @@ import { AbortManagerThrownError } from "../../scraper/scrapeURL/lib/abortManage
 import { logRequest } from "../../services/logging/log_job";
 import { externalRequestId } from "../../lib/external-request-id";
 import { getErrorContactMessage } from "../../lib/deployment";
-import { captureExceptionWithZdrCheck } from "../../services/sentry";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
+import {
+  withSpan,
+  setSpanAttributes,
+  recordSpanException,
+  SpanKind,
+  type Span,
+} from "../../lib/otel-tracer";
 import {
   adjustKeylessCredits,
   keylessLimitBody,
@@ -38,11 +51,39 @@ import {
 import { projectScrapeCredits } from "../../lib/keyless-credit-projection";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
 import { resolveThreatProtection } from "../../lib/threat-protection/request";
-import { getEffectiveConcurrencyLimit } from "../../lib/concurrency-limit";
+import { DEFAULT_TEAM_LIMITS } from "../../services/autumn/autumn.service";
 
 export async function scrapeController(
   req: RequestWithAuth<{}, ScrapeResponse, ScrapeRequest>,
   res: Response<ScrapeResponse>,
+) {
+  // Resolved before the root span starts so the whole request trace stays
+  // unrecorded for zero-data-retention requests (see otel-tracer). Safe Mode
+  // lockdown implies ZDR, so fold it in here too — otherwise child spans could
+  // export target URLs before the inner handler applies lockdown.
+  const zeroDataRetentionTrace =
+    getScrapeZDR(req.acuc?.flags) === "forced" ||
+    req.body?.zeroDataRetention === true ||
+    isLockdownZeroDataRetention(req.acuc?.flags, req.body?.safeMode);
+
+  return withSpan(
+    "api.scrape.request",
+    span => scrapeControllerInner(req, res, span),
+    {
+      kind: SpanKind.SERVER,
+      attributes: {
+        "api.version": "v1",
+        "scrape.team_id": req.auth.team_id,
+      },
+      zeroDataRetention: zeroDataRetentionTrace,
+    },
+  );
+}
+
+async function scrapeControllerInner(
+  req: RequestWithAuth<{}, ScrapeResponse, ScrapeRequest>,
+  res: Response<ScrapeResponse>,
+  span: Span,
 ) {
   // Get timing data from middleware (includes all middleware processing time)
   const middlewareStartTime =
@@ -53,11 +94,26 @@ export async function scrapeController(
   const preNormalizedBody = { ...req.body };
   req.body = scrapeRequestSchema.parse(req.body);
 
+  // Honor a per-request Safe Mode opt-out/affirmation, consistent with v2.
+  const safeMode = resolveSafeMode(
+    req.acuc?.flags,
+    req.body.safeMode,
+    req.body.url,
+  );
+  if (safeMode.error) {
+    return res.status(403).json({
+      success: false,
+      code: safeMode.code,
+      error: safeMode.error,
+    } as any);
+  }
+
   const threatProtection = await resolveThreatProtection({
     teamId: req.auth.team_id,
     orgId: req.acuc?.org_id ?? null,
     flags: req.acuc?.flags ?? null,
     override: req.body.threatProtection,
+    force: safeMode.safeMode?.domainControls === true,
   });
   if (threatProtection.error) {
     return res.status(403).json({
@@ -68,10 +124,12 @@ export async function scrapeController(
 
   const permissions = checkPermissions(req.body, req.acuc?.flags, {
     threatProtectionOrgConfig: threatProtection.orgConfig,
+    safeMode: safeMode.safeMode ?? null,
   });
   if (permissions.error) {
     return res.status(403).json({
       success: false,
+      code: permissions.code,
       error: permissions.error,
     });
   }
@@ -90,7 +148,9 @@ export async function scrapeController(
   }
 
   const zeroDataRetention =
-    getScrapeZDR(req.acuc?.flags) === "forced" || req.body.zeroDataRetention;
+    getScrapeZDR(req.acuc?.flags) === "forced" ||
+    req.body.zeroDataRetention ||
+    (safeMode.safeMode?.lockdown ?? false);
 
   const logger = _logger.child({
     method: "scrapeController",
@@ -132,15 +192,22 @@ export async function scrapeController(
 
   // const startTime = new Date().getTime();
 
-  const isDirectToBullMQ =
-    config.SEARCH_PREVIEW_TOKEN !== undefined &&
-    config.SEARCH_PREVIEW_TOKEN === req.body.__searchPreviewToken;
+  const isDirectToBullMQ = timingSafeSecretEqual(
+    req.body.__searchPreviewToken,
+    config.SEARCH_PREVIEW_TOKEN,
+  );
 
   const { scrapeOptions, internalOptions } = fromV1ScrapeOptions(
     req.body,
     req.body.timeout,
     req.auth.team_id,
   );
+  // v1 prefaults maxAge (1 day), which would shadow the lockdown default —
+  // keep only a maxAge the request actually sent under forced lockdown.
+  if (safeMode.safeMode?.lockdown && preNormalizedBody.maxAge === undefined) {
+    scrapeOptions.maxAge = undefined;
+  }
+  applySafeMode(safeMode.safeMode, scrapeOptions);
   const projectedKeylessCredits = !isDirectToBullMQ
     ? projectScrapeCredits(
         scrapeOptions,
@@ -160,7 +227,7 @@ export async function scrapeController(
       applyAgentAuthDiscoveryHeader(res);
       return res
         .status(429)
-        .json(await keylessLimitBody(req.auth.team_id, "v1_scrape"));
+        .json(await keylessLimitBody(req.auth.team_id, "v1_scrape", req));
     }
     reservedKeylessCredits = projectedKeylessCredits;
   }
@@ -191,12 +258,13 @@ export async function scrapeController(
     doc = await teamConcurrencySemaphore.withSemaphore(
       req.auth.team_id,
       jobId,
-      await getEffectiveConcurrencyLimit(req.auth.team_id, req.acuc?.org_id),
+      req.acuc?.concurrency_limit ?? DEFAULT_TEAM_LIMITS.concurrency_limit,
       aborter.signal,
       timeout ?? 60_000,
       async limited => {
         const jobPriority = await getJobPriority({
           team_id: req.auth.team_id,
+          acuc: req.acuc,
           basePriority: 10,
         });
 
@@ -232,11 +300,17 @@ export async function scrapeController(
               orgId: req.acuc?.org_id ?? null,
               agentIndexOnly: (req as any).agentIndexOnly ?? false,
               threatProtection: threatProtection.policy ?? undefined,
+              safeMode: safeMode.allowlisted ? undefined : safeMode.safeMode,
+              safeModeBypassed: safeMode.bypassed === true,
             },
             skipNuq: true,
             origin,
             integration: req.body.integration,
-            billing: { endpoint: "scrape", jobId },
+            billing: {
+              endpoint: "scrape",
+              jobId,
+              externalRequestId: externalRequestId(req),
+            },
             startTime: controllerStartTime,
             zeroDataRetention: zeroDataRetention ?? false,
             apiKeyId: req.acuc?.api_key_id ?? null,
@@ -296,7 +370,18 @@ export async function scrapeController(
         });
       }
 
-      if (e.code === "unsafe_domain_blocked") {
+      if (
+        e.code === "unsafe_domain_blocked" ||
+        e.code === "US_ONLY_UNAVAILABLE"
+      ) {
+        return res.status(403).json({
+          success: false,
+          code: e.code,
+          error: e.message,
+        });
+      }
+
+      if (e.code === "UNSUPPORTED_SITE") {
         return res.status(403).json({
           success: false,
           code: e.code,
@@ -328,6 +413,40 @@ export async function scrapeController(
         });
       }
 
+      if (e instanceof ThirdPartyDataTermsRequiredError) {
+        return res.status(403).json(e.response());
+      }
+
+      if (
+        e.code === "THIRD_PARTY_DATA_NOT_ENABLED" ||
+        e.code === "THIRD_PARTY_DATA_ENRICHMENT_NOT_ENABLED"
+      ) {
+        return res.status(403).json({
+          success: false,
+          code: e.code,
+          error: e.message,
+        });
+      }
+
+      if (e.code === "THIRD_PARTY_DATA_NOT_FOUND") {
+        return res.status(404).json({
+          success: false,
+          code: e.code,
+          error: e.message,
+        });
+      }
+
+      if (
+        e.code === "THIRD_PARTY_DATA_UNSUPPORTED_URL" ||
+        e.code === "THIRD_PARTY_DATA_UNSUPPORTED_OPTION"
+      ) {
+        return res.status(400).json({
+          success: false,
+          code: e.code,
+          error: e.message,
+        });
+      }
+
       return res.status(timeoutErr ? 408 : 500).json({
         success: false,
         code: e.code,
@@ -342,17 +461,10 @@ export async function scrapeController(
         path: req.path,
         teamId: req.auth.team_id,
       });
-      captureExceptionWithZdrCheck(e, {
-        tags: {
-          errorId: id,
-          version: "v1",
-          teamId: req.auth.team_id,
-        },
-        extra: {
-          path: req.path,
-          url: req.body.url,
-        },
-        zeroDataRetention,
+      recordSpanException(span, e);
+      setSpanAttributes(span, {
+        "scrape.status_code": 500,
+        "scrape.error_id": id,
       });
       return res.status(500).json({
         success: false,

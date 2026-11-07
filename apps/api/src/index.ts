@@ -1,8 +1,6 @@
 import "dotenv/config";
 import { config } from "./config";
-import "./services/sentry";
-import { setSentryServiceTag } from "./services/sentry";
-import * as Sentry from "@sentry/node";
+import { shutdownTracing } from "./otel";
 import express, { NextFunction, Request, Response } from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
@@ -11,20 +9,23 @@ import {
   getDeepResearchQueue,
   getBillingQueue,
   getPrecrawlQueue,
+  getFirebillTrackRetryQueue,
 } from "./services/queue-service";
 import { v0Router } from "./routes/v0";
+import { livenessController, readinessController } from "./controllers/health";
+import { startNodeRuntimeMetrics } from "./lib/node-runtime-metrics";
 import os from "os";
 import { logger } from "./lib/logger";
-import { adminRouter } from "./routes/admin";
+import {
+  adminInternalRouter,
+  adminRouter,
+  countAdminPathRoute,
+} from "./routes/admin";
 import http from "node:http";
 import https from "node:https";
 import { v1Router } from "./routes/v1";
 import expressWs from "express-ws";
-import {
-  ErrorResponse,
-  RequestWithMaybeACUC,
-  ResponseWithSentry,
-} from "./controllers/v1/types";
+import { ErrorResponse, RequestWithMaybeACUC } from "./controllers/v1/types";
 import { ZodError } from "zod";
 import { QueueFullError } from "./lib/queue-full-error";
 import { v7 as uuidv7 } from "uuid";
@@ -33,8 +34,6 @@ import { v2Router } from "./routes/v2";
 import { exchangeRouter } from "./routes/exchange";
 import { labsRouter } from "./routes/labs";
 import { registerMcpActionLogIngestRoute } from "./routes/mcp-action-logs";
-import { startMcpActionLogRetentionWorkerIfEnabled } from "./services/mcp/action-logs";
-import { db } from "./db/connection";
 import { nuqShutdown } from "./services/worker/nuq";
 import { getErrorContactMessage } from "./lib/deployment";
 import { initializeBlocklist } from "./scraper/WebScraper/utils/blocklist";
@@ -75,8 +74,6 @@ const app = ws.app;
 
 global.isProduction = config.IS_PRODUCTION;
 
-setSentryServiceTag("api");
-
 // Capture the exact request bytes so integrations that sign the raw payload
 // (e.g. Slack's X-Slack-Signature) can verify it after body parsing. Typed with
 // the node http types body-parser's `verify` hook expects.
@@ -107,23 +104,30 @@ if (config.EXPRESS_TRUST_PROXY) {
 
 const serverAdapter = new ExpressAdapter();
 
+const bullBoardQueues = [
+  new BullMQAdapter(getGenerateLlmsTxtQueue()),
+  new BullMQAdapter(getDeepResearchQueue()),
+  new BullMQAdapter(getBillingQueue()),
+  new BullMQAdapter(getPrecrawlQueue()),
+  new BullMQAdapter(getFirebillTrackRetryQueue()),
+  // SIEM audit delivery runs on RabbitMQ; inspect it in the broker's
+  // management UI, not here.
+];
+
 const { addQueue, removeQueue, setQueues, replaceQueues } = createBullBoard({
-  queues: [
-    new BullMQAdapter(getGenerateLlmsTxtQueue()),
-    new BullMQAdapter(getDeepResearchQueue()),
-    new BullMQAdapter(getBillingQueue()),
-    new BullMQAdapter(getPrecrawlQueue()),
-    // SIEM audit delivery runs on RabbitMQ; inspect it in the broker's
-    // management UI, not here.
-  ],
+  queues: bullBoardQueues,
   serverAdapter: serverAdapter,
 });
 
-if (config.BULL_AUTH_KEY) {
-  serverAdapter.setBasePath(`/admin/${config.BULL_AUTH_KEY}/queues`);
-  app.use(`/admin/${config.BULL_AUTH_KEY}/queues`, serverAdapter.getRouter());
-} else {
+if (!config.BULL_AUTH_KEY) {
   logger.warn("BULL_AUTH_KEY is not set; admin routes are disabled.");
+} else if (config.BULL_AUTH_KEY_PATH_ROUTES) {
+  serverAdapter.setBasePath(`/admin/${config.BULL_AUTH_KEY}/queues`);
+  app.use(
+    `/admin/${config.BULL_AUTH_KEY}/queues`,
+    countAdminPathRoute("queues"),
+    serverAdapter.getRouter(),
+  );
 }
 
 app.get("/", (_, res) => {
@@ -137,6 +141,9 @@ app.get("/e2e-test", (_, res) => {
   res.status(200).send("OK");
 });
 
+app.get("/health/liveness", livenessController);
+app.get("/health/readiness", readinessController);
+
 // register router
 app.use(v0Router);
 app.use("/v1", v1Router);
@@ -148,7 +155,53 @@ app.use(adminRouter);
 const DEFAULT_PORT = config.PORT;
 const HOST = config.HOST;
 
+// The internal listener has no key check: keep its port off public ingress.
+function startAdminInternalServer(port: number) {
+  const adminApp = express();
+  adminApp.disable("x-powered-by");
+  adminApp.use(bodyParser.json({ limit: "10mb" }));
+
+  const internalBullBoard = new ExpressAdapter();
+  internalBullBoard.setBasePath("/admin/queues");
+  createBullBoard({
+    queues: bullBoardQueues,
+    serverAdapter: internalBullBoard,
+  });
+  adminApp.use("/admin/queues", internalBullBoard.getRouter());
+
+  adminApp.use(adminInternalRouter);
+  adminApp.use(notFoundHandler);
+  adminApp.use(
+    (err: unknown, req: Request, res: Response, _next: NextFunction) => {
+      logger.error("Internal admin request failed", {
+        error: err,
+        path: req.path,
+      });
+      res.status(500).json({ success: false, error: "Internal server error" });
+    },
+  );
+
+  const host = config.ADMIN_INTERNAL_HOST;
+  return adminApp.listen(port, host, (error?: Error) => {
+    if (error) {
+      logger.error("Failed to start internal admin server", {
+        error,
+        port,
+        host,
+      });
+      throw error;
+    }
+
+    logger.info("Internal admin server listening", {
+      pid: process.pid,
+      port,
+      host,
+    });
+  });
+}
+
 async function startServer(port = DEFAULT_PORT) {
+  startNodeRuntimeMetrics();
   try {
     await initializeBlocklist();
     initializeEngineForcing();
@@ -160,10 +213,6 @@ async function startServer(port = DEFAULT_PORT) {
     throw error;
   }
 
-  const mcpActionLogRetention = startMcpActionLogRetentionWorkerIfEnabled({
-    enabled: config.MCP_ACTION_LOG_STORAGE_ENABLED,
-    db,
-  });
   const server = app.listen(Number(port), HOST, (error?: Error) => {
     if (error) {
       logger.error("Failed to start HTTP server", { error, port, host: HOST });
@@ -173,20 +222,31 @@ async function startServer(port = DEFAULT_PORT) {
     logger.info(`Worker ${process.pid} listening on port ${port}`);
   });
 
+  const adminInternalServer =
+    config.ADMIN_INTERNAL_PORT !== undefined
+      ? startAdminInternalServer(config.ADMIN_INTERNAL_PORT)
+      : undefined;
+
   const exitHandler = async () => {
     logger.info("SIGTERM signal received: closing HTTP server");
-    mcpActionLogRetention?.stop();
     if (config.IS_KUBERNETES) {
       // Account for GCE load balancer drain timeout
       logger.info("Waiting 60s for GCE load balancer drain timeout");
       await new Promise(resolve => setTimeout(resolve, 60000));
     }
-    server.close(() => {
+    const adminInternalClosed = new Promise<void>(resolve =>
+      adminInternalServer
+        ? adminInternalServer.close(() => resolve())
+        : resolve(),
+    );
+    server.close(async () => {
+      await adminInternalClosed;
       logger.info("Server closed.");
       nuqShutdown().finally(() => {
         shutdownWebhookQueue().finally(() => {
           shutdownIndexerQueue().finally(async () => {
             await shutdownPubSubLogging();
+            await shutdownTracing();
             logger.info("NUQ shutdown complete");
             process.exit(0);
           });
@@ -265,13 +325,11 @@ app.use(
   },
 );
 
-Sentry.setupExpressErrorHandler(app);
-
 app.use(
   (
     err: unknown,
     req: RequestWithMaybeACUC<{}, ErrorResponse, undefined>,
-    res: ResponseWithSentry<ErrorResponse>,
+    res: Response<ErrorResponse>,
     next: NextFunction,
   ) => {
     if (
@@ -298,7 +356,7 @@ app.use(
       });
     }
 
-    const id = res.sentry ?? uuidv7();
+    const id = uuidv7();
 
     logger.error(
       "Error occurred in request! (" + req.path + ") -- ID " + id + " -- ",

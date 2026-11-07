@@ -32,17 +32,92 @@ export function isNearBlack(hex: string): boolean {
   return contrastYIQ(hex) < 40 && max < 140;
 }
 
-/** Chromatic brand color — not gray chrome, and not a near-black nav on light pages. */
+/** Near-black with no hue: a monochrome brand's black, not navy chrome. */
+export function isNeutralDark(hex: string): boolean {
+  const h = hex.replace("#", "");
+  if (h.length < 6) return false;
+  const channels = [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16));
+  return isNearBlack(hex) && Math.max(...channels) - Math.min(...channels) < 30;
+}
+
+/** Straight-line RGB distance; Infinity unless both are #RRGGBB. */
+export function colorDistance(a?: string | null, b?: string | null): number {
+  const x = normalizeRoleHex(a);
+  const y = normalizeRoleHex(b);
+  if (!x || !y || x.length !== 7 || y.length !== 7) return Infinity;
+  const channels = (hex: string) =>
+    [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16));
+  const [p, q] = [channels(x), channels(y)];
+  return Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]);
+}
+
+/**
+ * Nearly white, whatever its tint (#E5EDF5, #F2E8E1): on a light page that is
+ * a section background, not a brand color.
+ */
+function isPale(hex: string): boolean {
+  const h = hex.replace("#", "");
+  if (h.length < 6) return false;
+  const channels = [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16));
+  return (Math.max(...channels) + Math.min(...channels)) / 2 / 255 > 0.9;
+}
+
+/** A light color on a light page, a dark one on a dark page: what a page background can be. */
+export function fitsColorScheme(
+  hex: string,
+  colorScheme?: "light" | "dark",
+): boolean {
+  const luma = contrastYIQ(hex);
+  return colorScheme === "dark" ? luma < 128 : luma >= 128;
+}
+
+/**
+ * Able to call attention to a button or link: a monochrome brand's black (white
+ * on a dark page), or a color with real chroma that isn't a pale tint on a
+ * light page. Grays and slates (#A2A9B1, #4A5565) are chrome.
+ */
+export function isUsableAccent(
+  hex: string,
+  colorScheme?: "light" | "dark",
+): boolean {
+  if (colorScheme === "dark" ? contrastYIQ(hex) > 200 : isNearBlack(hex)) {
+    return hex.replace("#", "").length >= 6;
+  }
+  return isChromaticAccent(hex, colorScheme);
+}
+
+/** A color with real chroma that isn't a pale tint on a light page: what the page's own colored elements can offer as an accent. Grays, slates (#4A5565), black and white are not it. */
+export function isChromaticAccent(
+  hex: string,
+  colorScheme?: "light" | "dark",
+): boolean {
+  const h = hex.replace("#", "");
+  if (h.length < 6) return false;
+  const channels = [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16));
+  if (Math.max(...channels) - Math.min(...channels) < 30) return false;
+  return colorScheme === "dark" || !isPale(hex);
+}
+
+/** Chromatic brand color — not gray chrome, and not near-black or near-white chrome on light pages. */
 export function isUsableBrandPrimary(
   hex: string,
   colorScheme?: "light" | "dark",
 ): boolean {
   if (isGrayish(hex)) return false;
-  if (colorScheme !== "dark" && isNearBlack(hex)) return false;
+  if (colorScheme !== "dark" && (isNearBlack(hex) || isPale(hex))) return false;
   return true;
 }
 
 const HEX = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i;
+
+// What browsers draw unstyled links in (unvisited, visited). A page that shows
+// them never chose them, so they say nothing about the brand.
+const BROWSER_LINK_COLORS = new Set(["#0000EE", "#551A8B"]);
+
+export function isBrowserLinkColor(value?: string | null): boolean {
+  const hex = normalizeRoleHex(value);
+  return !!hex && BROWSER_LINK_COLORS.has(hex);
+}
 
 /** Accept #RGB / #RRGGBB; reject names like "navy" so they cannot overwrite heuristics. */
 export function normalizeRoleHex(value?: string | null): string | undefined {
@@ -74,7 +149,7 @@ export function pickBrandPrimary(
 
   const chromatic = ranked.find(h => {
     if (skip.has(h) || isGrayish(h)) return false;
-    if (lightPage && isNearBlack(h)) return false;
+    if (lightPage && (isNearBlack(h) || isPale(h))) return false;
     return true;
   });
   if (chromatic) return chromatic;

@@ -3,6 +3,7 @@ import { config } from "../../../config";
 import { describeIf, itIf, TEST_PRODUCTION } from "../lib";
 import { creditUsage, idmux, researchRaw } from "./lib";
 import { and, desc, eq, gt } from "drizzle-orm";
+import { HAS_JOB_LOG, waitForJobLogRow } from "../job-log";
 import { db } from "../../../db/connection";
 import * as schema from "../../../db/schema";
 import { redisRateLimitClient } from "../../../services/rate-limiter";
@@ -244,7 +245,7 @@ describeIf(HAS_RESEARCH)("Research API", () => {
   });
 
   it("logs research origin from X-Origin and integration from query", async () => {
-    if (!config.USE_DB_AUTHENTICATION) return;
+    if (!config.USE_DB_AUTHENTICATION || !HAS_JOB_LOG) return;
 
     const identity = await idmux({
       name: "research/logs metadata",
@@ -262,27 +263,14 @@ describeIf(HAS_RESEARCH)("Research API", () => {
     expect(res.statusCode).toBe(200);
     expect(res.body.success).toBe(true);
 
-    const requestLog = await waitForSingleRow<{
+    const requestLog = await waitForJobLogRow<{
       origin: string | null;
       integration: string | null;
-    }>(async () => {
-      const data = await db
-        .select({
-          origin: schema.requests.origin,
-          integration: schema.requests.integration,
-        })
-        .from(schema.requests)
-        .where(
-          and(
-            eq(schema.requests.team_id, identity.teamId),
-            eq(schema.requests.kind, "research_paper_search"),
-            eq(schema.requests.target_hint, query),
-          ),
-        )
-        .orderBy(desc(schema.requests.created_at))
-        .limit(1);
-      return data[0] ?? null;
-    });
+    }>(
+      "requests",
+      "team_id = {teamId: UUID} AND kind = 'research_paper_search' AND target_hint = {query: String}",
+      { teamId: identity.teamId, query },
+    );
 
     expect(requestLog).not.toBeNull();
     expect(requestLog?.origin).toBe("mcp");
@@ -543,21 +531,16 @@ describeIf(HAS_RESEARCH)("Research API", () => {
 const GITHUB_DEPRECATED_AT = "@1788393600";
 const GITHUB_SUNSET = "Tue, 03 Nov 2026 23:59:59 GMT";
 
-describeIf(HAS_RESEARCH)("Research API github search deprecation", () => {
-  it("carries the deprecation headers and body warning on the canonical mount", async () => {
-    const identity = await idmux({
-      name: "research/github deprecation canonical",
-      credits: 100,
+describeIf(HAS_RESEARCH)("Research API github search removal", () => {
+  it("answers 410 with the deprecation headers on the canonical mount", async () => {
+    const res = await researchRaw("/v2/search/research/github", {
+      query: "milvus hybrid search",
+      k: 3,
     });
 
-    const res = await researchRaw(
-      "/v2/search/research/github",
-      { query: "milvus hybrid search", k: 3 },
-      identity,
-    );
-
-    expect(res.statusCode).toBe(200);
-    expect(res.body.success).toBe(true);
+    expect(res.statusCode).toBe(410);
+    expect(res.body.success).toBe(false);
+    expect(res.body.code).toBe("ENDPOINT_REMOVED");
 
     expect(res.headers["deprecation"]).toBe(GITHUB_DEPRECATED_AT);
     expect(res.headers["sunset"]).toBe(GITHUB_SUNSET);
@@ -565,12 +548,9 @@ describeIf(HAS_RESEARCH)("Research API github search deprecation", () => {
     expect(res.headers["link"]).toContain(
       '</v2/search/developer>; rel="successor-version"',
     );
-    expect(res.headers["warning"]).toMatch(/^299 - "/);
 
-    expect(Array.isArray(res.body.warnings)).toBe(true);
-    expect(
-      res.body.warnings.some((w: string) => /\/v2\/search\/developer/.test(w)),
-    ).toBe(true);
+    expect(res.body.error).toContain("/v2/search/developer");
+    expect(res.body.detail).toBe(res.body.error);
     expect(res.body.replacement).toBe("/v2/search/developer");
   }, 120000);
 
@@ -593,40 +573,23 @@ describeIf(HAS_RESEARCH)("Research API github search deprecation", () => {
     expect(res.body.replacement).toBeUndefined();
   }, 120000);
 
-  it("keeps the legacy snake_case aliases alongside the new warning", async () => {
-    const identity = await idmux({
-      name: "research/github deprecation legacy",
-      credits: 100,
+  it("answers 410 on the legacy mount too", async () => {
+    const res = await researchRaw("/v2/research/github", {
+      query: "milvus hybrid search",
+      k: 3,
     });
 
-    const res = await researchRaw(
-      "/v2/research/github",
-      { query: "milvus hybrid search", k: 3 },
-      identity,
-    );
-
-    expect(res.statusCode).toBe(200);
+    expect(res.statusCode).toBe(410);
     expect(res.headers["deprecation"]).toBe(GITHUB_DEPRECATED_AT);
-    expect(Array.isArray(res.body.warnings)).toBe(true);
-    expect(res.body.results.length).toBeGreaterThan(0);
-    // resultType is optional, so only assert the alias when the camel key is set.
-    const first = res.body.results[0];
-    if (first.resultType !== undefined) {
-      expect(first.result_type).toBe(first.resultType);
-    }
+    expect(res.body.replacement).toBe("/v2/search/developer");
   }, 120000);
 
-  it("still warns when the request is rejected", async () => {
-    const identity = await idmux({
-      name: "research/github deprecation 400",
-      credits: 100,
-    });
+  it("answers 410 without an API key or a query", async () => {
+    const res = await researchRaw("/v2/search/research/github", {});
 
-    const res = await researchRaw("/v2/search/research/github", {}, identity);
-
-    expect(res.statusCode).toBe(400);
+    expect(res.statusCode).toBe(410);
     expect(res.body.success).toBe(false);
     expect(res.headers["deprecation"]).toBe(GITHUB_DEPRECATED_AT);
-    expect(Array.isArray(res.body.warnings)).toBe(true);
+    expect(res.body.replacement).toBe("/v2/search/developer");
   }, 60000);
 });

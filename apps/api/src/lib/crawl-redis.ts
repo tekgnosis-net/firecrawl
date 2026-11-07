@@ -8,6 +8,8 @@ import { getAdjustedMaxDepth } from "../scraper/WebScraper/utils/maxDepthUtils";
 import type { Logger } from "winston";
 import { withSpan, setSpanAttributes } from "./otel-tracer";
 import { getScrapeZDR, getIgnoreRobots } from "./zdr-helpers";
+import { resolveSafeMode } from "./safe-mode";
+import { isUsOnly } from "./us-only";
 import {
   firstPipelineError,
   reportPipelineError,
@@ -36,42 +38,55 @@ export type StoredCrawl = {
   v1?: boolean;
   webhook?: WebhookConfig;
   requestId?: string;
+  // The request's `origin`; dashboard-started jobs get an in-app notification
+  // when they finish.
+  origin?: string;
 };
 
 export async function saveCrawl(id: string, crawl: StoredCrawl) {
-  return await withSpan("firecrawl-redis-save-crawl", async span => {
-    setSpanAttributes(span, {
-      "crawl.id": id,
-      "crawl.team_id": crawl.team_id,
-      "crawl.zero_data_retention": crawl.zeroDataRetention || false,
-      operation: "save_crawl",
-    });
+  return await withSpan(
+    "firecrawl-redis-save-crawl",
+    async span => {
+      setSpanAttributes(span, {
+        "crawl.id": id,
+        "crawl.team_id": crawl.team_id,
+        "crawl.zero_data_retention": crawl.zeroDataRetention || false,
+        operation: "save_crawl",
+      });
 
-    _logger.debug("Saving crawl " + id + " to Redis...", {
-      crawl,
-      module: "crawl-redis",
-      method: "saveCrawl",
-      crawlId: id,
-      teamId: crawl.team_id,
-      zeroDataRetention: crawl.zeroDataRetention,
-    });
+      _logger.debug("Saving crawl " + id + " to Redis...", {
+        crawl,
+        module: "crawl-redis",
+        method: "saveCrawl",
+        crawlId: id,
+        teamId: crawl.team_id,
+        zeroDataRetention: crawl.zeroDataRetention,
+      });
 
-    await redisEvictConnection.set(
-      "crawl:" + id,
-      JSON.stringify(crawl),
-      "EX",
-      24 * 60 * 60,
-    );
-    await redisEvictConnection.sadd("crawls_by_team_id:" + crawl.team_id, id);
-    await redisEvictConnection.expire(
-      "crawls_by_team_id:" + crawl.team_id,
-      24 * 60 * 60,
-    );
-  });
+      await redisEvictConnection.set(
+        "crawl:" + id,
+        JSON.stringify(crawl),
+        "EX",
+        24 * 60 * 60,
+      );
+      await redisEvictConnection.sadd("crawls_by_team_id:" + crawl.team_id, id);
+      await redisEvictConnection.expire(
+        "crawls_by_team_id:" + crawl.team_id,
+        24 * 60 * 60,
+      );
+    },
+    { zeroDataRetention: crawl.zeroDataRetention },
+  );
 }
 
-export async function recordRobotsBlocked(crawlId: string, url: string) {
-  await redisEvictConnection.sadd("crawl:" + crawlId + ":robots_blocked", url);
+export async function recordRobotsBlocked(crawlId: string, urls: string[]) {
+  if (urls.length === 0) return;
+  for (let i = 0; i < urls.length; i += REDIS_COMMAND_ARG_CHUNK_SIZE) {
+    await redisEvictConnection.sadd(
+      "crawl:" + crawlId + ":robots_blocked",
+      ...urls.slice(i, i + REDIS_COMMAND_ARG_CHUNK_SIZE),
+    );
+  }
   await redisEvictConnection.expire(
     "crawl:" + crawlId + ":robots_blocked",
     24 * 60 * 60,
@@ -134,6 +149,7 @@ export async function getCrawl(id: string): Promise<StoredCrawl | null> {
     setSpanAttributes(span, {
       "crawl.found": true,
       "crawl.team_id": crawl.team_id,
+      "crawl.zero_data_retention": crawl.zeroDataRetention === true,
     });
 
     return crawl;
@@ -220,6 +236,16 @@ export async function addCrawlJobs(
   }
 }
 
+// Sets KEYS[1] to ARGV[1] only if the stored value is missing or smaller,
+// then refreshes the TTL (ARGV[2], in seconds). Jobs can finish out of order,
+// so a plain SET could replace a newer finish time with an older one.
+const SET_IF_GREATER_SCRIPT = `local current = tonumber(redis.call("get", KEYS[1]))
+if current == nil or tonumber(ARGV[1]) > current then
+  redis.call("set", KEYS[1], ARGV[1])
+end
+redis.call("expire", KEYS[1], ARGV[2])
+return 1`;
+
 export async function addCrawlJobDone(
   id: string,
   job_id: string,
@@ -239,16 +265,24 @@ export async function addCrawlJobDone(
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
+      const now = Date.now();
       const pipeline = redisEvictConnection.pipeline();
       pipeline.sadd("crawl:" + id + ":jobs_done", job_id);
       pipeline.expire("crawl:" + id + ":jobs_done", 24 * 60 * 60);
 
+      // jobs_donez_ordered only holds successful jobs, so it cannot tell when
+      // a crawl ended if its last jobs failed. Keep the finish time of the
+      // latest job of any outcome for the crawl status completedAt.
+      pipeline.eval(
+        SET_IF_GREATER_SCRIPT,
+        1,
+        "crawl:" + id + ":last_job_done_at",
+        now,
+        24 * 60 * 60,
+      );
+
       if (success) {
-        pipeline.zadd(
-          "crawl:" + id + ":jobs_donez_ordered",
-          Date.now(),
-          job_id,
-        );
+        pipeline.zadd("crawl:" + id + ":jobs_donez_ordered", now, job_id);
       } else {
         // in case it's already been pushed, make sure it's removed
         pipeline.zrem("crawl:" + id + ":jobs_donez_ordered", job_id);
@@ -428,6 +462,9 @@ export async function getDoneJobsOrdered(
   );
 }
 
+/// Finish time of the latest done job in the crawl, failed jobs included.
+/// Crawls that started before last_job_done_at existed only have the
+/// successful-job timestamps, so take the later of the two.
 export async function getLastDoneJobTimestamp(
   id: string,
 ): Promise<number | null> {
@@ -435,15 +472,24 @@ export async function getLastDoneJobTimestamp(
     "crawl:" + id + ":jobs_donez_ordered",
     24 * 60 * 60,
   );
-  const result = await redisEvictConnection.zrange(
-    "crawl:" + id + ":jobs_donez_ordered",
-    -1,
-    -1,
-    "WITHSCORES",
+  await redisEvictConnection.expire(
+    "crawl:" + id + ":last_job_done_at",
+    24 * 60 * 60,
   );
-  if (!result || result.length < 2) return null;
-  const score = parseInt(result[1], 10);
-  return Number.isFinite(score) ? score : null;
+  const [lastAny, lastSuccess] = await Promise.all([
+    redisEvictConnection.get("crawl:" + id + ":last_job_done_at"),
+    redisEvictConnection.zrange(
+      "crawl:" + id + ":jobs_donez_ordered",
+      -1,
+      -1,
+      "WITHSCORES",
+    ),
+  ]);
+  const candidates = [
+    lastAny !== null ? parseInt(lastAny, 10) : NaN,
+    lastSuccess && lastSuccess.length >= 2 ? parseInt(lastSuccess[1], 10) : NaN,
+  ].filter(x => Number.isFinite(x));
+  return candidates.length > 0 ? Math.max(...candidates) : null;
 }
 
 export async function getDoneJobsOrderedUntil(
@@ -669,103 +715,58 @@ export async function lockURL(
   url: string,
   __logger: Logger = _logger,
 ): Promise<boolean> {
-  return await withSpan("firecrawl-redis-lock-url", async span => {
-    const normalizedUrl = normalizeURL(url, sc);
-    setSpanAttributes(span, {
-      "crawl.id": id,
-      "crawl.url": normalizedUrl,
-      "crawl.team_id": sc.team_id,
-      operation: "lock_url",
-    });
+  return await withSpan(
+    "firecrawl-redis-lock-url",
+    async span => {
+      const normalizedUrl = normalizeURL(url, sc);
+      setSpanAttributes(span, {
+        "crawl.id": id,
+        "crawl.url": normalizedUrl,
+        "crawl.team_id": sc.team_id,
+        operation: "lock_url",
+      });
 
-    if (typeof sc.crawlerOptions?.limit === "number") {
-      if (
-        (await redisEvictConnection.scard("crawl:" + id + ":visited_unique")) >=
-        sc.crawlerOptions.limit
-      ) {
-        setSpanAttributes(span, { "crawl.limit_reached": true });
-        return false;
-      }
-    }
-
-    const lockTarget = !sc.crawlerOptions?.deduplicateSimilarURLs
-      ? normalizedUrl
-      : generateURLPermutations(normalizedUrl)[0].href;
-
-    // The commands are idempotent, so retry the pipeline on failure: the
-    // SADD may land before a failing command (e.g. a failed EXPIRE), and
-    // giving up then would leave the URL marked visited without being
-    // queued — a caller retry would read SADD=0 and skip it. Track whether
-    // any attempt reported the SADD as newly added, since a retry after a
-    // partial success reads 0.
-    let sawNewLock = false;
-    let locked = false;
-    let lastError: unknown = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      let attemptError: unknown = null;
-      try {
-        const pipeline = redisEvictConnection.pipeline();
-        pipeline.sadd("crawl:" + id + ":visited", lockTarget);
-        pipeline.expire("crawl:" + id + ":visited", 24 * 60 * 60);
-        const attemptResults = await pipeline.exec();
-        if (attemptResults?.[0]?.[1] === 1) {
-          sawNewLock = true;
+      if (typeof sc.crawlerOptions?.limit === "number") {
+        if (
+          (await redisEvictConnection.scard(
+            "crawl:" + id + ":visited_unique",
+          )) >= sc.crawlerOptions.limit
+        ) {
+          setSpanAttributes(span, { "crawl.limit_reached": true });
+          return false;
         }
-        attemptError = firstPipelineError(attemptResults);
-      } catch (error) {
-        attemptError = error;
       }
 
-      if (attemptError === null) {
-        locked = true;
-        lastError = null;
-        break;
-      }
-      lastError = attemptError;
+      const lockTarget = !sc.crawlerOptions?.deduplicateSimilarURLs
+        ? normalizedUrl
+        : generateURLPermutations(normalizedUrl)[0].href;
 
-      __logger.error("Redis pipeline command failed", {
-        module: "crawl-redis",
-        method: "lockURL",
-        crawlId: id,
-        url: normalizedUrl,
-        attempt,
-        error: attemptError,
-      });
-
-      if (attempt < 3) {
-        await new Promise(resolve => setTimeout(resolve, 50 * 2 ** attempt));
-      }
-    }
-
-    if (!locked) {
-      throw new Error("URL lock pipeline failed after retries", {
-        cause: lastError,
-      });
-    }
-
-    const res = sawNewLock;
-
-    if (res) {
-      // The visited SADD has already landed, so a caller retry would skip
-      // this URL as already-visited and it would be lost from the crawl.
-      // The visited_unique bookkeeping is idempotent — retry it before
-      // exposing the failure.
+      // The commands are idempotent, so retry the pipeline on failure: the
+      // SADD may land before a failing command (e.g. a failed EXPIRE), and
+      // giving up then would leave the URL marked visited without being
+      // queued — a caller retry would read SADD=0 and skip it. Track whether
+      // any attempt reported the SADD as newly added, since a retry after a
+      // partial success reads 0.
+      let sawNewLock = false;
+      let locked = false;
       let lastError: unknown = null;
       for (let attempt = 1; attempt <= 3; attempt++) {
         let attemptError: unknown = null;
         try {
-          const uniquePipeline = redisEvictConnection.pipeline();
-          uniquePipeline.sadd("crawl:" + id + ":visited_unique", normalizedUrl);
-          uniquePipeline.expire(
-            "crawl:" + id + ":visited_unique",
-            24 * 60 * 60,
-          );
-          attemptError = firstPipelineError(await uniquePipeline.exec());
+          const pipeline = redisEvictConnection.pipeline();
+          pipeline.sadd("crawl:" + id + ":visited", lockTarget);
+          pipeline.expire("crawl:" + id + ":visited", 24 * 60 * 60);
+          const attemptResults = await pipeline.exec();
+          if (attemptResults?.[0]?.[1] === 1) {
+            sawNewLock = true;
+          }
+          attemptError = firstPipelineError(attemptResults);
         } catch (error) {
           attemptError = error;
         }
 
         if (attemptError === null) {
+          locked = true;
           lastError = null;
           break;
         }
@@ -785,29 +786,42 @@ export async function lockURL(
         }
       }
 
-      if (lastError !== null) {
-        // Roll back the locks we just acquired, so a caller retry can
-        // re-lock and queue this URL instead of skipping it as
-        // already-visited. visited_unique may have landed during a retried
-        // attempt whose EXPIRE failed, so remove it too — otherwise the
-        // stale member consumes crawl-limit budget for a URL that was
-        // never queued. The rollback itself is retried; if it still fails,
-        // Redis is having a sustained outage and the canonical logs are
-        // the signal.
+      if (!locked) {
+        throw new Error("URL lock pipeline failed after retries", {
+          cause: lastError,
+        });
+      }
+
+      const res = sawNewLock;
+
+      if (res) {
+        // The visited SADD has already landed, so a caller retry would skip
+        // this URL as already-visited and it would be lost from the crawl.
+        // The visited_unique bookkeeping is idempotent — retry it before
+        // exposing the failure.
+        let lastError: unknown = null;
         for (let attempt = 1; attempt <= 3; attempt++) {
-          let rollbackError: unknown = null;
+          let attemptError: unknown = null;
           try {
-            const rollback = redisEvictConnection.pipeline();
-            rollback.srem("crawl:" + id + ":visited", lockTarget);
-            rollback.srem("crawl:" + id + ":visited_unique", normalizedUrl);
-            rollbackError = firstPipelineError(await rollback.exec());
+            const uniquePipeline = redisEvictConnection.pipeline();
+            uniquePipeline.sadd(
+              "crawl:" + id + ":visited_unique",
+              normalizedUrl,
+            );
+            uniquePipeline.expire(
+              "crawl:" + id + ":visited_unique",
+              24 * 60 * 60,
+            );
+            attemptError = firstPipelineError(await uniquePipeline.exec());
           } catch (error) {
-            rollbackError = error;
+            attemptError = error;
           }
 
-          if (rollbackError === null) {
+          if (attemptError === null) {
+            lastError = null;
             break;
           }
+          lastError = attemptError;
 
           __logger.error("Redis pipeline command failed", {
             module: "crawl-redis",
@@ -815,7 +829,7 @@ export async function lockURL(
             crawlId: id,
             url: normalizedUrl,
             attempt,
-            error: rollbackError,
+            error: attemptError,
           });
 
           if (attempt < 3) {
@@ -824,15 +838,57 @@ export async function lockURL(
             );
           }
         }
-        throw new Error("Unique URL lock pipeline failed after retries", {
-          cause: lastError,
-        });
-      }
-    }
 
-    setSpanAttributes(span, { "crawl.url_locked": res });
-    return res;
-  });
+        if (lastError !== null) {
+          // Roll back the locks we just acquired, so a caller retry can
+          // re-lock and queue this URL instead of skipping it as
+          // already-visited. visited_unique may have landed during a retried
+          // attempt whose EXPIRE failed, so remove it too — otherwise the
+          // stale member consumes crawl-limit budget for a URL that was
+          // never queued. The rollback itself is retried; if it still fails,
+          // Redis is having a sustained outage and the canonical logs are
+          // the signal.
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            let rollbackError: unknown = null;
+            try {
+              const rollback = redisEvictConnection.pipeline();
+              rollback.srem("crawl:" + id + ":visited", lockTarget);
+              rollback.srem("crawl:" + id + ":visited_unique", normalizedUrl);
+              rollbackError = firstPipelineError(await rollback.exec());
+            } catch (error) {
+              rollbackError = error;
+            }
+
+            if (rollbackError === null) {
+              break;
+            }
+
+            __logger.error("Redis pipeline command failed", {
+              module: "crawl-redis",
+              method: "lockURL",
+              crawlId: id,
+              url: normalizedUrl,
+              attempt,
+              error: rollbackError,
+            });
+
+            if (attempt < 3) {
+              await new Promise(resolve =>
+                setTimeout(resolve, 50 * 2 ** attempt),
+              );
+            }
+          }
+          throw new Error("Unique URL lock pipeline failed after retries", {
+            cause: lastError,
+          });
+        }
+      }
+
+      setSpanAttributes(span, { "crawl.url_locked": res });
+      return res;
+    },
+    { zeroDataRetention: sc.zeroDataRetention },
+  );
 }
 
 /// NOTE: does not check limit. only use if limit is checked beforehand e.g. with sitemap
@@ -964,6 +1020,15 @@ export function crawlToCrawler(
   newBase?: string,
   crawlerOptions?: any,
 ): WebCrawler {
+  // Resolve the crawl's Safe Mode once (honoring a stored request bypass) to
+  // drive both lockdown and the robots override below.
+  const crawlerSafeMode = sc.internalOptions?.safeModeBypassed
+    ? undefined
+    : resolveSafeMode(
+        sc.internalOptions?.teamFlags ?? teamFlags,
+        undefined,
+        sc.originUrl ?? undefined,
+      ).safeMode;
   const crawler = new WebCrawler({
     jobId: id,
     initialUrl: sc.originUrl!,
@@ -985,18 +1050,23 @@ export function crawlToCrawler(
     allowExternalContentLinks:
       sc.crawlerOptions?.allowExternalContentLinks ?? false,
     allowSubdomains: sc.crawlerOptions?.allowSubdomains ?? false,
+    // Safe Mode enforceRobots overrides even a team's forced ignore-robots.
     ignoreRobotsTxt:
-      getIgnoreRobots(teamFlags) === "forced" ||
-      (getIgnoreRobots(teamFlags) === "allowed" &&
-        (sc.crawlerOptions?.ignoreRobotsTxt ?? false)),
+      !crawlerSafeMode?.enforceRobots &&
+      (getIgnoreRobots(teamFlags) === "forced" ||
+        (getIgnoreRobots(teamFlags) === "allowed" &&
+          (sc.crawlerOptions?.ignoreRobotsTxt ?? false))),
     regexOnFullURL: sc.crawlerOptions?.regexOnFullURL ?? false,
     maxDiscoveryDepth: sc.crawlerOptions?.maxDiscoveryDepth,
     currentDiscoveryDepth: crawlerOptions?.currentDiscoveryDepth ?? 0,
     zeroDataRetention:
       (getScrapeZDR(teamFlags) === "forced" || sc.zeroDataRetention) ?? false,
+    usOnly: isUsOnly(sc.internalOptions?.teamFlags) || isUsOnly(teamFlags),
     location: sc.scrapeOptions?.location,
     headers: sc.scrapeOptions?.headers,
     robotsUserAgent: sc.crawlerOptions?.robotsUserAgent,
+    // Safe Mode lockdown: skip robots/sitemap discovery (outbound to target).
+    lockdown: crawlerSafeMode?.lockdown ?? false,
   });
 
   if (sc.robots !== undefined) {

@@ -9,6 +9,8 @@ on:
       - .github/workflows/deploy-go-service.yaml
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
   push-app-image:
     runs-on: ubuntu-latest

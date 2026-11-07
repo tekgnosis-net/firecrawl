@@ -56,14 +56,14 @@ const KEYLESS_TEAM_ID = keylessTeamId(KEYLESS_IP);
 /** Lets the un-awaited controller (wrapped by `wrap`) and its `finally` run. */
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
-/** Pulls the GET handler out of the router's stack for either mount shape. */
+/** Pulls the GET controller (after the credit gate) out of the router's stack for either mount shape. */
 function developerHandler(options: { root?: boolean } = {}) {
   const router: any = createDeveloperRouter(options);
   const path = options.root ? "/" : "/search";
   const layer = router.stack.find(
     (l: any) => l.route?.path === path && l.route?.methods?.get,
   );
-  return layer.route.stack[0].handle;
+  return layer.route.stack.at(-1).handle;
 }
 
 function makeReq(teamId: string, acuc: Record<string, unknown> | undefined) {
@@ -151,6 +151,8 @@ describe.each([
     // Ordinary team billing runs for the real (non-keyless) team id.
     expect(billTeam).toHaveBeenCalledWith(
       TEAM_ID,
+      // This fixture's ACUC carries no org.
+      null,
       expect.any(Number),
       expect.anything(),
       expect.anything(),

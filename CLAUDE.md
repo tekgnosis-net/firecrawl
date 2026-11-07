@@ -21,7 +21,7 @@ Firecrawl is a web scraper API. The directory you have access to is a monorepo:
     - If it requires fire-engine: `!process.env.TEST_SUITE_SELF_HOSTED`
     - If it requires AI: `!process.env.TEST_SUITE_SELF_HOSTED || process.env.OPENAI_API_KEY || process.env.OLLAMA_BASE_URL`
 2. Write code to achieve your win conditions.
-3. Run your tests using `pnpm harness jest ...` from `apps/api`.
+3. Run your tests using `pnpm harness pnpm exec vitest run ...` from `apps/api`.
   - `pnpm harness` gets the API server and workers up for you to run the tests. Don't try to `pnpm start` manually.
   - The full test suite takes a long time to run, so only execute relevant tests locally and let CI run the full suite.
 4. Push to a branch, open a PR, and let CI run to verify your win condition.
@@ -34,8 +34,8 @@ All commands run from `apps/api` unless noted otherwise.
 |---|---|
 | `pnpm install` (repo root) | Installs all workspaces. Builds the Rust native crate. |
 | `pnpm harness` | Boots the full stack (API, all workers, nuq-postgres container) for local dev. Use this — not `pnpm start`. |
-| `pnpm harness jest <pattern>` | Boots the stack and runs a specific test file/pattern. The preferred way to run any test locally. |
-| `pnpm test:snips` | Runs all snip tests (matches `src/__tests__/snips/v[12]/.+\.test\.ts`). |
+| `pnpm harness pnpm exec vitest run <pattern>` | Boots the stack and runs a specific test file/pattern (Vitest replaced Jest upstream in Oct 2026). The preferred way to run any test locally. |
+| `pnpm test:snips` | Runs all snip tests under `src/__tests__/snips/v1` and `v2`. |
 | `pnpm build` | TypeScript compile only (no tests). |
 | `pnpm format` | Prettier-format `src/**/*.{js,ts}`. Runs automatically via husky on commit. |
 | `pnpm knip` | Dead-code / unused-export scan. |

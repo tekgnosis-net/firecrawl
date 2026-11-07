@@ -4,7 +4,6 @@ import {
   SearchV2Response,
   SearchResultType,
 } from "../../lib/entities";
-import * as Sentry from "@sentry/node";
 import { logger } from "../../lib/logger";
 import { executeWithRetry, attemptRequest } from "../../lib/retry-utils";
 import { useFireEngine } from "../../scraper/scrapeURL/engines/fire-engine/available";
@@ -48,6 +47,9 @@ export async function fire_engine_search_v2(
     page?: number;
     type?: SearchResultType | SearchResultType[];
     enterprise?: ("default" | "anon" | "zdr")[];
+    includeDomains?: string[];
+    excludeDomains?: string[];
+    usOnly?: boolean;
   },
   abort?: AbortSignal,
 ): Promise<SearchV2Response> {
@@ -69,6 +71,9 @@ export async function fire_engine_search_v2(
     type: options.type || "web",
     enterprise: options.enterprise,
     safe: options.safe ? ("active" as const) : undefined,
+    includeDomains: options.includeDomains,
+    excludeDomains: options.excludeDomains,
+    ...(options.usOnly ? { usOnly: true } : {}),
   };
 
   const requestedTypes = normalizeSearchTypes(options.type);

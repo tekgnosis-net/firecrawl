@@ -28,6 +28,9 @@ type Document struct {
 	Pages []PdfPage `json:"pages,omitempty"`
 	// Blocks is typed PDF layout data, present only when parsers[].blocks is true.
 	Blocks []PdfPageBlocks `json:"blocks,omitempty"`
+	// Tools contains domain tools discovered during the scrape, present only
+	// when domainTools is enabled.
+	Tools []DiscoveredTool `json:"tools,omitempty"`
 }
 
 // PDFParser configures PDF parsing. Use in ScrapeOptions.Parsers / ParseOptions.Parsers.
@@ -193,17 +196,19 @@ type MenuItemIdentifiers struct {
 
 // PaperResult represents a ranked research paper result.
 type PaperResult struct {
-	PaperID   string                 `json:"paperId"`
-	PrimaryID string                 `json:"primaryId,omitempty"`
-	IDs       map[string]interface{} `json:"ids,omitempty"`
-	Title     string                 `json:"title,omitempty"`
-	Abstract  string                 `json:"abstract,omitempty"`
-	Score     *float64               `json:"score,omitempty"`
-	Year      *int                   `json:"year,omitempty"`
-	Authors   []string               `json:"authors,omitempty"`
-	Venue     string                 `json:"venue,omitempty"`
-	URL       string                 `json:"url,omitempty"`
-	Signals   map[string]interface{} `json:"signals,omitempty"`
+	PaperID     string                 `json:"paperId"`
+	PrimaryID   string                 `json:"primaryId,omitempty"`
+	IDs         map[string]interface{} `json:"ids,omitempty"`
+	Title       string                 `json:"title,omitempty"`
+	Abstract    string                 `json:"abstract,omitempty"`
+	Score       *float64               `json:"score,omitempty"`
+	Year        *int                   `json:"year,omitempty"`
+	Authors     []string               `json:"authors,omitempty"`
+	CreatedDate string                 `json:"createdDate,omitempty"`
+	UpdateDate  string                 `json:"updateDate,omitempty"`
+	Venue       string                 `json:"venue,omitempty"`
+	URL         string                 `json:"url,omitempty"`
+	Signals     map[string]interface{} `json:"signals,omitempty"`
 }
 
 // PaperMetadata represents paper metadata returned by inspect/read endpoints.
@@ -285,6 +290,10 @@ type SearchPapersOptions struct {
 	Categories []string `json:"categories,omitempty"`
 	From       string   `json:"from,omitempty"`
 	To         string   `json:"to,omitempty"`
+	// Sort is "relevance" (default) or "date_desc", which returns the newest of
+	// the most relevant matches, newest first by created date. It does not list
+	// every paper in a date range. Set From (and To) for that.
+	Sort string `json:"sort,omitempty"`
 }
 
 // ReadPaperOptions configures ReadPaper.
@@ -303,6 +312,74 @@ type RelatedPapersOptions struct {
 // SearchGitHubOptions configures SearchGitHub.
 type SearchGitHubOptions struct {
 	K *int `json:"k,omitempty"`
+}
+
+// DeveloperSearchOptions configures DeveloperSearch.
+type DeveloperSearchOptions struct {
+	// K is the total number of ranked results, 1 to 100 (default 10).
+	K *int `json:"k,omitempty"`
+	// Passages is the number of passages per result, 1 to 5 (default 1).
+	Passages *int `json:"passages,omitempty"`
+	// Types limits result kinds: "doc", "issue", "pull_request", "readme".
+	Types []string `json:"types,omitempty"`
+	// Repos filters by GitHub owner/name, at most 20.
+	Repos []string `json:"repos,omitempty"`
+	// Sources filters by developer documentation source ID, at most 20.
+	Sources []string `json:"sources,omitempty"`
+	// Language is one case-insensitive GitHub Linguist primary language.
+	Language string `json:"language,omitempty"`
+	// Topic lists repository topics that must all match, at most 8.
+	Topic []string `json:"topic,omitempty"`
+	// License is one case-insensitive SPDX repository license identifier.
+	License  string `json:"license,omitempty"`
+	MinStars *int   `json:"min_stars,omitempty"`
+	MaxStars *int   `json:"max_stars,omitempty"`
+	Archived *bool  `json:"archived,omitempty"`
+	Fork     *bool  `json:"fork,omitempty"`
+	// Skills set to "only" returns packaged agent-skill evidence only.
+	Skills string `json:"skills,omitempty"`
+}
+
+// DeveloperSearchPassage is one matched passage of a developer search result.
+type DeveloperSearchPassage struct {
+	Text        string `json:"text"`
+	CitationURL string `json:"citation_url,omitempty"`
+}
+
+// DeveloperSearchResult is one ranked developer search result. License is
+// either an SPDX string or a disclosure object, so it is kept raw.
+type DeveloperSearchResult struct {
+	ID       string                   `json:"id"`
+	URL      string                   `json:"url"`
+	Title    string                   `json:"title,omitempty"`
+	Passages []DeveloperSearchPassage `json:"passages"`
+	License  json.RawMessage          `json:"license,omitempty"`
+}
+
+// DeveloperSearchRepoStatus reports whether a requested repository is indexed.
+type DeveloperSearchRepoStatus struct {
+	Repo    string `json:"repo"`
+	Indexed bool   `json:"indexed"`
+	Types   struct {
+		Issue       bool `json:"issue"`
+		PullRequest bool `json:"pullRequest"`
+		Readme      bool `json:"readme"`
+	} `json:"types"`
+}
+
+// DeveloperSearchSourceStatus reports whether a requested source is indexed.
+type DeveloperSearchSourceStatus struct {
+	Source  string `json:"source"`
+	Indexed bool   `json:"indexed"`
+}
+
+// DeveloperSearchResponse is returned by DeveloperSearch. Repos and Sources
+// are present only when those filters were requested.
+type DeveloperSearchResponse struct {
+	Success bool                          `json:"success"`
+	Results []DeveloperSearchResult       `json:"results"`
+	Repos   []DeveloperSearchRepoStatus   `json:"repos,omitempty"`
+	Sources []DeveloperSearchSourceStatus `json:"sources,omitempty"`
 }
 
 // CrawlResponse is returned when starting an async crawl.
@@ -336,6 +413,10 @@ type BatchScrapeResponse struct {
 }
 
 // BatchScrapeJob represents the status and results of a batch scrape job.
+//
+// ID is always set to the batch job ID, so callers of the synchronous
+// BatchScrape can still reach the per-job endpoints (GetBatchScrapeErrors,
+// CancelBatchScrape) afterwards.
 type BatchScrapeJob struct {
 	ID          string     `json:"id,omitempty"`
 	Status      string     `json:"status"`
@@ -345,11 +426,49 @@ type BatchScrapeJob struct {
 	ExpiresAt   string     `json:"expiresAt,omitempty"`
 	Next        string     `json:"next,omitempty"`
 	Data        []Document `json:"data,omitempty"`
+
+	// Errors lists the URLs that could not be scraped at all (for example DNS
+	// resolution errors or timeouts). Pages that responded with an HTTP error
+	// such as 404 or 429 are not listed here: they are returned in Data with the
+	// original status in Metadata["statusCode"].
+	//
+	// Populated by BatchScrape and BatchScrapeWithPolling once the job has
+	// finished. GetBatchScrapeStatus leaves it nil; use GetBatchScrapeErrors.
+	Errors []BatchScrapeError `json:"errors,omitempty"`
+	// RobotsBlocked lists the URLs skipped because robots.txt disallowed them.
+	// Populated under the same conditions as Errors.
+	RobotsBlocked []string `json:"robotsBlocked,omitempty"`
 }
 
 // IsDone returns true if the batch scrape job has finished.
 func (b *BatchScrapeJob) IsDone() bool {
 	return b.Status == "completed" || b.Status == "failed" || b.Status == "cancelled"
+}
+
+// BatchScrapeError describes one URL in a batch scrape job that failed to scrape.
+type BatchScrapeError struct {
+	// ID is the ID of the individual scrape job for this URL.
+	ID string `json:"id"`
+	// Timestamp is when the scrape failed, in RFC 3339 format, if known.
+	Timestamp string `json:"timestamp,omitempty"`
+	// URL is the URL that failed to scrape.
+	URL string `json:"url"`
+	// Code is a stable error code, such as "SCRAPE_DNS_RESOLUTION_ERROR" or
+	// "SCRAPE_TIMEOUT". Empty when the failure has no classified code.
+	Code string `json:"code,omitempty"`
+	// Error is the human-readable error message.
+	Error string `json:"error"`
+	// RequiresAction is set when the page needs an out-of-band step first, such
+	// as accepting a data provider's terms.
+	RequiresAction *RequiresAction `json:"requiresAction,omitempty"`
+}
+
+// BatchScrapeErrorsResponse is returned by GetBatchScrapeErrors.
+type BatchScrapeErrorsResponse struct {
+	// Errors lists the URLs that failed to scrape. See BatchScrapeError.
+	Errors []BatchScrapeError `json:"errors"`
+	// RobotsBlocked lists the URLs skipped because robots.txt disallowed them.
+	RobotsBlocked []string `json:"robotsBlocked"`
 }
 
 // LinkResult represents a discovered URL from a map request.
@@ -604,9 +723,64 @@ type GetMonitorCheckOptions struct {
 
 // SearchData represents the result of a search request.
 type SearchData struct {
-	Web    []map[string]interface{} `json:"web,omitempty"`
-	News   []map[string]interface{} `json:"news,omitempty"`
-	Images []map[string]interface{} `json:"images,omitempty"`
+	Warning string                   `json:"warning,omitempty"`
+	Web     []map[string]interface{} `json:"web,omitempty"`
+	News    []map[string]interface{} `json:"news,omitempty"`
+	Images  []map[string]interface{} `json:"images,omitempty"`
+	Tools   []DiscoveredTool         `json:"tools,omitempty"`
+	Skills  []SkillCard              `json:"skills,omitempty"`
+}
+
+// SkillCard is a short skill card from the skills search source.
+type SkillCard struct {
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Source      string   `json:"source"`
+	Provider    string   `json:"provider,omitempty"`
+	Similarity  *float64 `json:"similarity,omitempty"`
+}
+
+type AlexandriaCall struct {
+	Provider   string                 `json:"provider"`
+	Capability string                 `json:"capability"`
+	Options    map[string]interface{} `json:"options,omitempty"`
+}
+
+type AlexandriaOptions struct {
+	RequestID   string  `json:"-"`
+	Timeout     *int    `json:"timeout,omitempty"`
+	Integration *string `json:"integration,omitempty"`
+	Origin      *string `json:"origin,omitempty"`
+}
+
+type AlexandriaScrapeError struct {
+	Code     string `json:"code"`
+	Message  string `json:"message"`
+	Status   *int   `json:"status,omitempty"`
+	ChargeID string `json:"chargeId,omitempty"`
+}
+
+type AlexandriaScrapeResult struct {
+	Provider       string                 `json:"provider,omitempty"`
+	Capability     string                 `json:"capability,omitempty"`
+	CreditsCost    *int                   `json:"creditsCost,omitempty"`
+	Data           interface{}            `json:"data,omitempty"`
+	Records        *int                   `json:"records,omitempty"`
+	UpstreamStatus *int                   `json:"upstreamStatus,omitempty"`
+	RecordedAt     string                 `json:"recordedAt,omitempty"`
+	Error          *AlexandriaScrapeError `json:"error,omitempty"`
+}
+
+func (r *AlexandriaScrapeResult) Failed() bool {
+	return r.Error != nil
+}
+
+type AlexandriaScrapeData struct {
+	RequestID   string                   `json:"requestId"`
+	ScrapeID    string                   `json:"scrapeId"`
+	Alexandria  []AlexandriaScrapeResult `json:"alexandria"`
+	CreditsCost int                      `json:"creditsCost"`
 }
 
 // AgentResponse is returned when starting an async agent task.
@@ -614,6 +788,11 @@ type AgentResponse struct {
 	Success bool   `json:"success"`
 	ID      string `json:"id,omitempty"`
 	Error   string `json:"error,omitempty"`
+	// ThreadID is the thread this run belongs to. Pass it back in
+	// AgentOptions.ThreadID to continue the conversation.
+	ThreadID string `json:"threadId,omitempty"`
+	// ThreadTurn is the 1-based position of this run in its thread.
+	ThreadTurn int `json:"threadTurn,omitempty"`
 }
 
 // AgentStatusResponse represents the status and results of an agent task.
@@ -626,11 +805,121 @@ type AgentStatusResponse struct {
 	Effort      string      `json:"effort,omitempty"`
 	ExpiresAt   string      `json:"expiresAt,omitempty"`
 	CreditsUsed *int        `json:"creditsUsed,omitempty"`
+	ThreadID    string      `json:"threadId,omitempty"`
+	ThreadTurn  int         `json:"threadTurn,omitempty"`
+	Mode        string      `json:"mode,omitempty"`
+	// Message is the text reply. Chat-mode runs answer here instead of in Data.
+	Message         string                `json:"message,omitempty"`
+	Suggestions     []AgentSuggestion     `json:"suggestions,omitempty"`
+	PendingApproval *AgentPendingApproval `json:"pendingApproval,omitempty"`
+	Exchange        *AgentExchangeSummary `json:"exchange,omitempty"`
 }
 
 // IsDone returns true if the agent task has finished.
 func (a *AgentStatusResponse) IsDone() bool {
 	return a.Status == "completed" || a.Status == "failed" || a.Status == "cancelled"
+}
+
+// AgentSuggestion is a follow-up the agent offers for the next turn.
+type AgentSuggestion struct {
+	Label  string `json:"label"`
+	Prompt string `json:"prompt"`
+}
+
+// AgentExchangeSummary reports what a run did with Exchange. Toolkits and
+// RequireApproval are what the run resolved to after thread inheritance.
+type AgentExchangeSummary struct {
+	Enabled         bool     `json:"enabled"`
+	Toolkits        []string `json:"toolkits,omitempty"`
+	RequireApproval bool     `json:"requireApproval,omitempty"`
+	OnTermsRequired string   `json:"onTermsRequired,omitempty"`
+	PaidCalls       int      `json:"paidCalls"`
+	// CreditsUsed is nil when unknown.
+	CreditsUsed *int `json:"creditsUsed"`
+	// SkippedProviders lists providers that would have helped but were not
+	// used because their data terms are not accepted.
+	SkippedProviders []AgentSkippedProvider `json:"skippedProviders,omitempty"`
+	// RequiresAction is set in "ask" mode when a terms offer ended the turn.
+	RequiresAction *AgentTermsRequiredAction `json:"requiresAction,omitempty"`
+}
+
+// AgentSkippedProvider is a provider a run did not use because its data terms
+// are not accepted.
+type AgentSkippedProvider struct {
+	Provider   string `json:"provider"`
+	Name       string `json:"name"`
+	Capability string `json:"capability,omitempty"`
+	Adds       string `json:"adds,omitempty"`
+	Reason     string `json:"reason"`
+	Version    string `json:"version"`
+	TermsURL   string `json:"termsUrl"`
+}
+
+// AgentTermsRequiredAction lists the Exchange calls that show and accept
+// providers' data terms. Run Accept with ScrapeAlexandria only after the user
+// has explicitly agreed, then continue the thread with Exchange.Approve.
+type AgentTermsRequiredAction struct {
+	Type       string                     `json:"type"`
+	ApprovalID string                     `json:"approvalId"`
+	Providers  []AgentTermsActionProvider `json:"providers"`
+}
+
+// AgentTermsActionProvider is one provider whose data terms can be accepted.
+type AgentTermsActionProvider struct {
+	Provider   string `json:"provider"`
+	Name       string `json:"name"`
+	Capability string `json:"capability,omitempty"`
+	Adds       string `json:"adds,omitempty"`
+	Version    string `json:"version"`
+	// Digest is empty when the catalog published none; Show returns it.
+	Digest string         `json:"digest"`
+	URL    string         `json:"url"`
+	Show   AlexandriaCall `json:"show"`
+	Accept AlexandriaCall `json:"accept"`
+}
+
+// AgentPendingApproval is set when a turn ended waiting for the caller. Kind
+// "terms" asks to accept the providers in Terms and leaves Calls empty; any
+// other Kind, including empty, asks to allow or refuse Calls.
+type AgentPendingApproval struct {
+	ID         string                          `json:"id"`
+	Kind       string                          `json:"kind,omitempty"`
+	Reason     string                          `json:"reason"`
+	Calls      []AgentPendingApprovalCall      `json:"calls"`
+	Terms      []AgentTermsGate                `json:"terms,omitempty"`
+	Resolution *AgentPendingApprovalResolution `json:"resolution"`
+}
+
+// AgentPendingApprovalCall is a paid provider call held back for approval.
+type AgentPendingApprovalCall struct {
+	ID              string                   `json:"id"`
+	Provider        string                   `json:"provider"`
+	Capability      string                   `json:"capability"`
+	Input           map[string]interface{}   `json:"input"`
+	More            []map[string]interface{} `json:"more,omitempty"`
+	CreditsEstimate *int                     `json:"creditsEstimate"`
+}
+
+// AgentTermsGate is a provider in a terms pending approval.
+type AgentTermsGate struct {
+	Provider   string `json:"provider"`
+	Name       string `json:"name"`
+	Logo       string `json:"logo,omitempty"`
+	Capability string `json:"capability,omitempty"`
+	Adds       string `json:"adds,omitempty"`
+	Version    string `json:"version"`
+	// Digest is empty when the catalog published none.
+	Digest string `json:"digest"`
+	URL    string `json:"url"`
+}
+
+// AgentPendingApprovalResolution records how a later turn answered a pending
+// approval.
+type AgentPendingApprovalResolution struct {
+	Approved bool     `json:"approved"`
+	CallIDs  []string `json:"callIds"`
+	Always   bool     `json:"always"`
+	ByRunID  string   `json:"byRunId"`
 }
 
 // AgentTraceResponse is returned when fetching the event trace of an agent task.
@@ -826,4 +1115,49 @@ type CreditUsage struct {
 	PlanCredits        int    `json:"planCredits"`
 	BillingPeriodStart string `json:"billingPeriodStart,omitempty"`
 	BillingPeriodEnd   string `json:"billingPeriodEnd,omitempty"`
+}
+
+// DiscoveredTool includes the contract and its semantic/domain provenance.
+type DiscoveredTool struct {
+	ID            string                   `json:"id,omitempty"`
+	Provider      string                   `json:"provider"`
+	Capability    string                   `json:"capability"`
+	Name          string                   `json:"name"`
+	Description   string                   `json:"description"`
+	CreditsCost   int                      `json:"creditsCost"`
+	PerRecord     bool                     `json:"perRecord"`
+	Options       []map[string]interface{} `json:"options"`
+	RequiresOneOf [][]string               `json:"requiresOneOf,omitempty"`
+	Response      map[string]interface{}   `json:"response,omitempty"`
+	Examples      map[string]string        `json:"examples,omitempty"`
+	Example       map[string]interface{}   `json:"example,omitempty"`
+	Label         string                   `json:"label,omitempty"`
+	WhenToUse     string                   `json:"whenToUse,omitempty"`
+	Returns       interface{}              `json:"returns,omitempty"`
+	Discovery     interface{}              `json:"discovery,omitempty"`
+	Attribution   interface{}              `json:"attribution,omitempty"`
+	MatchedBy     []string                 `json:"matchedBy,omitempty"`
+	MatchedURLs   []string                 `json:"matchedUrls,omitempty"`
+	Concept       string                   `json:"concept,omitempty"`
+	Cohorts       []string                 `json:"cohorts,omitempty"`
+	Similarity    *float64                 `json:"similarity,omitempty"`
+}
+
+type FindToolsOptions struct {
+	URLs         []string `json:"urls,omitempty"`
+	Providers    []string `json:"providers,omitempty"`
+	Categories   []string `json:"categories,omitempty"`
+	Groups       []string `json:"groups,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty"`
+	Level        string   `json:"level,omitempty"`
+	Expand       []string `json:"expand,omitempty"`
+	Limit        *int     `json:"limit,omitempty"`
+	Offset       *int     `json:"offset,omitempty"`
+}
+
+type FindToolsData struct {
+	Level string                   `json:"level"`
+	Items []map[string]interface{} `json:"items"`
+	Total int                      `json:"total"`
+	Next  *AlexandriaCall          `json:"next"`
 }

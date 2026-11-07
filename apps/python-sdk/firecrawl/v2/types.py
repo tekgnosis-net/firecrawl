@@ -20,6 +20,7 @@ from pydantic import (
     ValidationError,
     model_serializer,
     model_validator,
+    StringConstraints,
 )
 
 # Suppress pydantic warnings about schema field shadowing
@@ -68,6 +69,7 @@ class BaseResponse(BaseModel, Generic[T]):
     """Base response structure for all API responses."""
 
     success: bool
+    agent_hints: Optional[List[str]] = None
     data: Optional[T] = None
     error: Optional[str] = None
     warning: Optional[str] = None
@@ -328,6 +330,9 @@ class ProductVariant(BaseModel):
 
     id: Optional[str] = None
     sku: Optional[str] = None
+    gtin: Optional[str] = None
+    mpn: Optional[str] = None
+    condition: Optional[Literal["new", "used", "refurbished", "damaged"]] = None
     title: Optional[str] = None
     values: Optional[Dict[str, Any]] = None
     price: Optional[ProductPrice] = None
@@ -497,6 +502,7 @@ class PdfPage(BaseModel):
 class Document(BaseModel):
     """A scraped document."""
 
+    agent_hints: Optional[List[str]] = None
     markdown: Optional[str] = None
     html: Optional[str] = None
     raw_html: Optional[str] = None
@@ -518,6 +524,7 @@ class Document(BaseModel):
     menu: Optional[MenuProfile] = None
     pages: Optional[List[PdfPage]] = None
     blocks: Optional[List[PdfPageBlocks]] = None
+    tools: Optional[List["DiscoveredTool"]] = None
 
     @property
     def metadata_typed(self) -> DocumentMetadata:
@@ -608,6 +615,8 @@ class WebhookData(BaseModel):
 class Source(BaseModel):
     """Configuration for a search source."""
 
+    model_config = {"extra": "forbid"}
+
     type: str
 
 
@@ -617,11 +626,10 @@ SourceOption = Union[str, Source]
 class Category(BaseModel):
     """Configuration for a search category.
 
-    Categories narrow ordinary **web search**. They do not switch `search()` to
-    a different index.
+    Most categories narrow ordinary **web search**; "developer" and "gov" switch
+    `search()` to their own index.
 
     Supported categories:
-    - "github": Restrict web results to github.com (a `site:` filter)
     - "research": Restrict web results to a fixed list of ~14 academic
       *websites* (arxiv.org, pubmed.ncbi.nlm.nih.gov, nature.com, science.org,
       ieee.org, sciencedirect.com, biorxiv.org, medrxiv.org, ...). This is a
@@ -630,6 +638,11 @@ class Category(BaseModel):
     - "pdf": Filter results to PDF files (adds filetype:pdf to search)
     - "developer": Developer-index results (issues, pull requests, READMEs and
       documentation) served in `web`; cannot be combined with other categories
+    - "gov": Government Index results served in `web`; cannot be combined
+      with other categories
+
+    The "github" category is removed. Use "developer" for GitHub issues, pull
+    requests and READMEs.
 
     .. warning::
        ``categories=["research"]`` is **not** Firecrawl's research paper index.
@@ -691,6 +704,7 @@ class JsonFormat(Format):
     type: Literal["json"] = "json"
     prompt: Optional[str] = None
     schema: Optional[Any] = None
+    # Deprecated: use the top-level ScrapeOptions.check_prompt_injection.
     check_prompt_injection: Optional[bool] = None
 
 
@@ -840,8 +854,12 @@ class ThreatProtectionOptions(BaseModel):
     explicitly provide replace the team policy's values.
     """
 
-    # "off" disables scanning for this request; "normal" applies the policy.
-    mode: Optional[Literal["off", "normal"]] = None
+    # "off" disables scanning for this request; "manual-only" enforces only the
+    # blacklist / whitelist / blocked TLDs (no provider scan, no scan fee);
+    # "normal" scans with Google Web Risk; "zscaler" classifies through your
+    # organization's Zscaler connection. Enforced teams may raise the mode per
+    # request but never lower it.
+    mode: Optional[Literal["off", "manual-only", "normal", "zscaler"]] = None
     # Block verdicts at or above this risk score (integer 0-100).
     risk_score_threshold: Optional[int] = Field(
         default=None, alias="riskScoreThreshold"
@@ -879,7 +897,7 @@ class ScrapeOptions(BaseModel):
     timeout: Optional[int] = None
     wait_for: Optional[int] = None
     mobile: Optional[bool] = None
-    parsers: Optional[Union[List[str], List[Union[str, "PDFParser"]]]] = None
+    parsers: Optional[Union[List[str], List[Union[str, "PDFParser", "ImageParser"]]]] = None
     actions: Optional[
         List[
             Union[
@@ -908,6 +926,12 @@ class ScrapeOptions(BaseModel):
     min_age: Optional[int] = None
     store_in_cache: Optional[bool] = None
     lockdown: Optional[bool] = None
+    # Scans the page content for prompt injection with any format except
+    # rawBase64, before LLM-backed formats run. A detection fails the scrape.
+    # Adds 4 credits when the check scans the whole page.
+    check_prompt_injection: Optional[bool] = Field(
+        default=None, alias="checkPromptInjection"
+    )
     redact_pii: Optional[Union[bool, RedactPIIOptions]] = Field(
         default=None, alias="redactPII"
     )
@@ -919,6 +943,10 @@ class ScrapeOptions(BaseModel):
     )
     profile: Optional[Dict[str, Any]] = None
     integration: Optional[str] = None
+    # Enables Alexandria domain-tool discovery/execution for this scrape.
+    # Omitted from the serialized request entirely when unset or False.
+    domain_tools: Optional[bool] = Field(default=None, alias="domainTools")
+    tool_detail: Optional[Literal["compact", "summary", "full"]] = Field(default=None, alias="toolDetail")
 
     model_config = {"populate_by_name": True}
 
@@ -940,6 +968,21 @@ class ScrapeOptions(BaseModel):
 # Parse accepts a strict subset of scrape options; unsupported fields are
 # rejected by parse-specific request preparation.
 ParseOptions = ScrapeOptions
+
+
+ParseFormatKind = Union[Literal["document", "image"], str]
+
+
+class ParseFormat(BaseModel):
+    """A file format accepted by the parse endpoint."""
+
+    model_config = {"populate_by_name": True}
+
+    format: str
+    kind: ParseFormatKind
+    extensions: List[str]
+    mime_types: List[str] = Field(alias="mimeTypes")
+    available: bool
 
 
 class ScrapeRequest(BaseModel):
@@ -998,12 +1041,14 @@ class CrawlResponse(BaseModel):
 class CrawlJob(BaseModel):
     """Crawl job status and progress data."""
 
+    id: Optional[str] = None
     status: Literal["scraping", "completed", "failed", "cancelled"]
     total: int = 0
     completed: int = 0
     credits_used: int = 0
     expires_at: Optional[datetime] = None
     next: Optional[str] = None
+    warning: Optional[str] = None
     data: List[Document] = []
 
 
@@ -1044,6 +1089,183 @@ class SearchResultImages(BaseModel):
     image_height: Optional[int] = None
     url: Optional[str] = None
     position: Optional[int] = None
+
+
+class ExchangeSearchResult(BaseModel):
+    model_config = {"extra": "allow", "populate_by_name": True}
+
+    provider: str
+    capability: str
+    concept: Optional[str] = None
+    cohorts: List[str] = Field(default_factory=list)
+    credits_cost: Optional[Union[int, float]] = Field(default=None, alias="creditsCost")
+    similarity: Optional[float] = None
+
+
+class DiscoveredTool(ExchangeSearchResult):
+    next: Optional[Dict[str, Any]] = None
+    credits_cost: Optional[int] = Field(default=None, alias="creditsCost")
+    id: Optional[str] = None
+    name: Optional[str] = None
+    description: str
+    per_record: Optional[bool] = Field(default=None, alias="perRecord")
+    options: List[Dict[str, Any]] = Field(default_factory=list)
+    requires_one_of: Optional[List[List[str]]] = Field(default=None, alias="requiresOneOf")
+    response: Dict[str, Any] = Field(default_factory=dict)
+    examples: Dict[str, str] = Field(default_factory=dict)
+    example: Optional[Dict[str, Any]] = None
+    label: Optional[str] = None
+    when_to_use: Optional[str] = Field(default=None, alias="whenToUse")
+    returns: Optional[Any] = None
+    discovery: Optional[Any] = None
+    attribution: Optional[Any] = None
+    matched_by: List[Literal["semantic", "domain"]] = Field(default_factory=list, alias="matchedBy")
+    matched_urls: List[str] = Field(default_factory=list, alias="matchedUrls")
+
+
+class FindToolsData(BaseModel):
+    model_config = {"populate_by_name": True}
+
+    level: Literal["categories", "providers", "groups", "tools"]
+    items: List[Dict[str, Any]]
+    total: int
+    next: Optional[Dict[str, Any]] = None
+    # Meta calls are not scored, so this token is optional to keep.
+    feedback_token: Optional[str] = Field(default=None, alias="feedbackToken")
+
+
+class AlexandriaCall(BaseModel):
+    model_config = {"extra": "forbid"}
+    provider: str
+    capability: str
+    options: Optional[Dict[str, Any]] = None
+
+
+class AlexandriaError(BaseModel):
+    model_config = {"extra": "allow", "populate_by_name": True}
+
+    code: str
+    message: str
+    status: Optional[int] = None
+    charge_id: Optional[str] = Field(default=None, alias="chargeId")
+
+
+class AlexandriaScrapeResult(BaseModel):
+    model_config = {"extra": "allow", "populate_by_name": True}
+
+    provider: Optional[str] = None
+    capability: Optional[str] = None
+    credits_cost: Optional[Union[int, float]] = Field(default=None, alias="creditsCost")
+    data: Any = None
+    records: Optional[int] = None
+    upstream_status: Optional[int] = Field(default=None, alias="upstreamStatus")
+    recorded_at: Optional[str] = Field(default=None, alias="recordedAt")
+    # Opaque token for alexandria_feedback. Absent under zero data retention.
+    feedback_token: Optional[str] = Field(default=None, alias="feedbackToken")
+    error: Optional[AlexandriaError] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+class AlexandriaScrapeData(BaseModel):
+    model_config = {"extra": "allow", "populate_by_name": True}
+
+    scrape_id: Optional[str] = None
+    request_id: Optional[str] = None
+    alexandria: List[AlexandriaScrapeResult] = Field(default_factory=list)
+    credits_cost: Union[int, float] = Field(default=0, alias="creditsCost")
+
+
+AlexandriaFeedbackRating = Literal["good", "partial", "bad"]
+_FeedbackToken = Annotated[str, Field(min_length=1, max_length=1024)]
+_FeedbackText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=2000)]
+
+
+class AlexandriaCallRating(BaseModel):
+    """Rating for one Alexandria call, identified by its feedback token."""
+
+    model_config = {"extra": "forbid"}
+
+    token: _FeedbackToken
+    rating: AlexandriaFeedbackRating
+
+
+class AlexandriaRequestedWebsite(BaseModel):
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    url: str
+    requested_functionality: _FeedbackText = Field(alias="requestedFunctionality")
+
+
+class AlexandriaProviderFeedback(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    name: str
+    issue: Literal["missing_provider", "insufficient_coverage", "provider_unavailable", "other"]
+    why: _FeedbackText
+
+
+class AlexandriaCapabilityFeedback(BaseModel):
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    name: str
+    provider: str
+    issue: Literal[
+        "new_capability_request",
+        "missing_capability",
+        "insufficient_functionality",
+        "incorrect_result",
+        "execution_error",
+        "other",
+    ]
+    why: _FeedbackText
+    requested_functionality: Optional[_FeedbackText] = Field(default=None, alias="requestedFunctionality")
+
+    @model_validator(mode="after")
+    def _require_functionality_for_new_capability(self):
+        if self.issue == "new_capability_request" and self.requested_functionality is None:
+            raise ValueError("requested_functionality is required for new_capability_request")
+        return self
+
+
+class AlexandriaFeedbackRequest(BaseModel):
+    """Feedback for Alexandria calls.
+
+    ``tokens`` lists the calls the session-level ``rating`` covers (at most 20,
+    newest last). ``call_ratings`` rates individual calls (at most 20); a token there
+    need not also be in ``tokens``.
+    """
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    rating: AlexandriaFeedbackRating
+    requested_website: AlexandriaRequestedWebsite = Field(alias="requestedWebsite")
+    rationale: _FeedbackText
+    objective: Optional[_FeedbackText] = None
+    provider_feedback: Optional[List[AlexandriaProviderFeedback]] = Field(
+        default=None, alias="providerFeedback", max_length=20
+    )
+    capability_feedback: Optional[List[AlexandriaCapabilityFeedback]] = Field(
+        default=None, alias="capabilityFeedback", max_length=20
+    )
+    tokens: Optional[List[_FeedbackToken]] = Field(default=None, max_length=20)
+    call_ratings: Optional[List[AlexandriaCallRating]] = Field(
+        default=None, alias="callRatings", max_length=20
+    )
+    integration: Optional[str] = None
+    origin: Optional[str] = None
+
+
+class AlexandriaFeedbackResponse(BaseModel):
+    model_config = {"extra": "allow", "populate_by_name": True}
+
+    success: bool = True
+    feedback_id: Optional[str] = Field(default=None, alias="feedbackId")
+    credits_refunded: Optional[Union[int, float]] = Field(default=None, alias="creditsRefunded")
+    # Tokens that failed verification (expired, other team, or forged).
+    rejected_tokens: Optional[int] = Field(default=None, alias="rejectedTokens")
 
 
 class MapDocument(Document):
@@ -1163,6 +1385,7 @@ class MapRequest(BaseModel):
 class MapData(BaseModel):
     """Map results data."""
 
+    agent_hints: Optional[List[str]] = None
     links: List["SearchResult"]
 
 
@@ -1459,9 +1682,86 @@ class AgentExchangeOptions(BaseModel):
     toolkits: Optional[List[str]] = None
     max_calls: Optional[int] = Field(default=None, alias="maxCalls")
     require_approval: Optional[bool] = Field(default=None, alias="requireApproval")
-    # Answers a pending_approval from the previous turn of the thread.
+    # Answers a pending_approval from the previous turn of the thread. A
+    # "terms" approval is accepted or declined as a whole: callIds and always
+    # are ignored on it.
     approve: Optional[Dict[str, Any]] = None
     decline: Optional[Dict[str, Any]] = None
+    # What to do when a provider the agent would use needs data terms the team
+    # has not accepted. Gated providers are never called in any mode:
+    # - "skip" (server default): answer with accepted providers only and list
+    #   the gated ones in exchange.skipped_providers.
+    # - "ask": the same, plus exchange.requires_action and a "terms"
+    #   pending_approval. Get your user's explicit consent, call terms/accept,
+    #   then continue the thread with approve={"approvalId": ...}.
+    # There is no auto-accept mode. Omitted on a follow-up turn inherits the
+    # previous turn's value.
+    on_terms_required: Optional[Literal["skip", "ask"]] = Field(
+        default=None, alias="onTermsRequired"
+    )
+
+
+class AgentSkippedProvider(BaseModel):
+    """A gated provider the run would have used but did not."""
+
+    model_config = {"populate_by_name": True, "extra": "allow"}
+
+    provider: Optional[str] = None
+    name: Optional[str] = None
+    capability: Optional[str] = None
+    # What it would have added, in the agent's words.
+    adds: Optional[str] = None
+    # "terms_required".
+    reason: Optional[str] = None
+    # The gating terms version.
+    version: Optional[str] = None
+    # Where a person accepts the terms in the dashboard.
+    terms_url: Optional[str] = Field(default=None, alias="termsUrl")
+
+
+class AgentExchangeCall(BaseModel):
+    """An Exchange call spelled out for the caller to make (terms/show, terms/accept)."""
+
+    model_config = {"populate_by_name": True, "extra": "allow"}
+
+    provider: Optional[str] = None
+    capability: Optional[str] = None
+    options: Optional[Dict[str, Any]] = None
+
+
+class AgentTermsActionProvider(BaseModel):
+    """One provider whose terms the caller can view and accept."""
+
+    model_config = {"populate_by_name": True, "extra": "allow"}
+
+    provider: Optional[str] = None
+    name: Optional[str] = None
+    capability: Optional[str] = None
+    adds: Optional[str] = None
+    version: Optional[str] = None
+    # None when the catalog published no digest; terms/show returns it.
+    digest: Optional[str] = None
+    url: Optional[str] = None
+    show: Optional[AgentExchangeCall] = None
+    # Only call this after the user has explicitly agreed to the terms. Its
+    # options.digest is None when the catalog published none; terms/show
+    # returns it.
+    accept: Optional[AgentExchangeCall] = None
+
+
+class AgentTermsRequiredAction(BaseModel):
+    """The exact calls to view and accept gated providers' terms. Never run for you."""
+
+    model_config = {"populate_by_name": True, "extra": "allow"}
+
+    # "accept_terms".
+    type: Optional[str] = None
+    # Always set by the server: the "terms" pending_approval that answers this.
+    # After the user agrees and terms/accept succeeds, continue the thread with
+    # approve={"approvalId": ...}, or refuse with decline. Optional here only so a
+    # malformed payload cannot break status polling.
+    approval_id: Optional[str] = Field(default=None, alias="approvalId")
+    providers: Optional[List[AgentTermsActionProvider]] = None
 
 
 class AgentExchangeSummary(BaseModel):
@@ -1473,8 +1773,17 @@ class AgentExchangeSummary(BaseModel):
     # What the run resolved to after thread inheritance, not what it requested.
     toolkits: Optional[List[str]] = None
     require_approval: Optional[bool] = Field(default=None, alias="requireApproval")
+    on_terms_required: Optional[str] = Field(default=None, alias="onTermsRequired")
     paid_calls: Optional[int] = Field(default=None, alias="paidCalls")
     credits_used: Optional[int] = Field(default=None, alias="creditsUsed")
+    # Gated providers that would have helped and were not used. Any mode.
+    skipped_providers: Optional[List[AgentSkippedProvider]] = Field(
+        default=None, alias="skippedProviders"
+    )
+    # "ask" mode, when a terms offer ended the turn.
+    requires_action: Optional[AgentTermsRequiredAction] = Field(
+        default=None, alias="requiresAction"
+    )
 
 
 class AgentSuggestion(BaseModel):
@@ -1510,16 +1819,48 @@ class PendingApprovalResolution(BaseModel):
     by_run_id: Optional[str] = Field(default=None, alias="byRunId")
 
 
+class PendingApprovalTerms(BaseModel):
+    """A provider in a "terms" pending approval."""
+
+    model_config = {"populate_by_name": True, "extra": "allow"}
+
+    provider: Optional[str] = None
+    name: Optional[str] = None
+    logo: Optional[str] = None
+    capability: Optional[str] = None
+    adds: Optional[str] = None
+    version: Optional[str] = None
+    # None when the catalog published no digest; terms/show returns it.
+    digest: Optional[str] = None
+    url: Optional[str] = None
+
+
 class PendingApproval(BaseModel):
-    """A turn that ended waiting for the caller to allow or refuse paid calls."""
+    """A turn that ended waiting for the caller.
+
+    Two shapes, told apart by ``kind``:
+
+    - calls (``kind`` "calls", or None on items written before terms offers):
+      allow or refuse the paid ``calls``.
+    - terms (``kind`` "terms"): accept the listed providers' data ``terms``;
+      ``calls`` is always empty. Use ``is_terms`` to branch.
+
+    One model rather than a pydantic discriminated union, so an item with an
+    unknown ``kind`` still parses and status polling keeps working.
+    """
 
     model_config = {"populate_by_name": True, "extra": "allow"}
 
     id: Optional[str] = None
+    kind: Optional[str] = None
     reason: Optional[str] = None
     calls: Optional[List[PendingApprovalCall]] = None
+    terms: Optional[List[PendingApprovalTerms]] = None
     resolution: Optional[PendingApprovalResolution] = None
 
+    @property
+    def is_terms(self) -> bool:
+        return self.kind == "terms"
 
 class AgentResponse(BaseModel):
     """Response for agent operations (start/status/final)."""
@@ -1530,6 +1871,10 @@ class AgentResponse(BaseModel):
     id: Optional[str] = None
     status: Optional[Literal["processing", "completed", "failed"]] = None
     data: Optional[Any] = None
+    # Best-effort result on a failed run; never a completed `data` value.
+    partial: Optional[Any] = None
+    partial_schema_valid: Optional[bool] = Field(default=None, alias="partialSchemaValid")
+    stop_reason: Optional[str] = Field(default=None, alias="stopReason")
     error: Optional[str] = None
     # Deliberately a plain str, not a Literal: this is server-provided and new
     # models ship without an SDK release, so a narrow type turns an unknown
@@ -1623,6 +1968,9 @@ class AgentThreadRun(BaseModel):
     message: Optional[str] = None
     # Only present when the request asked for include_data.
     data: Optional[Any] = None
+    partial: Optional[Any] = None
+    partial_schema_valid: Optional[bool] = Field(default=None, alias="partialSchemaValid")
+    stop_reason: Optional[str] = Field(default=None, alias="stopReason")
     suggestions: Optional[List[AgentSuggestion]] = None
     pending_approval: Optional[PendingApproval] = Field(
         default=None, alias="pendingApproval"
@@ -1673,7 +2021,12 @@ class AgentTraceError(BaseModel):
     """Structured error attached to terminal/error trace events."""
 
     code: Literal[
-        "cancelled", "credit_limit_reached", "parent_finished", "refused", "internal"
+        "cancelled",
+        "credit_limit_reached",
+        "insufficient_credits",
+        "parent_finished",
+        "refused",
+        "internal",
     ]
     source: Literal["agent", "tool", "billing", "system"]
     retryable: bool
@@ -1835,6 +2188,9 @@ class AgentTraceResponse(BaseModel):
     active_browser_sessions: Optional[List[AgentTraceActiveBrowserSession]] = Field(
         default=None, alias="activeBrowserSessions"
     )
+    zero_data_retention: Optional[bool] = Field(
+        default=None, alias="zeroDataRetention"
+    )
     error: Optional[str] = None
 
 
@@ -1876,6 +2232,7 @@ class BrowserExecuteResponse(BaseModel):
     stderr: Optional[str] = None
     exit_code: Optional[int] = None
     killed: Optional[bool] = None
+    truncated: Optional[bool] = None
     error: Optional[str] = None
 
 
@@ -1883,6 +2240,7 @@ class BrowserDeleteResponse(BaseModel):
     """Response from deleting a browser session."""
 
     success: bool
+    status: Optional[str] = None
     session_duration_ms: Optional[int] = None
     credits_billed: Optional[int] = None
     error: Optional[str] = None
@@ -2087,6 +2445,15 @@ class PDFParser(BaseModel):
         return folded
 
 
+class ImageParser(BaseModel):
+    """Image parser: OCR raster images (PNG, JPEG, JPEG 2000, TIFF, GIF, BMP,
+    WebP, AVIF) as one-page documents. Part of the default parsers list next to
+    "pdf"; takes no options, so the string "image" is equivalent. Omit it from
+    an explicit list to keep image URLs failing as unsupported files."""
+
+    type: Literal["image"] = "image"
+
+
 # Location types
 class Location(BaseModel):
     """Location configuration for scraping."""
@@ -2164,10 +2531,50 @@ class DeveloperSearchResponse(BaseModel):
     sources: Optional[List[DeveloperSearchSourceStatus]] = None
 
 
+GovSearchCourtType = Literal[
+    "federal-supreme",
+    "federal-appellate",
+    "federal-district",
+    "federal-bankruptcy",
+    "federal-special",
+    "military",
+    "state-supreme",
+    "state-appellate",
+    "state-trial",
+    "state-special",
+    "state-attorney-general",
+]
+
+
+class GovSearchRequest(BaseModel):
+    """Request for the Government Index search endpoint."""
+
+    model_config = {"populate_by_name": True}
+
+    query: str
+    k: Optional[int] = Field(default=None, ge=1, le=100)
+    jurisdiction: Optional[str] = None
+    court: Optional[str] = None
+    court_type: Optional[GovSearchCourtType] = Field(default=None, alias="courtType")
+    cites: Optional[str] = None
+    domain: Optional[str] = None
+
+
+class GovSearchData(BaseModel):
+    web: List[SearchResultWeb]
+
+
+class GovSearchResponse(BaseModel):
+    success: bool
+    data: GovSearchData
+
+
 class SearchRequest(BaseModel):
     """Request for search operations."""
 
     query: str
+    domain_tools: Optional[bool] = Field(default=None, alias="domainTools")
+    tool_detail: Optional[Literal["compact", "summary", "full"]] = Field(default=None, alias="toolDetail")
     sources: Optional[List[SourceOption]] = None
     categories: Optional[List[CategoryOption]] = None
     include_domains: Optional[List[str]] = None
@@ -2175,6 +2582,7 @@ class SearchRequest(BaseModel):
     limit: Optional[int] = 5
     tbs: Optional[str] = None
     location: Optional[str] = None
+    country: Optional[str] = None
     ignore_invalid_urls: Optional[bool] = None
     timeout: Optional[int] = 300000
     highlights: Optional[bool] = None
@@ -2184,6 +2592,8 @@ class SearchRequest(BaseModel):
     enterprise: Optional[List[str]] = None
     threat_protection: Optional[ThreatProtectionOptions] = None
     integration: Optional[str] = None
+
+    model_config = {"populate_by_name": True}
 
     @field_validator("sources")
     @classmethod
@@ -2249,12 +2659,29 @@ class LinkResult(BaseModel):
 SearchResult = LinkResult
 
 
+class SkillCard(BaseModel):
+    """Short skill card returned by the skills search source."""
+
+    model_config = {"extra": "ignore"}
+
+    id: str
+    name: str
+    description: str
+    source: Literal["official", "provider"]
+    provider: Optional[str] = None
+    similarity: Optional[float] = None
+
+
 class SearchData(BaseModel):
     """Search results grouped by source type."""
 
+    agent_hints: Optional[List[str]] = None
+    warning: Optional[str] = None
     web: Optional[List[Union[SearchResultWeb, Document]]] = None
     news: Optional[List[Union[SearchResultNews, Document]]] = None
     images: Optional[List[Union[SearchResultImages, Document]]] = None
+    tools: Optional[List[DiscoveredTool]] = None
+    skills: Optional[List[SkillCard]] = None
 
     @property
     def data(self):
@@ -2265,7 +2692,11 @@ class SearchData(BaseModel):
             parts.append(f".news ({len(self.news)} results)")
         if self.images:
             parts.append(f".images ({len(self.images)} results)")
-        available = ", ".join(parts) if parts else ".web, .news, or .images"
+        if self.tools:
+            parts.append(f".tools ({len(self.tools)} results)")
+        if self.skills:
+            parts.append(f".skills ({len(self.skills)} results)")
+        available = ", ".join(parts) if parts else ".web, .news, .images, .tools, or .skills"
         raise AttributeError(
             f"SearchData has no '.data'. Results are grouped by source: {available}"
         )
@@ -2310,11 +2741,18 @@ class JobStatus(BaseModel):
 class CrawlError(BaseModel):
     """A crawl error."""
 
+    model_config = {"populate_by_name": True}
+
     id: str
     timestamp: Optional[datetime] = None
     url: str
     code: Optional[str] = None
     error: str
+    # Set when the page needs provider terms accepted first:
+    # {"type": "accept_terms", "terms", "version", "url"}.
+    requires_action: Optional[Dict[str, Any]] = Field(
+        default=None, alias="requiresAction"
+    )
 
 
 class CrawlErrorsResponse(BaseModel):

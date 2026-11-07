@@ -7,6 +7,7 @@ import { billTeam } from "../../services/billing/credit_billing";
 import { ExtractOptions } from "../../controllers/v1/types";
 import { CostTracking } from "../cost-tracking";
 import { getACUCTeam } from "../../controllers/auth";
+import { orgIdFromAcuc } from "../team-org";
 import { includesFormat } from "../format-utils";
 export interface DeepResearchServiceOptions {
   researchId: string;
@@ -20,6 +21,8 @@ export interface DeepResearchServiceOptions {
   formats: string[];
   jsonOptions: ExtractOptions;
   apiKeyId: number | null;
+  /** The caller's External-Request-Id, carried on the charge for firebill. */
+  externalRequestId?: string | null;
 }
 
 export async function performDeepResearch(options: DeepResearchServiceOptions) {
@@ -44,8 +47,6 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
     logger,
     options.query,
   );
-  const llmService = new ResearchLLMService(logger);
-
   const acuc = await getACUCTeam(teamId);
 
   const checkTimeLimit = () => {
@@ -61,6 +62,7 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
   };
 
   try {
+    const llmService = new ResearchLLMService(logger, acuc?.flags);
     while (!state.hasReachedMaxDepth() && urlsAnalyzed < maxUrls) {
       logger.debug("[Deep Research] Current depth:", state.getCurrentDepth());
       logger.debug("[Deep Research] URL analysis count:", {
@@ -427,9 +429,15 @@ export async function performDeepResearch(options: DeepResearchServiceOptions) {
     // Bill team for usage based on URLs analyzed
     billTeam(
       teamId,
+      orgIdFromAcuc(acuc),
       credits_billed,
       apiKeyId,
-      { endpoint: "deep_research", jobId: researchId, chargeId: researchId },
+      {
+        endpoint: "deep_research",
+        jobId: researchId,
+        chargeId: researchId,
+        externalRequestId: options.externalRequestId ?? null,
+      },
       logger,
     ).catch(error => {
       logger.error(

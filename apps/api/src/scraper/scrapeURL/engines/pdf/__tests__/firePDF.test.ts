@@ -3,6 +3,8 @@ import {
   reconcilePageCountWithFirePdf,
   scrapePDFWithFirePDF,
 } from "../firePDF";
+import { buildFirePdfJobOptions } from "../fire-pdf/utils";
+import { config } from "../../../../../config";
 
 vi.mock("../../../lib/fetch", () => ({
   robustFetch: vi.fn(),
@@ -22,6 +24,7 @@ function makeMeta() {
     id: "sync-page-markdown-test",
     url: "https://example.com/file.pdf",
     rewrittenUrl: undefined,
+    options: {},
     logger,
     mock: null,
     abort: {
@@ -35,6 +38,118 @@ function makeMeta() {
     },
   } as any;
 }
+
+describe("scrapePDFWithFirePDF request metadata", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedRobustFetch.mockResolvedValue({
+      markdown: "Document",
+      failed_pages: null,
+      pages_processed: 1,
+    } as any);
+  });
+
+  it.each([
+    [
+      "original URL",
+      {},
+      {},
+      { source_endpoint: "scrape", url: "https://example.com/file.pdf" },
+    ],
+    [
+      "rewritten URL",
+      { rewrittenUrl: "https://example.com/download/file.pdf" },
+      {},
+      {
+        source_endpoint: "scrape",
+        url: "https://example.com/download/file.pdf",
+      },
+    ],
+    ["empty URL", { url: "" }, {}, { source_endpoint: "scrape", url: "" }],
+    [
+      "non-HTTP URL",
+      { url: "file:///document.pdf" },
+      {},
+      { source_endpoint: "scrape", url: "file:///document.pdf" },
+    ],
+    [
+      "unmodified source value",
+      { url: "  document source  " },
+      {},
+      { source_endpoint: "scrape", url: "  document source  " },
+    ],
+    ["ZDR", {}, { zeroDataRetention: true }, { source_endpoint: "scrape" }],
+    ["parse", {}, { isParse: true }, { source_endpoint: "parse" }],
+    [
+      "uploaded file",
+      {},
+      {
+        uploadedFile: {
+          buffer: Buffer.from("document"),
+          filename: "document.pdf",
+        },
+      },
+      { source_endpoint: "parse" },
+    ],
+  ] as const)(
+    "sends source metadata for %s",
+    async (_name, overrides, internalOptions, expected) => {
+      const meta = { ...makeMeta(), ...overrides };
+      meta.internalOptions = {
+        ...meta.internalOptions,
+        zeroDataRetention: false,
+        ...internalOptions,
+      };
+
+      await scrapePDFWithFirePDF(meta, "BASE64", 1);
+
+      const body = mockedRobustFetch.mock.calls[0][0].body as Record<
+        string,
+        unknown
+      >;
+      expect(body).toMatchObject({
+        source: "firecrawl",
+        source_request_context: "default",
+        ...expected,
+      });
+      expect(Object.hasOwn(body, "url")).toBe(Object.hasOwn(expected, "url"));
+    },
+  );
+
+  it.each([
+    ["empty options", {}, "default"],
+    ["empty headers and actions", { headers: {}, actions: [] }, "default"],
+    ["header", { headers: { "X-Example": "example-value" } }, "custom"],
+    ["empty header value", { headers: { "X-Example": "" } }, "custom"],
+    ["cookie header", { headers: { Cookie: "example=value" } }, "custom"],
+    ["action", { actions: [{ type: "wait", milliseconds: 1 }] }, "custom"],
+    ["profile", { profile: { name: "example-profile" } }, "custom"],
+    [
+      "profile without saving changes",
+      { profile: { name: "example-profile", saveChanges: false } },
+      "custom",
+    ],
+  ] as const)(
+    "describes %s without forwarding option values",
+    async (_name, options, expected) => {
+      const meta = { ...makeMeta(), options };
+
+      await scrapePDFWithFirePDF(meta, "BASE64", 1);
+
+      const body = mockedRobustFetch.mock.calls[0][0].body as Record<
+        string,
+        unknown
+      >;
+      expect(body.source_request_context).toBe(expected);
+      expect(body).not.toHaveProperty("headers");
+      expect(body).not.toHaveProperty("actions");
+      expect(body).not.toHaveProperty("profile");
+      expect(JSON.stringify(body)).not.toContain("example-value");
+      expect(JSON.stringify(body)).not.toContain("example=value");
+      expect(JSON.stringify(body)).not.toContain("example-profile");
+    },
+  );
+});
 
 describe("reconcilePageCountWithFirePdf", () => {
   it("uses fire-pdf's count when the upstream pass left it at 0", () => {
@@ -311,5 +426,81 @@ describe("scrapePDFWithFirePDF page markers", () => {
         }),
       }),
     );
+  });
+});
+
+describe("FirePDF table format", () => {
+  const originalTableFormat = config.PARSE_FIRE_PDF_TABLE_FORMAT;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockedRobustFetch.mockResolvedValue({
+      markdown: "Document",
+      failed_pages: null,
+      pages_processed: 1,
+    } as any);
+  });
+
+  afterEach(() => {
+    (config as any).PARSE_FIRE_PDF_TABLE_FORMAT = originalTableFormat;
+  });
+
+  it.each([
+    ["parse", { isParse: true }, "dynamic", "dynamic"],
+    ["parse with html", { isParse: true }, "html", "html"],
+    ["parse with the format off", { isParse: true }, "off", undefined],
+    ["scrape", {}, "dynamic", undefined],
+  ] as const)(
+    "sends the configured format for %s",
+    async (_name, internalOptions, configured, expected) => {
+      (config as any).PARSE_FIRE_PDF_TABLE_FORMAT = configured;
+      const meta = makeMeta();
+      meta.internalOptions = { ...meta.internalOptions, ...internalOptions };
+
+      await scrapePDFWithFirePDF(meta, "BASE64", 1);
+
+      const body = mockedRobustFetch.mock.calls[0][0].body as Record<
+        string,
+        unknown
+      >;
+      expect(body.tableFormat).toBe(expected);
+      expect(Object.hasOwn(body, "tableFormat")).toBe(expected !== undefined);
+    },
+  );
+
+  it("puts the format in async job options only when set", () => {
+    const trainingCapture = {
+      eligible: true,
+      policy_ref: "firecrawl-org-training-v1",
+      decision_ref: "eligible",
+    } as const;
+    const base = {
+      maxPages: undefined,
+      pagesProcessed: 2,
+      mode: "auto" as const,
+      includePageMarkdown: false,
+      includeBlocks: false,
+      pageMarkers: false,
+      trainingCapture,
+      dataRegion: undefined,
+    };
+    expect(buildFirePdfJobOptions({ ...base, tableFormat: "dynamic" })).toEqual(
+      {
+        pages_estimate: 2,
+        mode: "auto",
+        tableFormat: "dynamic",
+        training_capture: trainingCapture,
+      },
+    );
+    expect(buildFirePdfJobOptions({ ...base, tableFormat: undefined })).toEqual(
+      { pages_estimate: 2, mode: "auto", training_capture: trainingCapture },
+    );
+    expect(
+      buildFirePdfJobOptions({
+        ...base,
+        tableFormat: undefined,
+        trainingCapture: undefined,
+      }),
+    ).toEqual({ pages_estimate: 2, mode: "auto" });
   });
 });

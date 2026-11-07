@@ -2,7 +2,14 @@ import type { Meta } from "../../..";
 import type { PDFMode } from "../../../../../controllers/v2/types";
 import { fetch as undiciFetch } from "undici";
 import { AbortManagerThrownError } from "../../../lib/abortManager";
+import { isUsOnly, US_DATA_REGION } from "../../../../../lib/us-only";
 import {
+  buildFirePdfJobTrainingCapture,
+  buildFirePdfRequestMetadata,
+  firePdfTableFormat,
+} from "./request-metadata";
+import {
+  firePdfAsyncSubmit503Total,
   firePdfAsyncSubmitRetriesTotal,
   firePdfAsyncSubmittedTotal,
   type SubmitRetryTrigger,
@@ -112,6 +119,7 @@ export async function submitJob(args: SubmitArgs): Promise<SubmitOutcome> {
     fetchImpl,
   } = args;
   const scrapeId = meta.id;
+  const usOnly = isUsOnly(meta.internalOptions.teamFlags ?? undefined);
 
   if (
     input.kind === "byReference" &&
@@ -131,6 +139,7 @@ export async function submitJob(args: SubmitArgs): Promise<SubmitOutcome> {
       : { input_gcs_uri: input.gcsUri, input_sha256: input.sha256 }),
     scrape_id: scrapeId,
     source: "firecrawl" as const,
+    ...buildFirePdfRequestMetadata(meta),
     zdr: false as const,
     deadline_at: deadlineAt,
     ...(meta.internalOptions.teamId && {
@@ -154,6 +163,9 @@ export async function submitJob(args: SubmitArgs): Promise<SubmitOutcome> {
       includePageMarkdown,
       includeBlocks,
       pageMarkers,
+      tableFormat: firePdfTableFormat(meta),
+      trainingCapture: buildFirePdfJobTrainingCapture(meta),
+      dataRegion: usOnly ? US_DATA_REGION : undefined,
     }),
   };
 
@@ -221,7 +233,14 @@ export async function submitJob(args: SubmitArgs): Promise<SubmitOutcome> {
   if (status === 413) failAsync(meta, "http_413");
   if (status === 429) failAsync(meta, "http_429");
   if (status === 502) failAsync(meta, "http_502", { body: json });
-  if (status === 503) failAsync(meta, "http_503");
+  if (status === 503) {
+    // Keep fire-pdf's own code (page_markdown_not_ready, admission_rejected,
+    // ...) so the 503 bucket can be split without the request body.
+    const parsed503 = firePdfSubmit503BodySchema.safeParse(json);
+    const code = parsed503.success ? parsed503.data.error : "unattributed";
+    firePdfAsyncSubmit503Total.labels(code).inc();
+    failAsync(meta, "http_503", { code });
+  }
 
   if (status === 409) {
     meta.logger.error(
@@ -244,7 +263,13 @@ export async function submitJob(args: SubmitArgs): Promise<SubmitOutcome> {
         body: json,
       },
     );
-    throw new Error("fire-pdf async POST /jobs validation error");
+    // Counted like every other exit from the async path, with fire-pdf's
+    // validation code, so 400s appear in the fallback metric.
+    const code =
+      typeof (json as { error?: unknown } | null)?.error === "string"
+        ? (json as { error: string }).error
+        : "unattributed";
+    failAsync(meta, "http_400", { code });
   }
 
   if (status !== 200 && status !== 202) {

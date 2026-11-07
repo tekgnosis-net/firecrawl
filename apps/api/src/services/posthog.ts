@@ -1,52 +1,9 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { redisEvictConnection } from "./redis";
 import { dbRr } from "../db/connection";
 import * as schema from "../db/schema";
 import { logger as _logger } from "../lib/logger";
-
-/**
- * Lightweight, dependency-free PostHog capture for the API.
- *
- * The API has no PostHog SDK wired up, so we POST directly to the capture
- * endpoint. Everything here is best-effort and fire-and-forget: a missing key
- * or a network error must never affect request handling.
- *
- * Configure via env:
- *   POSTHOG_API_KEY  — project API key (if unset, capture is a no-op)
- *   POSTHOG_HOST     — ingestion host (defaults to https://us.i.posthog.com)
- */
-const POSTHOG_API_KEY = process.env.POSTHOG_API_KEY;
-const POSTHOG_HOST = process.env.POSTHOG_HOST || "https://us.i.posthog.com";
-
-function capturePostHog(
-  event: string,
-  distinctId: string,
-  properties: Record<string, unknown> = {},
-): void {
-  if (!POSTHOG_API_KEY) return;
-
-  // Fire-and-forget — do not await in the request path, never throw.
-  void (async () => {
-    try {
-      await fetch(`${POSTHOG_HOST.replace(/\/$/, "")}/capture/`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          api_key: POSTHOG_API_KEY,
-          event,
-          distinct_id: distinctId,
-          properties,
-        }),
-      });
-    } catch (error) {
-      _logger.debug("PostHog capture failed", {
-        module: "posthog",
-        event,
-        error,
-      });
-    }
-  })();
-}
+import { capturePostHog, isPostHogCaptureEnabled } from "./posthog-capture";
 
 /** Normalized request surface, derived from the `origin` + `integration` fields. */
 type RequestSurface =
@@ -91,11 +48,11 @@ function originToSurface(
  * events to the same person we key on the API key owner's email. Falls back to
  * the team_id (team-level) when the owner/email can't be resolved.
  *
- * Only called on the rare gated-first event, so the extra read is cheap.
+ * Only called on rare, deduplicated events, so the extra read is cheap.
  */
 async function resolveDistinctId(
   teamId: string,
-  apiKeyId?: number | null,
+  apiKeyId?: string | number | null,
 ): Promise<string> {
   if (!apiKeyId) return teamId;
   try {
@@ -107,7 +64,9 @@ async function resolveDistinctId(
       // team's milestone to another team's owner email — falls back to teamId.
       .where(
         and(
-          eq(schema.api_keys.id, apiKeyId),
+          // Compared as text cast to bigint, so an id past the safe-integer
+          // range (passed as its exact decimal string) is matched exactly.
+          sql`${schema.api_keys.id} = cast(${String(apiKeyId)} as bigint)`,
           eq(schema.api_keys.team_id, teamId),
         ),
       )
@@ -161,7 +120,7 @@ export function trackFirstSurfaceUse(args: {
   // No PostHog key → capture is a no-op. Bail BEFORE the Redis SETNX so we don't
   // burn the dedup marker without emitting (which would lose the milestone for
   // good once PostHog is enabled).
-  if (!POSTHOG_API_KEY) return;
+  if (!isPostHogCaptureEnabled()) return;
 
   // Skip anonymous / preview traffic — not a real team milestone.
   if (!teamId || teamId === "preview" || teamId.startsWith("preview_")) return;
@@ -181,7 +140,7 @@ export function trackFirstSurfaceUse(args: {
         resolveOrgId(teamId),
       ]);
 
-      capturePostHog("api_surface_first_used", distinctId, {
+      const sent = await capturePostHog("api_surface_first_used", distinctId, {
         surface,
         raw_origin: origin ?? null,
         raw_integration: integration ?? null,
@@ -192,6 +151,8 @@ export function trackFirstSurfaceUse(args: {
         // `company` ($group_0) groups for group-level analysis.
         $groups: { team: teamId, ...(orgId ? { company: orgId } : {}) },
       });
+      // A rejected capture must not use up the one-time milestone.
+      if (!sent) await redisEvictConnection.del(key);
     } catch (error) {
       _logger.debug("trackFirstSurfaceUse failed", {
         module: "posthog",

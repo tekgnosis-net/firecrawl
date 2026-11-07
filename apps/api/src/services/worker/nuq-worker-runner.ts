@@ -1,10 +1,13 @@
 import { config } from "../../config";
+import { withZeroDataRetention } from "../../lib/otel-tracer";
+import { shutdownTracing } from "../../otel";
 import { logger as _logger } from "../../lib/logger";
 import { jobDurationSeconds } from "../../lib/job-metrics";
 import { processJobInternal } from "./scrape-worker";
 import { NuQJob } from "./nuq";
 import { register } from "prom-client";
 import Express from "express";
+import { startNodeRuntimeMetrics } from "../../lib/node-runtime-metrics";
 import { initializeBlocklist } from "../../scraper/WebScraper/utils/blocklist";
 import { initializeEngineForcing } from "../../scraper/WebScraper/utils/engine-forcing";
 import { shutdownPubSubLogging } from "../logging/log_job";
@@ -72,6 +75,7 @@ export async function runNuqWorker(options: {
   let shutdownStartedAt: number | undefined;
 
   const app = Express();
+  startNodeRuntimeMetrics();
 
   app.get("/metrics", async (_, res) => {
     const localMetrics = options.metrics ? await options.metrics() : "";
@@ -175,35 +179,43 @@ export async function runNuqWorker(options: {
 
     clearInterval(lockRenewInterval);
 
-    if (processResult.ok) {
-      endJobTimer({ status: "success" });
-      if (
-        !(await options.queue.jobFinish(
-          job.id,
-          job.lock!,
-          processResult.data,
-          logger,
-        ))
-      ) {
-        logger.warn("Could not update job status");
+    // The job span has ended by now; keep the queue bookkeeping (which records
+    // the failure reason) unrecorded for zero-data-retention jobs too.
+    const zeroDataRetention =
+      (job.data as { zeroDataRetention?: boolean } | undefined)
+        ?.zeroDataRetention === true;
+
+    await withZeroDataRetention(zeroDataRetention, async () => {
+      if (processResult.ok) {
+        endJobTimer({ status: "success" });
+        if (
+          !(await options.queue.jobFinish(
+            job.id,
+            job.lock!,
+            processResult.data,
+            logger,
+          ))
+        ) {
+          logger.warn("Could not update job status");
+        }
+      } else {
+        endJobTimer({ status: "failed" });
+        if (
+          !(await options.queue.jobFail(
+            job.id,
+            job.lock!,
+            processResult.error instanceof Error
+              ? processResult.error.message
+              : typeof processResult.error === "string"
+                ? processResult.error
+                : JSON.stringify(processResult.error),
+            logger,
+          ))
+        ) {
+          logger.warn("Could not update job status");
+        }
       }
-    } else {
-      endJobTimer({ status: "failed" });
-      if (
-        !(await options.queue.jobFail(
-          job.id,
-          job.lock!,
-          processResult.error instanceof Error
-            ? processResult.error.message
-            : typeof processResult.error === "string"
-              ? processResult.error
-              : JSON.stringify(processResult.error),
-          logger,
-        ))
-      ) {
-        logger.warn("Could not update job status");
-      }
-    }
+    });
   }
 
   _logger.info("NuQ worker shutting down", {
@@ -215,6 +227,7 @@ export async function runNuqWorker(options: {
     await options.beforeShutdown?.();
     await options.shutdown?.();
     await shutdownPubSubLogging();
+    await shutdownTracing();
     _logger.info("NuQ worker shut down", { module: options.serviceName });
     process.exit(0);
   });

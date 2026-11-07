@@ -33,6 +33,8 @@ def _prepare_agent_request(
     thread_id: Optional[str] = None,
     mode: Optional[Literal["extract", "chat"]] = None,
     exchange: Optional[Union[AgentExchangeOptions, Dict[str, Any]]] = None,
+    location: Optional[Dict[str, str]] = None,
+    zero_data_retention: Optional[bool] = None,
 ) -> Dict[str, Any]:
     body: Dict[str, Any] = {}
     if urls is not None:
@@ -78,6 +80,10 @@ def _prepare_agent_request(
             if isinstance(exchange, dict)
             else exchange.model_dump(by_alias=True, exclude_none=True)
         )
+    if location is not None:
+        body["location"] = {"country": location["country"]}
+    if zero_data_retention is not None:
+        body["zeroDataRetention"] = zero_data_retention
     return body
 
 
@@ -107,6 +113,8 @@ async def start_agent(
     thread_id: Optional[str] = None,
     mode: Optional[Literal["extract", "chat"]] = None,
     exchange: Optional[Union[AgentExchangeOptions, Dict[str, Any]]] = None,
+    location: Optional[Dict[str, str]] = None,
+    zero_data_retention: Optional[bool] = None,
 ) -> AgentResponse:
     body = _prepare_agent_request(
         urls,
@@ -123,9 +131,11 @@ async def start_agent(
         thread_id=thread_id,
         mode=mode,
         exchange=exchange,
+        location=location,
+        zero_data_retention=zero_data_retention,
     )
     resp = await client.post("/v2/agent", body)
-    if not resp.ok:
+    if resp.status_code >= 400:
         handle_response_error(resp, "agent")
     payload = _normalize_agent_response_payload(resp.json())
     return AgentResponse(**payload)
@@ -133,7 +143,7 @@ async def start_agent(
 
 async def get_agent_status(client: AsyncHttpClient, job_id: str) -> AgentResponse:
     resp = await client.get(f"/v2/agent/{job_id}")
-    if not resp.ok:
+    if resp.status_code >= 400:
         handle_response_error(resp, "agent-status")
     payload = _normalize_agent_response_payload(resp.json())
     return AgentResponse(**payload)
@@ -202,6 +212,8 @@ async def agent(
     thread_id: Optional[str] = None,
     mode: Optional[Literal["extract", "chat"]] = None,
     exchange: Optional[Union[AgentExchangeOptions, Dict[str, Any]]] = None,
+    location: Optional[Dict[str, str]] = None,
+    zero_data_retention: Optional[bool] = None,
 ) -> AgentResponse:
     started = await start_agent(
         client,
@@ -219,6 +231,8 @@ async def agent(
         thread_id=thread_id,
         mode=mode,
         exchange=exchange,
+        location=location,
+        zero_data_retention=zero_data_retention,
     )
     job_id = getattr(started, "id", None)
     if not job_id:
@@ -243,7 +257,7 @@ async def get_agent_trace(
     if live_view:
         endpoint += "?liveView=true"
     resp = await client.get(endpoint)
-    if not resp.ok:
+    if resp.status_code >= 400:
         handle_response_error(resp, "agent-trace")
     return AgentTraceResponse(**resp.json())
 
@@ -283,7 +297,7 @@ async def get_agent_snapshot(
         snapshot_id: Snapshot ID from an artifact.updated trace event
     """
     resp = await client.get(f"/v2/agent/{job_id}/snapshots/{snapshot_id}")
-    if not resp.ok:
+    if resp.status_code >= 400:
         handle_response_error(resp, "agent-snapshot")
     return AgentSnapshotResponse(**resp.json())
 
@@ -303,6 +317,6 @@ async def cancel_agent(client: AsyncHttpClient, job_id: str) -> bool:
         Exception: If the cancellation fails
     """
     resp = await client.delete(f"/v2/agent/{job_id}")
-    if not resp.ok:
+    if resp.status_code >= 400:
         handle_response_error(resp, "cancel agent")
     return resp.json().get("success", False)
