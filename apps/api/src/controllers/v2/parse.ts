@@ -1,5 +1,6 @@
 import { NextFunction, Request, Response } from "express";
 import { config } from "../../config";
+import { timingSafeSecretEqual } from "../../lib/secret-compare";
 import { logger as _logger } from "../../lib/logger";
 import {
   Document,
@@ -24,7 +25,6 @@ import { getJobPriority } from "../../lib/job-priority";
 import { logRequest } from "../../services/logging/log_job";
 import { externalRequestId } from "../../lib/external-request-id";
 import { getErrorContactMessage } from "../../lib/deployment";
-import { captureExceptionWithZdrCheck } from "../../services/sentry";
 import type { BillingMetadata } from "../../services/billing/types";
 import { getScrapeZDR } from "../../lib/zdr-helpers";
 import {
@@ -35,7 +35,6 @@ import {
 } from "../../lib/keyless";
 import { projectScrapeCredits } from "../../lib/keyless-credit-projection";
 import { applyAgentAuthDiscoveryHeader } from "../../lib/agent-auth-discovery";
-import { getEffectiveConcurrencyLimit } from "../../lib/concurrency-limit";
 import path from "node:path";
 import {
   DOCUMENT_EXTENSIONS,
@@ -47,17 +46,25 @@ import {
 } from "../../lib/image-formats";
 import { isImageOcrEnabled } from "../../lib/image-ocr-gate";
 import { isAgentInteropSecretValid } from "../../lib/agent-interop";
+import {
+  HTML_CONTENT_TYPES,
+  HTML_EXTENSIONS,
+  listParseFormats,
+  PDF_CONTENT_TYPES,
+  PDF_EXTENSIONS,
+} from "../../lib/parse-formats";
+import { DEFAULT_TEAM_LIMITS } from "../../services/autumn/autumn.service";
 
 const AGENT_INTEROP_CONCURRENCY_BOOST = 3;
-const BASE_PARSE_FILE_TYPES =
-  ".html, .htm, .xhtml, .pdf, .docx, .doc, .docm, .odt, .ods, .odp, .rtf, .xlsx, .xls, .xlsm, .xlsb, .pptx, .ppt, .pptm, .epub, .csv";
 
 /** Image uploads are OCR'd through FirePDF, so they are only advertised as
  * supported for teams with image OCR enabled (matching
  * detectUploadedFileKind). */
 export function getSupportedParseFileTypes(imageOcrEnabled: boolean): string {
-  if (!imageOcrEnabled) return BASE_PARSE_FILE_TYPES;
-  return `${BASE_PARSE_FILE_TYPES}, ${[...IMAGE_EXTENSIONS].sort().join(", ")}`;
+  return listParseFormats(imageOcrEnabled)
+    .filter(format => format.available)
+    .flatMap(format => format.extensions)
+    .join(", ");
 }
 
 export function detectUploadedFileKind(
@@ -69,9 +76,10 @@ export function detectUploadedFileKind(
   const normalizedType = contentType?.toLowerCase() ?? "";
 
   const isPdf =
-    extension === ".pdf" ||
-    normalizedType === "application/pdf" ||
-    normalizedType.startsWith("application/pdf;");
+    PDF_EXTENSIONS.includes(extension) ||
+    PDF_CONTENT_TYPES.some(
+      type => normalizedType === type || normalizedType.startsWith(`${type};`),
+    );
 
   if (isPdf) {
     return "pdf";
@@ -85,8 +93,8 @@ export function detectUploadedFileKind(
     return "document";
   }
 
-  // Image uploads are OCR'd through FirePDF for teams with the imageOcr
-  // flag; for everyone else they stay unsupported.
+  // Image uploads are OCR'd through FirePDF where the deployment has image
+  // OCR on (lib/image-ocr-gate.ts); otherwise they stay unsupported.
   const isImage =
     imageOcrEnabled &&
     (IMAGE_EXTENSIONS.has(extension) ||
@@ -97,11 +105,8 @@ export function detectUploadedFileKind(
   }
 
   const isHtml =
-    extension === ".html" ||
-    extension === ".htm" ||
-    extension === ".xhtml" ||
-    normalizedType.includes("text/html") ||
-    normalizedType.includes("application/xhtml+xml");
+    HTML_EXTENSIONS.includes(extension) ||
+    HTML_CONTENT_TYPES.some(type => normalizedType.includes(type));
 
   if (isHtml) {
     return "html";
@@ -259,11 +264,7 @@ export function parseMultipartPayloadMiddleware(
     }
   }
 
-  // authMiddleware runs before this middleware, so the team's flags are
-  // available to decide whether image uploads are accepted.
-  const imageOcrEnabled = isImageOcrEnabled(
-    (req as unknown as RequestWithAuth).acuc?.flags,
-  );
+  const imageOcrEnabled = isImageOcrEnabled();
   const kind = detectUploadedFileKind(
     file.originalname || "",
     file.mimetype,
@@ -295,6 +296,12 @@ export async function parseController(
   req: RequestWithAuth<{}, ScrapeResponse, ParseRequest>,
   res: Response<ScrapeResponse>,
 ) {
+  // Resolved before the root span starts so the whole request trace stays
+  // unrecorded for zero-data-retention requests (see otel-tracer).
+  const zeroDataRetentionTrace =
+    getScrapeZDR(req.acuc?.flags) === "forced" ||
+    req.body?.zeroDataRetention === true;
+
   return withSpan(
     "api.parse.request",
     async span => {
@@ -355,6 +362,7 @@ export async function parseController(
         });
         return res.status(403).json({
           success: false,
+          code: permissions.code,
           error: permissions.error,
         });
       }
@@ -362,9 +370,13 @@ export async function parseController(
       const zeroDataRetention =
         getScrapeZDR(req.acuc?.flags) === "forced" ||
         (req.body.zeroDataRetention ?? false);
-      const billing: BillingMetadata = req.body.__agentInterop
-        ? { endpoint: "agent" as const, jobId }
-        : { endpoint: "parse" as const, jobId };
+      const billing: BillingMetadata = {
+        ...(req.body.__agentInterop
+          ? { endpoint: "agent" as const, jobId }
+          : { endpoint: "parse" as const, jobId }),
+        externalRequestId: externalRequestId(req),
+        hostedMcp: req.auth.hostedMcp,
+      };
 
       if (
         req.body.__agentInterop &&
@@ -386,9 +398,10 @@ export async function parseController(
       const agentRequestId = req.body.__agentInterop?.requestId ?? null;
       const boostConcurrency =
         req.body.__agentInterop?.boostConcurrency ?? false;
-      const isDirectToBullMQ =
-        config.SEARCH_PREVIEW_TOKEN !== undefined &&
-        config.SEARCH_PREVIEW_TOKEN === req.body.__searchPreviewToken;
+      const isDirectToBullMQ = timingSafeSecretEqual(
+        req.body.__searchPreviewToken,
+        config.SEARCH_PREVIEW_TOKEN,
+      );
       const projectedKeylessCredits =
         shouldBill && !isDirectToBullMQ
           ? projectScrapeCredits(
@@ -409,7 +422,7 @@ export async function parseController(
           applyAgentAuthDiscoveryHeader(res);
           return res
             .status(429)
-            .json(await keylessLimitBody(req.auth.team_id, "v2_parse"));
+            .json(await keylessLimitBody(req.auth.team_id, "v2_parse", req));
         }
         reservedKeylessCredits = projectedKeylessCredits;
       }
@@ -478,10 +491,8 @@ export async function parseController(
         }
         req.on("close", () => aborter.abort());
 
-        const baseConcurrency = await getEffectiveConcurrencyLimit(
-          req.auth.team_id,
-          req.acuc?.org_id,
-        );
+        const baseConcurrency =
+          req.acuc?.concurrency_limit ?? DEFAULT_TEAM_LIMITS.concurrency_limit;
         const concurrency = boostConcurrency
           ? baseConcurrency * AGENT_INTEROP_CONCURRENCY_BOOST
           : baseConcurrency;
@@ -495,6 +506,7 @@ export async function parseController(
           async limited => {
             const jobPriority = await getJobPriority({
               team_id: req.auth.team_id,
+              acuc: req.acuc,
               basePriority: 10,
             });
 
@@ -640,6 +652,17 @@ export async function parseController(
             });
           }
 
+          if (e.code === "US_ONLY_UNAVAILABLE") {
+            setSpanAttributes(span, {
+              "parse.status_code": 403,
+            });
+            return res.status(403).json({
+              success: false,
+              code: e.code,
+              error: e.message,
+            });
+          }
+
           const statusCode = timeoutErr ? 408 : 500;
           setSpanAttributes(span, {
             "parse.status_code": statusCode,
@@ -657,18 +680,6 @@ export async function parseController(
             errorId: id,
             path: req.path,
             teamId: req.auth.team_id,
-          });
-          captureExceptionWithZdrCheck(e, {
-            tags: {
-              errorId: id,
-              version: "v2",
-              teamId: req.auth.team_id,
-            },
-            extra: {
-              path: req.path,
-              fileName: req.body.file.filename,
-            },
-            zeroDataRetention,
           });
           setSpanAttributes(span, {
             "parse.status_code": 500,
@@ -723,7 +734,8 @@ export async function parseController(
         !!hasFormatOfType(req.body.formats, "summary") ||
         !!hasFormatOfType(req.body.formats, "question") ||
         !!hasFormatOfType(req.body.formats, "highlights") ||
-        !!hasFormatOfType(req.body.formats, "query");
+        !!hasFormatOfType(req.body.formats, "query") ||
+        req.body.checkPromptInjection;
 
       if (!usedLlm) {
         const ct = hasFormatOfType(req.body.formats, "changeTracking");
@@ -771,6 +783,7 @@ export async function parseController(
         "http.route": "/v2/parse",
       },
       kind: SpanKind.SERVER,
+      zeroDataRetention: zeroDataRetentionTrace,
     },
   );
 }

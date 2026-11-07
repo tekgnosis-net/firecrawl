@@ -1,17 +1,19 @@
 import { Response } from "express";
 import { config } from "../../config";
-import { supabaseGetAgentRequestByIdDirect } from "../../lib/supabase-jobs";
+import { getAgentJobAccess } from "../../lib/operational-job-access";
 import { AgentSkillResponse, RequestWithAuth } from "./types";
 
 export async function agentSkillController(
   req: RequestWithAuth<{ jobId: string }, AgentSkillResponse, any>,
   res: Response<AgentSkillResponse>,
 ) {
-  const agentRequest = await supabaseGetAgentRequestByIdDirect(
-    req.params.jobId,
-  );
+  const access = await getAgentJobAccess(req.params.jobId);
 
-  if (!agentRequest || agentRequest.team_id !== req.auth.team_id) {
+  if (
+    !access ||
+    access.expiresAtMs <= Date.now() ||
+    access.teamId !== req.auth.team_id
+  ) {
     return res.status(404).json({
       success: false,
       error: "Agent job not found",
@@ -34,8 +36,9 @@ export async function agentSkillController(
 
   const body = (await upstream.json()) as AgentSkillResponse;
 
-  // 404 (skills off, or nothing stored) and 409 (run still going, or it
-  // produced no data) both mean "no skill yet" to the caller, so the upstream
-  // status carries through rather than collapsing into a 500.
+  // 404 (skills off, or nothing stored), 409 (run still going, or it produced
+  // no data) and 410 (a zero data retention run past its retention window)
+  // all mean "no skill" to the caller, so the upstream status carries through
+  // rather than collapsing into a 500.
   return res.status(upstream.status).json(body);
 }

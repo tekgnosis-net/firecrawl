@@ -537,7 +537,6 @@ def prepare_scrape_options(options: Optional[ScrapeOptions]) -> Optional[Dict[st
     default_values = {
         "only_main_content": True,
         "mobile": False,
-        "skip_tls_verification": True,
         "remove_base64_images": True,
         "fast_mode": False,
         "block_ads": True,
@@ -570,6 +569,7 @@ def prepare_scrape_options(options: Optional[ScrapeOptions]) -> Optional[Dict[st
         "max_age": "maxAge",
         "min_age": "minAge",
         "redact_pii": "redactPII",
+        "check_prompt_injection": "checkPromptInjection",
         "threat_protection": "threatProtection",
         "audit_metadata": "auditMetadata",
     }
@@ -814,6 +814,12 @@ def prepare_scrape_options(options: Optional[ScrapeOptions]) -> Optional[Dict[st
                     scrape_data["location"] = value
                 else:
                     scrape_data["location"] = value.model_dump(exclude_none=True)
+            elif key == "tool_detail":
+                scrape_data["toolDetail"] = value
+            elif key == "domain_tools":
+                # Only ever sent when explicitly enabled; never emit `false`.
+                if value:
+                    scrape_data["domainTools"] = True
             elif key == "profile":
                 if isinstance(value, dict):
                     profile_data = {

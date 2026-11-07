@@ -19,6 +19,11 @@
 #   2  result=conflict  non-deterministic conflict — human needed
 #   2  result=buildfail merge applied but tsc failed — human needed
 #
+# Extra outputs: `behind` (upstream commits not yet in the base branch) always;
+# `conflicts` (multi-line `git status --porcelain` rows of the paths left
+# unmerged) on result=conflict. The workflow puts both in the escalation issue
+# so the diagnosis outlives the run log's retention window.
+#
 # Env overrides: UPSTREAM_URL, UPSTREAM_BRANCH, BASE_BRANCH, RUN_BUILD (0 to skip),
 #                DRY_RUN (1 = run merge + build gate but skip push/PR; for testing).
 set -euo pipefail
@@ -37,6 +42,7 @@ git fetch origin --prune
 
 UP_SHA="$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")"
 BRANCH="automation/upstream-sync-${UP_SHA}"
+emit behind "$(git rev-list --count "origin/${BASE_BRANCH}..upstream/${UPSTREAM_BRANCH}")"
 
 # Already integrated? Then there is nothing to do — unless DRY_RUN, which still
 # exercises the toolchain + build gate so the workflow can be tested any time.
@@ -66,6 +72,13 @@ if ! git merge --no-edit --no-ff "upstream/${UPSTREAM_BRANCH}"; then
   # SIGPIPEs the still-streaming git status; under pipefail that flips the
   # condition false and the script dies at `git commit` with no result emitted.
   if [ -n "$(git ls-files --unmerged)" ]; then
+    # Multi-line output needs the heredoc form of GITHUB_OUTPUT. Full capture
+    # (no -q) is SIGPIPE-safe: grep reads git status to EOF.
+    {
+      echo "conflicts<<SYNC_CONFLICTS_EOF"
+      git status --porcelain | grep -E '^(DD|AU|UD|UA|DU|AA|UU)' || true
+      echo "SYNC_CONFLICTS_EOF"
+    } >> "${GITHUB_OUTPUT:-/dev/stdout}"
     emit result conflict
     exit 2
   fi

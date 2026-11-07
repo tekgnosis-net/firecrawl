@@ -2,8 +2,12 @@
 
 set -e
 
-sysctl vm.overcommit_memory=1 || true
-sysctl net.core.somaxconn=1024 || true
+mkdir -p /data/redis
+if [ "$(id -u)" = 0 ]; then
+  chown 1001:1001 /data
+  chown -R 1001:1001 /data/redis
+  exec /usr/bin/setpriv --reuid=1001 --regid=1001 --clear-groups /usr/bin/start-redis-server.sh
+fi
 
 # Raise the soft file-descriptor limit up to whatever hard cap the container
 # runtime granted us. Redis defaults to maxclients=10000 which requires ~10032
@@ -25,8 +29,6 @@ if [ "${NOSAVE}" = "" ] ; then
 fi
 # Set maxmemory to 80% of RAM
 MAXMEMORY=$(($FLY_VM_MEMORY_MB*80/100))
-
-mkdir -p /data/redis
 
 redis-server $PW_ARG \
   --dir /data/redis \

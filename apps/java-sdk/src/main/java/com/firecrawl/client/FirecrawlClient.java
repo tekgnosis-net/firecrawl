@@ -37,7 +37,7 @@ import java.util.concurrent.ForkJoinPool;
 public class FirecrawlClient {
 
     private static final String DEFAULT_API_URL = "https://api.firecrawl.dev";
-    private static final String SDK_ORIGIN = "java-sdk@1.17.0";
+    private static final String SDK_ORIGIN = "java-sdk@1.18.9";
     private static final long DEFAULT_TIMEOUT_MS = 300_000; // 5 minutes
     private static final int DEFAULT_MAX_RETRIES = 3;
     private static final double DEFAULT_BACKOFF_FACTOR = 0.5;
@@ -103,7 +103,18 @@ public class FirecrawlClient {
             mergeOptions(body, options);
         }
         body.putIfAbsent("origin", SDK_ORIGIN);
-        return extractData(http.post("/v2/scrape", body, Map.class), Document.class);
+        Map raw = http.post("/v2/scrape", body, Map.class);
+        // Some scrape failures (e.g. SCRAPE_DNS_RESOLUTION_ERROR) arrive as HTTP 200 with success: false.
+        if (Boolean.FALSE.equals(raw.get("success"))) {
+            Object error = raw.get("error");
+            Object code = raw.get("code");
+            throw new FirecrawlException(
+                    error != null ? String.valueOf(error) : "Scrape failed",
+                    200,
+                    code != null ? String.valueOf(code) : null,
+                    raw.get("details"));
+        }
+        return extractData(raw, Document.class);
     }
 
     /**
@@ -249,6 +260,25 @@ public class FirecrawlClient {
         );
     }
 
+    /**
+     * Lists the upload types accepted by {@link #parse(ParseFile, ParseOptions)}.
+     *
+     * @return the supported parse formats
+     */
+    public List<ParseFormat> getParseFormats() {
+        Map<?, ?> raw = http.get("/v2/parse/formats", Map.class);
+        Object data = raw.get("data");
+        Object formats = data instanceof Map<?, ?> ? ((Map<?, ?>) data).get("formats") : null;
+        if (!(formats instanceof List<?>)) {
+            return Collections.emptyList();
+        }
+        List<ParseFormat> result = new ArrayList<>();
+        for (Object item : (List<?>) formats) {
+            result.add(http.objectMapper.convertValue(item, ParseFormat.class));
+        }
+        return result;
+    }
+
     // ================================================================
     // CRAWL
     // ================================================================
@@ -267,6 +297,7 @@ public class FirecrawlClient {
         if (options != null) {
             mergeOptions(body, options);
         }
+        body.putIfAbsent("origin", SDK_ORIGIN);
         return http.post("/v2/crawl", body, CrawlResponse.class);
     }
 
@@ -366,6 +397,7 @@ public class FirecrawlClient {
                 body.putAll(batchFields);
             }
         }
+        body.putIfAbsent("origin", SDK_ORIGIN);
         return http.post("/v2/batch/scrape", body, BatchScrapeResponse.class, extraHeaders);
     }
 
@@ -418,6 +450,18 @@ public class FirecrawlClient {
         return http.delete("/v2/batch/scrape/" + jobId, Map.class);
     }
 
+    /**
+     * Gets errors and robots.txt blocks from a batch scrape job.
+     *
+     * @param jobId the batch scrape job ID
+     * @return error details
+     */
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> getBatchScrapeErrors(String jobId) {
+        Objects.requireNonNull(jobId, "Job ID is required");
+        return http.get("/v2/batch/scrape/" + jobId + "/errors", Map.class);
+    }
+
     // ================================================================
     // MAP
     // ================================================================
@@ -446,6 +490,7 @@ public class FirecrawlClient {
         if (options != null) {
             mergeOptions(body, options);
         }
+        body.putIfAbsent("origin", SDK_ORIGIN);
         return extractData(http.post("/v2/map", body, Map.class), MapData.class);
     }
 
@@ -603,10 +648,8 @@ public class FirecrawlClient {
     }
 
     /**
-     * @deprecated Stops responding after 2026-11-03. Use the developer index at
-     *             GET or POST /v2/search/developer, which this SDK does not wrap
-     *             yet, so call it directly. It does not carry over the score
-     *             breakdown or the web fallback results.
+     * @deprecated The research index GitHub search endpoint was removed after
+     *             2026-11-03. Use {@link #developerSearch} instead.
      */
     @Deprecated
     public ResearchModels.GitHubSearchResponse searchGitHub(String query) {
@@ -614,10 +657,8 @@ public class FirecrawlClient {
     }
 
     /**
-     * @deprecated Stops responding after 2026-11-03. Use the developer index at
-     *             GET or POST /v2/search/developer, which this SDK does not wrap
-     *             yet, so call it directly. It does not carry over the score
-     *             breakdown or the web fallback results.
+     * @deprecated The research index GitHub search endpoint was removed after
+     *             2026-11-03. Use {@link #developerSearch} instead.
      */
     @Deprecated
     public ResearchModels.GitHubSearchResponse searchGitHub(String query, ResearchModels.SearchGitHubOptions options) {
@@ -627,6 +668,37 @@ public class FirecrawlClient {
         params.put("origin", SDK_ORIGIN);
         if (options != null) mergeOptions(params, options);
         return http.get("/v2/search/research/github" + researchQuery(params), ResearchModels.GitHubSearchResponse.class);
+    }
+
+    /**
+     * Searches the developer index: public repositories, GitHub issues, merged
+     * pull requests, READMEs and code documentation.
+     *
+     * @param query the search query
+     * @return ranked developer search results
+     */
+    public ResearchModels.DeveloperSearchResponse developerSearch(String query) {
+        return developerSearch(query, null);
+    }
+
+    /**
+     * Searches the developer index with filters.
+     *
+     * @param query   the search query
+     * @param options developer search filters
+     * @return ranked developer search results
+     * @throws IllegalArgumentException if the query is blank
+     */
+    public ResearchModels.DeveloperSearchResponse developerSearch(String query, ResearchModels.DeveloperSearchOptions options) {
+        Objects.requireNonNull(query, "Query is required");
+        if (query.isBlank()) {
+            throw new IllegalArgumentException("Query cannot be empty");
+        }
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("query", query);
+        if (options != null) mergeOptions(body, options);
+        body.put("origin", SDK_ORIGIN);
+        return http.post("/v2/search/developer", body, ResearchModels.DeveloperSearchResponse.class);
     }
 
     // ================================================================
@@ -791,10 +863,26 @@ public class FirecrawlClient {
      * @return the browser session details
      */
     public BrowserCreateResponse browser(Integer ttl, Integer activityTtl, Boolean streamWebView) {
+        return browser(ttl, activityTtl, streamWebView, null);
+    }
+
+    /**
+     * Creates a new browser session that browses from a given country.
+     *
+     * @param ttl            total session lifetime in seconds (30-3600), or null for default
+     * @param activityTtl    idle timeout in seconds (10-3600), or null for default
+     * @param streamWebView  whether to enable live view streaming, or null for default
+     * @param country        ISO 3166-1 alpha-2 country code such as "GB", sent as
+     *                       {@code location.country}, or null for default (US)
+     * @return the browser session details
+     */
+    public BrowserCreateResponse browser(Integer ttl, Integer activityTtl, Boolean streamWebView,
+                                         String country) {
         Map<String, Object> body = new LinkedHashMap<>();
         if (ttl != null) body.put("ttl", ttl);
         if (activityTtl != null) body.put("activityTtl", activityTtl);
         if (streamWebView != null) body.put("streamWebView", streamWebView);
+        if (country != null) body.put("location", Map.of("country", country));
         return http.post("/v2/browser", body, BrowserCreateResponse.class);
     }
 
@@ -1008,6 +1096,15 @@ public class FirecrawlClient {
     }
 
     /**
+     * Asynchronously lists the upload types accepted by parse.
+     *
+     * @return a CompletableFuture that resolves to the supported parse formats
+     */
+    public CompletableFuture<List<ParseFormat>> getParseFormatsAsync() {
+        return CompletableFuture.supplyAsync(this::getParseFormats, asyncExecutor);
+    }
+
+    /**
      * Asynchronously crawls a website and waits for completion.
      *
      * @param url     the URL to crawl
@@ -1071,14 +1168,16 @@ public class FirecrawlClient {
     }
 
     /**
-     * @deprecated Stops responding after 2026-11-03. Use the developer index at
-     *             GET or POST /v2/search/developer, which this SDK does not wrap
-     *             yet, so call it directly. It does not carry over the score
-     *             breakdown or the web fallback results.
+     * @deprecated The research index GitHub search endpoint was removed after
+     *             2026-11-03. Use {@link #developerSearchAsync} instead.
      */
     @Deprecated
     public CompletableFuture<ResearchModels.GitHubSearchResponse> searchGitHubAsync(String query, ResearchModels.SearchGitHubOptions options) {
         return CompletableFuture.supplyAsync(() -> searchGitHub(query, options), asyncExecutor);
+    }
+
+    public CompletableFuture<ResearchModels.DeveloperSearchResponse> developerSearchAsync(String query, ResearchModels.DeveloperSearchOptions options) {
+        return CompletableFuture.supplyAsync(() -> developerSearch(query, options), asyncExecutor);
     }
 
     /**
@@ -1156,7 +1255,22 @@ public class FirecrawlClient {
      */
     public CompletableFuture<BrowserCreateResponse> browserAsync(Integer ttl, Integer activityTtl,
                                                                     Boolean streamWebView) {
-        return CompletableFuture.supplyAsync(() -> browser(ttl, activityTtl, streamWebView), asyncExecutor);
+        return browserAsync(ttl, activityTtl, streamWebView, null);
+    }
+
+    /**
+     * Asynchronously creates a new browser session that browses from a given country.
+     *
+     * @param ttl            total session lifetime in seconds, or null for default
+     * @param activityTtl    idle timeout in seconds, or null for default
+     * @param streamWebView  whether to enable live view streaming, or null for default
+     * @param country        ISO 3166-1 alpha-2 country code, or null for default (US)
+     * @return a CompletableFuture that resolves to the BrowserCreateResponse
+     */
+    public CompletableFuture<BrowserCreateResponse> browserAsync(Integer ttl, Integer activityTtl,
+                                                                    Boolean streamWebView, String country) {
+        return CompletableFuture.supplyAsync(() -> browser(ttl, activityTtl, streamWebView, country),
+                asyncExecutor);
     }
 
     /**

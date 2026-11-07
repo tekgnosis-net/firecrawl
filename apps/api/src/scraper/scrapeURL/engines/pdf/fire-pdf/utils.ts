@@ -1,5 +1,6 @@
 import type { Meta } from "../../..";
 import type { PDFMode } from "../../../../../controllers/v2/types";
+import type { FirePdfTrainingCapture } from "./request-metadata";
 import { config } from "../../../../../config";
 import {
   INLINE_JOB_DEADLINE_MARGIN_FRACTION,
@@ -158,11 +159,20 @@ export function buildFirePdfJobOptions(args: {
   includePageMarkdown: boolean;
   includeBlocks: boolean;
   pageMarkers: boolean;
+  tableFormat: string | undefined;
+  trainingCapture: FirePdfTrainingCapture | undefined;
+  dataRegion: string | undefined;
 }): Record<string, unknown> {
   return {
-    ...(args.pagesProcessed !== undefined && {
-      pages_estimate: args.pagesProcessed,
-    }),
+    // fire-pdf accepts only a positive integer here. When the router has no
+    // page count (0), the field is left out and fire-pdf counts the pages
+    // itself on inline submits. By-reference submits require a positive
+    // count and check for one before they get here.
+    ...(args.pagesProcessed !== undefined &&
+      Number.isInteger(args.pagesProcessed) &&
+      args.pagesProcessed > 0 && {
+        pages_estimate: args.pagesProcessed,
+      }),
     ...(args.maxPages !== undefined && { max_pages: args.maxPages }),
     ...(args.mode !== undefined && { mode: args.mode }),
     ...(args.includePageMarkdown && { include_page_markdown: true }),
@@ -173,6 +183,11 @@ export function buildFirePdfJobOptions(args: {
     // `page_markers`. Sending snake_case here would be rejected as an
     // unknown option.
     ...(args.pageMarkers && { pageMarkers: true }),
+    ...(args.tableFormat !== undefined && { tableFormat: args.tableFormat }),
+    ...(args.trainingCapture && { training_capture: args.trainingCapture }),
+    // An idempotency key on the PDF service, so a pinned lookup only adopts
+    // a pinned job.
+    ...(args.dataRegion && { data_region: args.dataRegion }),
   };
 }
 

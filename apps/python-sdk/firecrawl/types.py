@@ -69,6 +69,10 @@ from .v2.types import (
     DeveloperSearchRepoStatus,
     DeveloperSearchSourceStatus,
     DeveloperSearchResponse,
+    GovSearchCourtType,
+    GovSearchRequest,
+    GovSearchData,
+    GovSearchResponse,
     
     # Action types
     WaitAction,
@@ -81,6 +85,7 @@ from .v2.types import (
     ExecuteJavascriptAction,
     PDFAction,
     PDFParser,
+    ImageParser,
     
     # Usage types
     QueueStatusResponse,
@@ -168,6 +173,10 @@ __all__ = [
     'DeveloperSearchRepoStatus',
     'DeveloperSearchSourceStatus',
     'DeveloperSearchResponse',
+    'GovSearchCourtType',
+    'GovSearchRequest',
+    'GovSearchData',
+    'GovSearchResponse',
     
     # Action types
     'WaitAction',
@@ -180,6 +189,7 @@ __all__ = [
     'ExecuteJavascriptAction',
     'PDFAction',
     'PDFParser',
+    'ImageParser',
 
     # Usage types
     'QueueStatusResponse',

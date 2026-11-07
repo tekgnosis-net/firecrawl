@@ -3,6 +3,8 @@ name: STAGING Deploy Images to GHCR
 on:
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
   push-app-image:
     runs-on: ubuntu-latest

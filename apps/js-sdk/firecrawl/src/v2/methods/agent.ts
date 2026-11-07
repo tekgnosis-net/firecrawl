@@ -12,6 +12,7 @@ function prepareAgentPayload(args: {
   origin?: string;
   maxCredits?: number;
   strictConstrainToURLs?: boolean;
+  /** Defaults to spark-2. "spark-1-pro" and "spark-1-mini" are deprecated and run spark-2. */
   model?: "spark-1-pro" | "spark-1-mini" | "spark-2";
   effort?: AgentEffort;
   webhook?: string | AgentWebhookConfig;
@@ -20,6 +21,12 @@ function prepareAgentPayload(args: {
   threadId?: string;
   mode?: AgentMode;
   exchange?: AgentExchangeOptions;
+  /**
+   * Country for the whole run (ISO 3166-1 alpha-2). Scrapes and browser sessions are proxied from it,
+   * and search results are localized to it without changing where requests come from. The agent cannot change it.
+   */
+  location?: { country: string };
+  zeroDataRetention?: boolean;
 }): Record<string, unknown> {
   const body: Record<string, unknown> = {};
   if (args.urls) body.urls = args.urls;
@@ -41,6 +48,8 @@ function prepareAgentPayload(args: {
   if (args.threadId != null) body.threadId = args.threadId;
   if (args.mode != null) body.mode = args.mode;
   if (args.exchange != null) body.exchange = args.exchange;
+  if (args.location != null) body.location = args.location;
+  if (args.zeroDataRetention != null) body.zeroDataRetention = args.zeroDataRetention;
   return body;
 }
 

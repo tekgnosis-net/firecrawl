@@ -1,22 +1,3 @@
-export type GetOrCreateCustomerParams = {
-  customerId: string;
-  name?: string | null;
-  email?: string | null;
-  autoEnablePlanId?: string;
-};
-
-export type GetEntityParams = {
-  customerId: string;
-  entityId: string;
-};
-
-export type CreateEntityParams = {
-  customerId: string;
-  entityId: string;
-  featureId: string;
-  name?: string | null;
-};
-
 export type TrackParams = {
   customerId: string;
   entityId?: string;
@@ -24,25 +5,24 @@ export type TrackParams = {
   value: number;
   properties?: Record<string, unknown>;
   /**
-   * Stable per-charge identity, honored on the firebill route only (the
-   * direct Autumn SDK does not expose its Idempotency-Key header). When set,
-   * a caller retry — or a requeued job re-billing the same work — dedupes
+   * The partner's own operation id (the caller's `External-Request-Id`).
+   * Sent to firebill as `external_request_id`, so firebill reports the
+   * operation under it without a lookup. Opaque, forwarded verbatim.
+   */
+  externalRequestId?: string | null;
+  /**
+   * Stable per-charge identity, sent to firebill as the idempotency key. When
+   * set, a caller retry — or a requeued job re-billing the same work — dedupes
    * instead of double-billing. Must be unique per CHARGE, never a shared id
    * like a crawl id (every page shares it: collision = underbilling).
    */
   idempotencyKey?: string;
-};
-
-export type EnsureOrgProvisionedParams = {
-  orgId: string;
-  name?: string | null;
-  email?: string | null;
-};
-
-export type EnsureTeamProvisionedParams = {
-  teamId: string;
-  orgId?: string | null;
-  name?: string | null;
+  /**
+   * `false` keeps an unanswered event out of the durable retry, for a caller
+   * that treats `false` as "did not happen" and releases something on it: a
+   * late retry landing would bill what it already undid. Defaults to retrying.
+   */
+  durableRetry?: boolean;
 };
 
 export type LockCreditsParams = {
@@ -52,6 +32,8 @@ export type LockCreditsParams = {
   expiresAt?: number;
   properties?: Record<string, unknown>;
   featureId?: string;
+  /** See TrackCreditsParams.orgId. */
+  orgId: string;
   /** Arms firebill's partner credit gate, which is asked before Autumn holds anything. */
   partnerJobToken?: string | null;
 };
@@ -85,13 +67,14 @@ export type FinalizeCreditsLockParams = {
   overrideValue?: number;
   properties?: Record<string, unknown>;
   /**
-   * The team the lock was taken for. Needed to route the settle through
-   * firebill for allowlisted orgs — a finalize carries no customer context of
-   * its own. When omitted, the settle goes directly to Autumn (which also
-   * works for a firebill-taken lock: the hold lives in Autumn either way, but
-   * loses firebill's durable retry).
+   * The team the lock was taken for, and its org. Used to ask the rollout
+   * whether this org's settle goes through firebill — a finalize carries no
+   * customer context of its own. A caller that cannot name the org omits this,
+   * and the settle goes through firebill whenever firebill is configured: the
+   * lock id is all a settle needs, and the hold lives in Autumn whichever
+   * route took it.
    */
-  teamId?: string;
+  team?: { teamId: string; orgId: string };
   /** For a gated run, the `operationToken` its lock handed back. */
   externalRequestId?: string | null;
   /** Which balance the hold was against; lets firebill split the settle. */
@@ -108,9 +91,15 @@ export type TrackCreditsParams = {
   featureId?: string;
   /** See TrackParams.idempotencyKey. */
   idempotencyKey?: string;
+  /** See TrackParams.externalRequestId. */
+  externalRequestId?: string | null;
+  /** See TrackParams.durableRetry. */
+  durableRetry?: boolean;
+  /**
+   * The team's org — the Autumn customer this usage bills against. The service
+   * never looks it up: callers hold it already (a request's ACUC, a job's
+   * payload), and a lookup buried in here is one an agentic edit reaches for
+   * instead of passing the org it has.
+   */
+  orgId: string;
 };
-
-export type CreateEntityResult =
-  | { ok: true; entity: unknown }
-  | { ok: false; conflict: true }
-  | { ok: false; conflict: false };

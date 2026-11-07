@@ -8,6 +8,7 @@ import {
 } from "../controllers/v2/types";
 import { crawlToCrawler, StoredCrawl } from "./crawl-redis";
 import { getScrapeZDR } from "./zdr-helpers";
+import { resolveSafeMode } from "./safe-mode";
 import {
   checkAndUpdateURLForMap,
   isSameDomain,
@@ -15,6 +16,7 @@ import {
   resolveRedirects,
 } from "./validateUrl";
 import { fireEngineMap } from "../search/fireEngine";
+import { isUsOnly } from "./us-only";
 import { redisEvictConnection } from "../services/redis";
 import {
   generateURLSplits,
@@ -50,7 +52,7 @@ function dedupeMapDocumentArray(documents: MapDocument[]): MapDocument[] {
   return Array.from(urlMap.values());
 }
 
-async function queryIndex(
+export async function queryIndex(
   url: string,
   limit: number,
   useIndex: boolean,
@@ -121,7 +123,15 @@ export async function getMapResults({
 }): Promise<MapResult> {
   const functionStartTime = Date.now();
 
-  const resolvedUrl = await resolveRedirects(url, abort);
+  // Safe Mode lockdown: serve links from the index only — skip live search +
+  // sitemap discovery. Derived here from the team flags so every caller
+  // (map, extract, llmstxt, prompt enhancement) honors it.
+  const indexOnly =
+    resolveSafeMode(flags, undefined, url).safeMode?.lockdown === true;
+
+  // Under lockdown (index-only) resolving redirects would HEAD/GET the target,
+  // which the zero-outbound guarantee forbids — use the URL as given.
+  const resolvedUrl = indexOnly ? url : await resolveRedirects(url, abort);
 
   // If the resolved URL is on a different domain, replace the hostname
   if (!isSameDomain(url, resolvedUrl)) {
@@ -133,7 +143,9 @@ export async function getMapResults({
 
   const id = providedId ?? uuidv7();
   let mapResults: MapDocument[] = [];
-  const zeroDataRetention = getScrapeZDR(flags) === "forced" || false;
+  // Lockdown (index-only) is cache-only, which implies zero data retention —
+  // and must never write its empty live-search result into the shared cache.
+  const zeroDataRetention = getScrapeZDR(flags) === "forced" || indexOnly;
 
   const sc: StoredCrawl = {
     originUrl: url,
@@ -207,7 +219,8 @@ export async function getMapResults({
       Math.min(maxFireEngineResults, limit) / resultsPerPage,
     );
 
-    const cacheKey = `fireEngineMap:${mapUrl}`;
+    const usOnly = isUsOnly(flags);
+    const cacheKey = `fireEngineMap:${usOnly ? "us-only:" : ""}${mapUrl}`;
     const cachedResult = ignoreCache
       ? null
       : await redisEvictConnection.get(cacheKey);
@@ -218,12 +231,18 @@ export async function getMapResults({
         {
           numResults: resultsPerPage,
           page,
+          usOnly,
+          zeroDataRetention,
         },
         abort,
       );
     };
 
     const fetchAllPages = async (): Promise<any[]> => {
+      if (indexOnly) {
+        // Lockdown: no live search discovery, serve from the index only.
+        return [];
+      }
       if (cachedResult) {
         return JSON.parse(cachedResult);
       }
@@ -256,7 +275,7 @@ export async function getMapResults({
       mapResults.push(...indexResults);
     }
 
-    if (crawlerOptions.sitemap === "include") {
+    if (crawlerOptions.sitemap === "include" && !indexOnly) {
       try {
         await crawler.tryGetSitemap(
           urls => {

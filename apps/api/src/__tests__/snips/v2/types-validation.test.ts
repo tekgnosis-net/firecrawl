@@ -2,6 +2,9 @@ import { z } from "zod";
 import {
   MAX_PATH_PATTERNS,
   MAX_PATH_PATTERN_LENGTH,
+  MAX_TOTAL_PATH_PATTERNS,
+  MAX_TOTAL_PATH_PATTERN_CHARS,
+  collectPathPatternIssues,
 } from "../../../lib/crawl-regex";
 import {
   scrapeRequestSchema,
@@ -43,7 +46,7 @@ describe("V2 Types Validation", () => {
       expect(result.url).toBe("https://example.com");
       expect(result.origin).toBe("api");
       expect(result.formats).toEqual([{ type: "markdown" }]);
-      expect(result.skipTlsVerification).toBe(true);
+      expect(result.skipTlsVerification).toBe(false);
     });
 
     it("should preserve explicit skipTlsVerification false", () => {
@@ -122,6 +125,22 @@ describe("V2 Types Validation", () => {
       ]);
     });
 
+    it("should accept the experimental first-screen flag on branding only as a boolean", () => {
+      const input: ScrapeRequestInput = {
+        url: "https://example.com",
+        formats: [{ type: "branding", __experimental_screenshot: true }],
+      };
+      expect(scrapeRequestSchema.parse(input).formats).toEqual([
+        { type: "branding", __experimental_screenshot: true },
+      ]);
+      expect(() =>
+        scrapeRequestSchema.parse({
+          url: "https://example.com",
+          formats: [{ type: "branding", __experimental_screenshot: "yes" }],
+        }),
+      ).toThrow();
+    });
+
     it("should accept valid scrape request with json format options", () => {
       const input: ScrapeRequestInput = {
         url: "https://example.com",
@@ -144,6 +163,72 @@ describe("V2 Types Validation", () => {
       expect(result.formats).toHaveLength(1);
       expect(result.formats[0].type).toBe("json");
       expect(result.timeout).toBe(60000); // Should be transformed from 30000
+    });
+
+    it("should reject JSON schemas structured outputs cannot express", () => {
+      const input: ScrapeRequestInput = {
+        url: "https://example.com",
+        formats: [
+          {
+            type: "json",
+            schema: {
+              type: "object",
+              properties: { events: { type: "array" } },
+            },
+          },
+        ],
+      };
+
+      const result = scrapeRequestSchema.safeParse(input);
+      expect(result.success).toBe(false);
+      expect(result.error?.issues.map(issue => issue.message)).toContain(
+        'Invalid JSON schema at "properties.events": arrays must define "items".',
+      );
+    });
+
+    it("should accept JSON schemas with capitalized types and oneOf", () => {
+      const input: ScrapeRequestInput = {
+        url: "https://example.com",
+        formats: [
+          {
+            type: "json",
+            schema: {
+              type: "object",
+              properties: {
+                name: { type: "String" },
+                slot: { oneOf: [{ type: "string" }, { type: "number" }] },
+              },
+            },
+          },
+        ],
+      };
+
+      expect(() => scrapeRequestSchema.parse(input)).not.toThrow();
+    });
+
+    it("should reject unsupported changeTracking schemas", () => {
+      const input: ScrapeRequestInput = {
+        url: "https://example.com",
+        formats: [
+          "markdown",
+          {
+            type: "changeTracking",
+            modes: ["json"],
+            schema: {
+              type: "object",
+              properties: {
+                price: { type: "object", properties: {}, allOf: [] },
+              },
+            },
+          },
+        ],
+      };
+
+      const result = scrapeRequestSchema.safeParse(input);
+      expect(result.success).toBe(false);
+      expect(result.error?.issues.map(issue => issue.message)).toContain(
+        'Invalid JSON schema at "properties.price": "allOf" is not supported for JSON extraction.',
+      );
     });
 
     it("should accept query format without markdown", () => {
@@ -242,7 +327,7 @@ describe("V2 Types Validation", () => {
             schema: {
               type: "object",
               properties: {
-                changes: { type: "array" },
+                changes: { type: "array", items: { type: "string" } },
               },
             },
             modes: ["json"],
@@ -406,6 +491,16 @@ describe("V2 Types Validation", () => {
 
       const result = scrapeRequestSchema.parse(input);
       expect(result.integration).toBe("dify");
+    });
+
+    it("should accept the lovable integration value", () => {
+      const input: ScrapeRequestInput = {
+        url: "https://example.com",
+        integration: "lovable",
+      };
+
+      const result = scrapeRequestSchema.parse(input);
+      expect(result.integration).toBe("lovable");
     });
 
     it("should accept integration value starting with underscore", () => {
@@ -688,8 +783,8 @@ describe("V2 Types Validation", () => {
         expect(result.maxAge).toBeUndefined();
       });
 
-      // lockdown takes precedence silently at the engine layer; other options are ignored, not rejected
-      it("should accept lockdown: true alongside any other options", () => {
+      // Profiles require browser state, which a cache-only request cannot supply.
+      it("should reject profile state with lockdown", () => {
         const input: ScrapeRequestInput = {
           url: "https://example.com",
           lockdown: true,
@@ -700,8 +795,9 @@ describe("V2 Types Validation", () => {
           formats: [{ type: "markdown" }, { type: "changeTracking" }],
         };
 
-        const result = scrapeRequestSchema.parse(input);
-        expect(result.lockdown).toBe(true);
+        expect(() => scrapeRequestSchema.parse(input)).toThrow(
+          "Profiles require live browsing and cannot be used with lockdown.",
+        );
       });
     });
   });
@@ -755,6 +851,21 @@ describe("V2 Types Validation", () => {
       expect(result.prompt).toBe("Extract the title");
     });
 
+    it("should accept an extract schema that uses standard string formats", () => {
+      const input: ExtractRequestInput = {
+        urls: ["https://example.com"],
+        schema: {
+          type: "object",
+          properties: {
+            contact: { type: "string", format: "email" },
+          },
+        },
+      };
+
+      const result = extractRequestSchema.parse(input);
+      expect(result.schema).toBeDefined();
+    });
+
     it("should reject extract request without urls or prompt", () => {
       const input = {
         schema: {
@@ -799,6 +910,21 @@ describe("V2 Types Validation", () => {
 
       const result = extractRequestSchema.parse(input);
       expect(result.urls).toHaveLength(10);
+    });
+
+    it("should reject JSON schemas structured outputs cannot express", () => {
+      const result = extractRequestSchema.safeParse({
+        urls: ["https://example.com"],
+        schema: {
+          type: "object",
+          properties: { events: { type: "array" } },
+        },
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error?.issues.map(issue => issue.message)).toContain(
+        'Invalid JSON schema at "properties.events": arrays must define "items".',
+      );
     });
 
     it("should reject invalid JSON schema", () => {
@@ -1020,6 +1146,18 @@ describe("V2 Types Validation", () => {
       expect(message).toMatch(/percent-encoded ASCII/);
     });
 
+    it("should accept several hundred keyword patterns per field", () => {
+      // Keyword-based filtering sends one short pattern per term; a few
+      // hundred per field must not be rejected by the count cap.
+      const result = crawlRequestSchema.parse({
+        url: "https://example.com",
+        includePaths: Array.from({ length: 300 }, (_, i) => `topic${i}`),
+        excludePaths: Array.from({ length: 300 }, (_, i) => `skip${i}`),
+      });
+      expect(result.includePaths).toHaveLength(300);
+      expect(result.excludePaths).toHaveLength(300);
+    });
+
     it("should reject more than the maximum number of path patterns", () => {
       expect(() =>
         crawlRequestSchema.parse({
@@ -1029,7 +1167,62 @@ describe("V2 Types Validation", () => {
             (_, i) => `^/p${i}`,
           ),
         }),
-      ).toThrow(/at most 100 patterns/);
+      ).toThrow(new RegExp(`at most ${MAX_PATH_PATTERNS} patterns`));
+    });
+
+    it("should reject more than the aggregate number of path patterns", () => {
+      // Each field is within its own cap, but together they exceed the budget.
+      const half = Math.floor(MAX_TOTAL_PATH_PATTERNS / 2) + 1;
+      expect(() =>
+        crawlRequestSchema.parse({
+          url: "https://example.com",
+          includePaths: Array.from({ length: half }, (_, i) => `^/a${i}`),
+          excludePaths: Array.from({ length: half }, (_, i) => `^/b${i}`),
+        }),
+      ).toThrow(
+        new RegExp(
+          `together accept at most ${MAX_TOTAL_PATH_PATTERNS} patterns`,
+        ),
+      );
+    });
+
+    it("should report aggregate budget issues at the request root", () => {
+      // excludePaths sits exactly at its own cap; one includePaths pattern
+      // pushes the total over the request-wide budget.
+      const result = crawlRequestSchema.safeParse({
+        url: "https://example.com",
+        excludePaths: Array.from(
+          { length: MAX_PATH_PATTERNS },
+          (_, i) => `^/b${i}`,
+        ),
+        includePaths: ["^/a"],
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        const issue = result.error.issues.find(i =>
+          /together accept at most/.test(i.message),
+        );
+        expect(issue).toBeDefined();
+        // Neither field is individually at fault, so do not point at one.
+        expect(issue!.path).toEqual([]);
+      }
+    });
+
+    it("should reject path patterns exceeding the aggregate character budget", () => {
+      const pattern = "^/" + "a".repeat(MAX_PATH_PATTERN_LENGTH - 2);
+      const perField =
+        Math.floor(MAX_TOTAL_PATH_PATTERN_CHARS / pattern.length / 2) + 1;
+      expect(() =>
+        crawlRequestSchema.parse({
+          url: "https://example.com",
+          includePaths: Array.from({ length: perField }, () => pattern),
+          excludePaths: Array.from({ length: perField }, () => pattern),
+        }),
+      ).toThrow(
+        new RegExp(
+          `together accept at most ${MAX_TOTAL_PATH_PATTERN_CHARS} characters`,
+        ),
+      );
     });
 
     it("should not compile patterns once the count cap is exceeded", () => {
@@ -1046,7 +1239,9 @@ describe("V2 Types Validation", () => {
         message = String(e);
       }
 
-      expect(message).toMatch(/at most 100 patterns/);
+      expect(message).toMatch(
+        new RegExp(`at most ${MAX_PATH_PATTERNS} patterns`),
+      );
       expect(message).not.toMatch(/unclosed character class/);
     });
 
@@ -1071,7 +1266,68 @@ describe("V2 Types Validation", () => {
           url: "https://example.com",
           includePaths: ["^/" + "a".repeat(MAX_PATH_PATTERN_LENGTH)],
         }),
-      ).toThrow(/at most 2000 characters/);
+      ).toThrow(new RegExp(`at most ${MAX_PATH_PATTERN_LENGTH} characters`));
+    });
+  });
+
+  describe("collectPathPatternIssues", () => {
+    // Options generated from a crawl prompt are merged after schema
+    // validation, so the controller validates them with this helper directly.
+    it("should accept merged options within every limit", () => {
+      expect(
+        collectPathPatternIssues({
+          includePaths: Array.from({ length: 300 }, (_, i) => `topic${i}`),
+          excludePaths: ["^/careers", "^/jobs"],
+        }),
+      ).toEqual([]);
+    });
+
+    it("should report malformed generated fields instead of throwing", () => {
+      expect(
+        collectPathPatternIssues({
+          includePaths: "^/blog",
+          excludePaths: ["^/jobs", 42],
+        }),
+      ).toEqual([
+        {
+          kind: "shape",
+          path: ["includePaths"],
+          message: "includePaths must be an array of strings.",
+        },
+        {
+          kind: "shape",
+          path: ["excludePaths"],
+          message: "excludePaths must be an array of strings.",
+        },
+      ]);
+      expect(collectPathPatternIssues({ includePaths: null })).toEqual([]);
+    });
+
+    it("should report per-field caps that the schema did not see", () => {
+      const issues = collectPathPatternIssues({
+        includePaths: Array.from(
+          { length: MAX_PATH_PATTERNS + 1 },
+          (_, i) => `^/p${i}`,
+        ),
+      });
+      expect(issues).toHaveLength(1);
+      expect(issues[0].kind).toBe("field-cap");
+      expect(issues[0].path).toEqual(["includePaths"]);
+    });
+
+    it("should report the aggregate budget and unsupported syntax", () => {
+      const half = Math.floor(MAX_TOTAL_PATH_PATTERNS / 2) + 1;
+      const budget = collectPathPatternIssues({
+        includePaths: Array.from({ length: half }, (_, i) => `^/a${i}`),
+        excludePaths: Array.from({ length: half }, (_, i) => `^/b${i}`),
+      });
+      expect(budget.map(i => i.kind)).toEqual(["budget"]);
+
+      const syntax = collectPathPatternIssues({
+        excludePaths: ["^/ok", "(?<=a)b"],
+      });
+      expect(syntax.map(i => i.kind)).toEqual(["syntax"]);
+      expect(syntax[0].message).toMatch(/look-around/);
     });
   });
 
@@ -1256,13 +1512,13 @@ describe("V2 Types Validation", () => {
     it("should accept search request with simple categories array", () => {
       const input: SearchRequestInput = {
         query: "test",
-        categories: ["github", "research"],
+        categories: ["pdf", "research"],
       };
 
       const result = searchRequestSchema.parse(input);
       // Categories are transformed from string array to object array
       expect(result.categories).toEqual([
-        { type: "github" },
+        { type: "pdf" },
         { type: "research" },
       ]);
     });
@@ -1284,6 +1540,34 @@ describe("V2 Types Validation", () => {
         searchRequestSchema.parse({
           query: "test",
           categories: [{ type: "developer", repos: ["firecrawl/firecrawl"] }],
+        }),
+      ).toThrow();
+    });
+
+    it("should accept the gov category on its own and reject params or mixing", () => {
+      expect(
+        searchRequestSchema.parse({ query: "test", categories: ["gov"] })
+          .categories,
+      ).toEqual([{ type: "gov" }]);
+
+      expect(
+        searchRequestSchema.parse({
+          query: "test",
+          categories: [{ type: "gov" }],
+        }).categories,
+      ).toEqual([{ type: "gov" }]);
+
+      expect(() =>
+        searchRequestSchema.parse({
+          query: "test",
+          categories: [{ type: "gov", sites: ["ecfr.gov"] }],
+        }),
+      ).toThrow();
+
+      expect(() =>
+        searchRequestSchema.parse({
+          query: "test",
+          categories: ["gov", "pdf"],
         }),
       ).toThrow();
     });
@@ -1341,7 +1625,7 @@ describe("V2 Types Validation", () => {
       expect(() =>
         searchRequestSchema.parse({
           query: "test",
-          categories: ["docs", "github", "developer_index"],
+          categories: ["docs", "pdf", "developer_index"],
         }),
       ).toThrow(/cannot be combined/);
     });
@@ -1370,9 +1654,6 @@ describe("V2 Types Validation", () => {
       const input: SearchRequestInput = {
         query: "test",
         categories: [
-          {
-            type: "github",
-          },
           {
             type: "research",
           },
@@ -1850,7 +2131,7 @@ describe("V2 Types Validation", () => {
             schema: {
               type: "object",
               properties: {
-                changes: { type: "array" },
+                changes: { type: "array", items: { type: "string" } },
               },
             },
           },

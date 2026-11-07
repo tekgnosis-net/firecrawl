@@ -1,10 +1,13 @@
-import { Request, Response } from "express";
+import type { AgentInteropStatus } from "../../lib/agent-interop";
+import type { ThirdPartyDataTermsRequiredError } from "../../lib/exchange";
+import { Request } from "express";
 import { config } from "../../config";
 import { z } from "zod";
 import { protocolIncluded, checkUrl } from "../../lib/validateUrl";
 import { hasReachableHost } from "../../lib/url-utils";
 import { countries } from "../../lib/validate-country";
 import { addPathRegexIssues, pathPatternsSchema } from "../../lib/crawl-regex";
+import { addStrictSchemaIssue } from "../../lib/openai-strict-schema";
 import type { PdfPageBlocks } from "../../scraper/scrapeURL/engines/pdf/types";
 import {
   ExtractorOptions,
@@ -15,6 +18,7 @@ import {
 import { InternalOptions } from "../../scraper/scrapeURL";
 import { getURLDepth } from "../../scraper/WebScraper/utils/maxDepthUtils";
 import Ajv from "ajv";
+import addFormats from "ajv-formats";
 import { ErrorCodes } from "../../lib/error";
 import { integrationSchema } from "../../utils/integration";
 import { includesFormat } from "../../lib/format-utils";
@@ -219,7 +223,8 @@ export const extractOptions = z
       .transform(val => normalizeSchemaForOpenAI(val))
       .refine(val => validateSchemaForOpenAI(val), {
         message: OPENAI_SCHEMA_ERROR_MESSAGE,
-      }),
+      })
+      .superRefine(addStrictSchemaIssue),
     systemPrompt: z.string().max(10000).prefault(""),
     prompt: z.string().max(10000).optional(),
     temperature: z.number().optional(),
@@ -254,7 +259,8 @@ const extractOptionsWithAgent = z
       .transform(val => normalizeSchemaForOpenAI(val))
       .refine(val => validateSchemaForOpenAI(val), {
         message: OPENAI_SCHEMA_ERROR_MESSAGE,
-      }),
+      })
+      .superRefine(addStrictSchemaIssue),
     systemPrompt: z.string().max(10000).prefault(""),
     prompt: z.string().max(10000).optional(),
     temperature: z.number().optional(),
@@ -353,7 +359,7 @@ const actionSchema = z.union([
   }),
   z.object({
     type: z.literal("scroll"),
-    direction: z.enum(["up", "down"]).optional().prefault("down"),
+    direction: z.enum(["up", "down"]).prefault("down"),
     selector: z.string().optional(),
   }),
   z.object({
@@ -391,6 +397,8 @@ export type InternalAction = Action & {
   metadata?: {
     [key: string]: unknown;
   };
+  /** fire-engine, executeJavascript only. */
+  realViewport?: boolean;
 };
 
 const actionsSchema = z
@@ -453,7 +461,6 @@ const baseScrapeOptions = z.strictObject({
       "menu",
     ])
     .array()
-    .optional()
     .prefault(["markdown"])
     .refine(
       x => !(x.includes("screenshot") && x.includes("screenshot@fullPage")),
@@ -509,8 +516,9 @@ const baseScrapeOptions = z.strictObject({
         .transform(val => normalizeSchemaForOpenAI(val))
         .refine(val => validateSchemaForOpenAI(val), {
           message: OPENAI_SCHEMA_ERROR_MESSAGE,
-        }),
-      modes: z.enum(["json", "git-diff"]).array().optional().prefault([]),
+        })
+        .superRefine(addStrictSchemaIssue),
+      modes: z.enum(["json", "git-diff"]).array().prefault([]),
       tag: z.string().or(z.null()).prefault(null),
     })
     .optional(),
@@ -542,12 +550,19 @@ const baseScrapeOptions = z.strictObject({
   fastMode: z.boolean().prefault(false),
   useMock: z.string().optional(),
   blockAds: z.boolean().prefault(true),
-  proxy: z.enum(["basic", "stealth", "enhanced", "auto"]).prefault("basic"),
+  // No prefault here: the default is conditional on location (see extractTransform).
+  // Requests without a non-default country default to "auto"; requests with one
+  // default to "basic".
+  proxy: z.enum(["basic", "stealth", "enhanced", "auto"]).optional(),
   maxAge: z
     .int()
     .gte(0)
     .prefault(1 * 24 * 60 * 60 * 1000),
   storeInCache: z.boolean().prefault(true),
+  // Enterprise: per-request Safe Mode opt-out/affirmation. Tri-state, so NOT
+  // prefaulted — an absent value must stay undefined (a default of false would
+  // read as an explicit bypass attempt). Honored only if the org allows it.
+  safeMode: z.boolean().optional(),
   // Enterprise: per-request field-level override of the org's threat
   // protection policy. Gated on the team flag + org config (checkPermissions).
   threatProtection: threatProtectionOverrideSchema.optional(),
@@ -580,6 +595,23 @@ const extractTransformRequired = <T extends ScrapeOptions>(obj: T): T => {
 };
 
 const extractTransform = (obj: ScrapeOptions) => {
+  // Proxy default: "auto" when no non-default country is specified, so
+  // requests can upgrade to stealth on proxy failures. When a country is
+  // specified, keep the historical "basic" default.
+  if (obj.proxy === undefined) {
+    // Check both location fields: a non-default country in either one counts
+    // as specified, even if the other omitted its country (its schema fills
+    // in the "us-generic" default, which must not shadow the other field).
+    const hasNonDefaultCountry = [
+      obj.location?.country,
+      obj.geolocation?.country,
+    ].some(
+      country =>
+        country !== undefined && country.toLowerCase() !== "us-generic",
+    );
+    obj = { ...obj, proxy: hasNonDefaultCountry ? "basic" : "auto" };
+  }
+
   // Handle timeout
   if (
     (includesFormat(obj.formats, "extract") ||
@@ -712,6 +744,7 @@ export type ScrapeOptions = BaseScrapeOptions & {
 };
 
 const ajv = new Ajv();
+addFormats(ajv);
 
 const extractV1Options = z
   .strictObject({
@@ -741,7 +774,8 @@ const extractV1Options = z
       .transform(val => normalizeSchemaForOpenAI(val))
       .refine(val => validateSchemaForOpenAI(val), {
         message: OPENAI_SCHEMA_ERROR_MESSAGE,
-      }),
+      })
+      .superRefine(addStrictSchemaIssue),
     limit: z.int().positive().finite().optional(),
     ignoreSitemap: z.boolean().prefault(false),
     includeSubdomains: z.boolean().prefault(true),
@@ -750,7 +784,7 @@ const extractV1Options = z
     scrapeOptions: baseScrapeOptions
       .prefault({ onlyMainContent: false })
       .optional(),
-    origin: z.string().optional().prefault("api"),
+    origin: z.string().prefault("api"),
     integration: integrationSchema.optional().transform(val => val || null),
     urlTrace: z.boolean().prefault(false),
     timeout: z.int().positive().min(1000).prefault(60000),
@@ -814,7 +848,7 @@ const scrapeRequestSchemaBase = baseScrapeOptions
       .optional(),
     extract: extractOptionsWithAgent.optional(),
     jsonOptions: extractOptionsWithAgent.optional(),
-    origin: z.string().optional().prefault("api"),
+    origin: z.string().prefault("api"),
     integration: integrationSchema.optional().transform(val => val || null),
     timeout: z.int().positive().min(1000).prefault(30000),
     zeroDataRetention: z.boolean().optional(),
@@ -834,7 +868,7 @@ export type ScrapeRequestInput = z.input<typeof scrapeRequestSchema>;
 
 const batchScrapeRequestSchemaBase = baseScrapeOptions.extend({
   urls: url.array().min(1),
-  origin: z.string().optional().prefault("api"),
+  origin: z.string().prefault("api"),
   integration: integrationSchema.optional().transform(val => val || null),
   webhook: webhookSchema.optional(),
   appendToId: z.uuid().optional(),
@@ -852,7 +886,7 @@ export const batchScrapeRequestSchema = batchScrapeRequestSchemaBase
 
 const batchScrapeRequestSchemaNoURLValidationBase = baseScrapeOptions.extend({
   urls: z.string().array().min(1),
-  origin: z.string().optional().prefault("api"),
+  origin: z.string().prefault("api"),
   integration: integrationSchema.optional().transform(val => val || null),
   webhook: webhookSchema.optional(),
   appendToId: z.uuid().optional(),
@@ -912,7 +946,7 @@ type CrawlerOptions = z.infer<typeof crawlerOptions>;
 
 const crawlRequestSchemaBase = crawlerOptions.extend({
   url,
-  origin: z.string().optional().prefault("api"),
+  origin: z.string().prefault("api"),
   integration: integrationSchema.optional().transform(val => val || null),
   scrapeOptions: baseScrapeOptions.prefault(() => baseScrapeOptions.parse({})),
   webhook: webhookSchema.optional(),
@@ -924,8 +958,7 @@ const crawlRequestSchemaBase = crawlerOptions.extend({
 export const crawlRequestSchema = crawlRequestSchemaBase
   .strict()
   .superRefine((x, ctx) => {
-    addPathRegexIssues(x.includePaths, "includePaths", ctx);
-    addPathRegexIssues(x.excludePaths, "excludePaths", ctx);
+    addPathRegexIssues(x, ctx);
   })
   .refine(
     x => (x.scrapeOptions ? extractRefine(x.scrapeOptions) : true),
@@ -986,7 +1019,7 @@ const mapRequestSchemaBase = crawlerOptions
   .omit({ ignoreQueryParameters: true })
   .extend({
     url,
-    origin: z.string().optional().prefault("api"),
+    origin: z.string().prefault("api"),
     integration: integrationSchema.optional().transform(val => val || null),
     includeSubdomains: z.boolean().prefault(true),
     search: z.string().optional(),
@@ -1008,8 +1041,7 @@ const mapRequestSchemaBase = crawlerOptions
 export const mapRequestSchema = mapRequestSchemaBase
   .strict()
   .superRefine((x, ctx) => {
-    addPathRegexIssues(x.includePaths, "includePaths", ctx);
-    addPathRegexIssues(x.excludePaths, "excludePaths", ctx);
+    addPathRegexIssues(x, ctx);
   });
 
 // export type MapRequest = {
@@ -1275,6 +1307,7 @@ export type CrawlErrorsResponse =
         timestamp?: string;
         url: string;
         error: string;
+        requiresAction?: ThirdPartyDataTermsRequiredError["requiresAction"];
       }[];
       robotsBlocked: string[];
     };
@@ -1282,6 +1315,13 @@ export type CrawlErrorsResponse =
 type AuthObject = {
   team_id: string;
   org_id?: string | null;
+  // Set only by authMiddleware from the raw request; controllers may re-parse
+  // the body and drop `__agentInterop`, so read this instead.
+  agentInterop?: AgentInteropStatus;
+  // Set only by authMiddleware, from the hosted MCP verification in
+  // supaAuthenticateUser; never from the request body or headers directly.
+  // A credit gate clears it when the call is billed on the team's own credits.
+  hostedMcp?: boolean;
 };
 
 type Account = {
@@ -1296,13 +1336,19 @@ export type AuthCreditUsageChunk = {
   org_id: string;
   flags: TeamFlags;
 
-  // teams.banned surfaced from auth_chunk_1 — banned teams are rejected (403)
+  // teams.banned surfaced from auth_chunk_2 — banned teams are rejected (403)
   // in supaAuthenticateUser. Optional because pre-rollout cached ACUC entries
   // and the bypass/preview mocks omit it (treated as not banned).
   is_banned?: boolean;
 
   // appended on JS-side
   is_extract?: boolean;
+
+  // The team's effective Autumn limits and plan, always set by
+  // getACUC/getACUCTeam.
+  concurrency_limit: number;
+  rate_limit_multiplier: number;
+  is_paid_plan: boolean;
 
   // Agent signup: populated when the key is agent-provisioned
   _agentSponsor?: {
@@ -1316,6 +1362,22 @@ export type TeamFlags = {
   ignoreRobots?: "disabled" | "allowed" | "forced";
   customRobotsAgent?: "disabled" | "allowed";
   threatProtection?: "disabled" | "allowed" | "forced";
+  safeMode?: boolean;
+  safeModeConfig?: {
+    allowBypassSafeMode?: boolean;
+    lockdown?: boolean;
+    domainControls?: boolean;
+    enforceRobots?: boolean;
+    disableStealthProxy?: boolean;
+    disableAuthentication?: boolean;
+    disableSiteHandling?: boolean;
+    exposeWebdriver?: boolean;
+    useHeadlessUserAgent?: boolean;
+    disablePlatformSelection?: boolean;
+    disableCountrySelection?: boolean;
+    disableAutomaticReferrer?: boolean;
+    allowlist?: string[];
+  };
   siemLogging?: boolean;
   unblockedDomains?: string[];
   forceZDR?: boolean;
@@ -1323,6 +1385,8 @@ export type TeamFlags = {
   scrapeZDR?: "disabled" | "allowed" | "forced";
   searchZDR?: "disabled" | "allowed" | "forced" | "forced-zdr" | "forced-anon";
   zdrCost?: number;
+  /** How long an agent run's ZDR result is kept, in minutes. Unset is the default (24 hours). */
+  agentZdrRetentionMinutes?: number;
   checkRobotsOnScrape?: boolean;
   crawlTtlHours?: number;
   ipWhitelist?: boolean;
@@ -1335,6 +1399,8 @@ export type TeamFlags = {
   bypassCreditChecks?: boolean;
   debugBranding?: boolean;
   maxBrowserSessions?: number;
+  // grants the privileged large-PDF size cap (PDF_BY_REFERENCE_MAX_BYTES_PRIVILEGED)
+  largePdfs?: boolean;
   // POST /v2/search/:jobId/feedback returns 403 TEAM_OPTED_OUT when true.
   searchFeedbackOptOut?: boolean;
   researchBeta?: boolean;
@@ -1342,6 +1408,15 @@ export type TeamFlags = {
   labsSearch?: boolean;
   exchangeRetrieve?: boolean;
   professionalProfileCompanyDataBeta?: boolean;
+  // The org's DPA (or partner amendment) restricts how its data may be
+  // handled. Informational only: the API does not change behavior on it.
+  dpaRestricted?: boolean;
+  // The org's contract bars training on its data: FirePDF never captures its
+  // documents (buildFirePdfTrainingCapture).
+  trainingRestricted?: boolean;
+  // Every request is processed by US-based vendors only. A route with no US
+  // vendor is refused or skipped with a warning.
+  usOnly?: boolean;
   organizationDataSourceAccess?: Record<
     string,
     {
@@ -1356,9 +1431,6 @@ export type TeamFlags = {
   >;
   // routes the team's new queue work to the FoundationDB backend
   nuqFdb?: boolean;
-  // enables OCR of raster image URLs and uploads through FirePDF (see
-  // lib/image-ocr-gate.ts); rolled out per team
-  imageOcr?: boolean;
   /**
    * Per-endpoint rate-limit overrides, in requests per minute. A value here
    * replaces the computed limit for that mode, so the Autumn multiplier is
@@ -1408,11 +1480,6 @@ export interface RequestWithAuth<
 > extends RequestWithMaybeACUC<ReqParams, ReqBody, ResBody> {
   auth: AuthObject;
   account?: Account;
-}
-
-export interface ResponseWithSentry<ResBody = undefined>
-  extends Response<ResBody> {
-  sentry?: string;
 }
 
 export function toLegacyCrawlerOptions(x: CrawlerOptions) {
@@ -1591,16 +1658,16 @@ export function toLegacyDocument(
 export const searchRequestSchema = z
   .strictObject({
     query: z.string(),
-    limit: z.int().positive().finite().max(100).optional().prefault(5),
+    limit: z.int().positive().finite().max(100).prefault(5),
     tbs: z.string().optional(),
     filter: z.string().optional(),
-    lang: z.string().optional().prefault("en"),
+    lang: z.string().prefault("en"),
     country: z.string().optional(),
     location: z.string().optional(),
-    origin: z.string().optional().prefault("api"),
+    origin: z.string().prefault("api"),
     integration: integrationSchema.optional().transform(val => val || null),
     timeout: z.int().positive().finite().prefault(60000),
-    ignoreInvalidURLs: z.boolean().optional().prefault(false),
+    ignoreInvalidURLs: z.boolean().prefault(false),
     __searchPreviewToken: z.string().optional(),
     threatProtection: threatProtectionOverrideSchema.optional(),
     scrapeOptions: baseScrapeOptions

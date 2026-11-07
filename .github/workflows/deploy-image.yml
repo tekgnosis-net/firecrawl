@@ -18,6 +18,8 @@ on:
       - .github/workflows/deploy-image.yml
   workflow_dispatch:
 
+permissions: {}
+
 jobs:
   build:
     runs-on: ubuntu-latest

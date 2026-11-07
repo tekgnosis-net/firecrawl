@@ -32,10 +32,38 @@ describe("calculateCreditsToBeBilled", () => {
       {} as any,
       undefined,
       undefined,
-      { handled: true, creditsCost: 12 },
+      { provider: { id: "acme", creditsCost: 12, steps: [] } },
     );
 
     expect(credits).toBe(12);
+  });
+
+  it("adds format surcharges on top of an Exchange access", async () => {
+    const credits = await calculateCreditsToBeBilled(
+      {
+        formats: [{ type: "json", prompt: "name" }],
+      } as any,
+      {
+        teamId: "team-id",
+        orgId: null,
+      },
+      {
+        metadata: {
+          statusCode: 200,
+          url: "https://profiles.example/person/example-person",
+          proxyUsed: "basic",
+        },
+      } as any,
+      {
+        totalCost: 0,
+      } as any,
+      {} as any,
+      undefined,
+      undefined,
+      { provider: { id: "acme", creditsCost: 12, steps: [] } },
+    );
+
+    expect(credits).toBe(16);
   });
 
   it("bills X/Twitter scrapes at 30 credits", async () => {
@@ -226,26 +254,38 @@ describe("calculateCreditsToBeBilled", () => {
   // lockdown + json surcharge stacking
   // =========================================
 
-  const promptInjectionGuardCall = {
+  const promptInjectionGuardCall = (
+    verdict: "clean" | "injection" | "none" = "clean",
+  ) => ({
     type: "other",
     model: "vertex/gemini",
     cost: 0,
-    metadata: { module: "scrapeURL", method: "checkForPromptInjection" },
-  };
+    metadata: {
+      module: "scrapeURL",
+      method: "checkForPromptInjection",
+      verdict,
+    },
+  });
 
   // `guard` means the caller asked for the prompt injection check and the
   // guard actually ran. Both conditions must hold for the +4 guard fee.
+  // `guardVerdicts` overrides the per-chunk verdicts the guard recorded.
   const billScrape = (args: {
     lockdown?: boolean;
     json?: boolean;
+    deterministicJson?: boolean;
     guard?: boolean;
+    guardVerdicts?: ("clean" | "injection" | "none")[];
   }) =>
     calculateCreditsToBeBilled(
       {
         lockdown: args.lockdown,
+        checkPromptInjection: args.guard,
         formats: args.json
-          ? [{ type: "json", schema: {}, checkPromptInjection: args.guard }]
-          : [{ type: "markdown" }],
+          ? [{ type: "json", schema: {} }]
+          : args.deterministicJson
+            ? [{ type: "deterministicJson", schema: {} }]
+            : [{ type: "markdown" }],
       } as any,
       {
         teamId: "team-id",
@@ -259,7 +299,9 @@ describe("calculateCreditsToBeBilled", () => {
       } as any,
       {
         totalCost: 0,
-        calls: args.guard ? [promptInjectionGuardCall] : [],
+        calls: args.guard
+          ? (args.guardVerdicts ?? ["clean"]).map(promptInjectionGuardCall)
+          : [],
       } as any,
       {} as any,
     );
@@ -285,6 +327,66 @@ describe("calculateCreditsToBeBilled", () => {
 
   it("bills json plus the prompt injection guard at 9 credits", async () => {
     expect(await billScrape({ json: true, guard: true })).toBe(9);
+  });
+
+  it("bills the prompt injection guard on a markdown-only scrape (5 credits)", async () => {
+    expect(await billScrape({ guard: true })).toBe(5);
+  });
+
+  it("keeps the guard fee on top of the deterministicJson flat rate", async () => {
+    expect(await billScrape({ deterministicJson: true, guard: true })).toBe(7);
+  });
+
+  it("drops the guard fee when any chunk got no verdict", async () => {
+    expect(
+      await billScrape({
+        json: true,
+        guard: true,
+        guardVerdicts: ["clean", "none", "clean"],
+      }),
+    ).toBe(5);
+  });
+
+  it("drops the guard fee when no chunk got a verdict", async () => {
+    expect(
+      await billScrape({ json: true, guard: true, guardVerdicts: ["none"] }),
+    ).toBe(5);
+  });
+
+  // =========================================
+  // prompt injection guard on failed scrapes
+  // =========================================
+
+  const billFailedGuardedScrape = (
+    verdicts: ("clean" | "injection" | "none")[],
+  ) =>
+    calculateCreditsToBeBilled(
+      {
+        checkPromptInjection: true,
+        formats: [{ type: "markdown" }],
+      } as any,
+      {
+        teamId: "team-id",
+        orgId: null,
+      },
+      null,
+      {
+        totalCost: 0,
+        calls: verdicts.map(promptInjectionGuardCall),
+      } as any,
+      {} as any,
+    );
+
+  it("bills 5 credits for a failed scrape whose guard scanned every chunk", async () => {
+    expect(await billFailedGuardedScrape(["clean", "clean"])).toBe(5);
+  });
+
+  it("bills 5 credits for a scrape the guard blocked, even if a concurrent chunk failed", async () => {
+    expect(await billFailedGuardedScrape(["injection", "none"])).toBe(5);
+  });
+
+  it("bills nothing for a failed scrape whose guard left a chunk unscanned", async () => {
+    expect(await billFailedGuardedScrape(["clean", "none"])).toBe(0);
   });
 });
 
@@ -344,6 +446,51 @@ const billWithDecisions = (args: {
 const successDocument = {
   metadata: { statusCode: 200, proxyUsed: "basic" },
 };
+
+describe("calculateCreditsToBeBilled — zero data retention", () => {
+  const bill = (
+    options: Record<string, unknown>,
+    zeroDataRetention: boolean,
+    flags: Record<string, unknown> = {},
+  ) =>
+    calculateCreditsToBeBilled(
+      { formats: [{ type: "markdown" }], ...options } as any,
+      { teamId: "team-id", orgId: null, zeroDataRetention },
+      { metadata: { statusCode: 200, proxyUsed: "basic" } } as any,
+      { totalCost: 0 } as any,
+      flags as any,
+    );
+
+  it("adds 1 credit per page by default", async () => {
+    expect(await bill({}, false)).toBe(1);
+    expect(await bill({}, true)).toBe(2);
+  });
+
+  it("adds the team's zdrCost when it is set", async () => {
+    expect(await bill({}, true, { zdrCost: 3 })).toBe(4);
+    expect(await bill({}, false, { zdrCost: 3 })).toBe(1);
+  });
+
+  it("stacks on format surcharges", async () => {
+    const json = { formats: [{ type: "json", schema: {} }] };
+    expect(await bill(json, false)).toBe(5);
+    expect(await bill(json, true)).toBe(6);
+  });
+
+  it("is not added on top of lockdown", async () => {
+    expect(await bill({ lockdown: true }, true)).toBe(5);
+  });
+
+  it.each(["audio", "video"])(
+    "drops the %s surcharge it refuses, but not under lockdown",
+    async type => {
+      const media = { formats: [{ type }] };
+      expect(await bill(media, false)).toBe(5);
+      expect(await bill(media, true)).toBe(2);
+      expect(await bill({ ...media, lockdown: true }, true)).toBe(9);
+    },
+  );
+});
 
 describe("calculateThreatScanCredits", () => {
   it("bills nothing for no decisions", () => {

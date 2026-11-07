@@ -1,12 +1,28 @@
 import { createHmac } from "node:crypto";
 import { isIPv4 } from "node:net";
-import { v5 as uuidv5 } from "uuid";
 import { config } from "../config";
+import {
+  KEYLESS_TEAM_PREFIX,
+  keylessTeamId,
+  keylessTeamUuid,
+} from "./keyless-team";
 import { db } from "../db/connection";
 import * as schema from "../db/schema";
 import { redisRateLimitClient } from "../services/rate-limiter";
 import { isKeylessIpSuspicious } from "./spur";
 import { logger } from "./logger";
+import {
+  keylessCreditBlocksTotal,
+  keylessCreditsTotal,
+} from "./keyless-metrics";
+import {
+  type KeylessPromptReason,
+  type KeylessSignupSurface,
+  keylessFallbackSignupUrl,
+  keylessSignupLink,
+  keylessSignupSurface,
+} from "./keyless-signup-link";
+import { trackKeylessPromptShown } from "./keyless-prompt-analytics";
 
 // Keyless free tier: scrape, search, and interact can be used without an API key
 // from the official MCP server, CLI, or SDKs. It's gated per-IP/day by TWO
@@ -19,11 +35,21 @@ import { logger } from "./logger";
 const KEYLESS_REQUESTS_PER_DAY = config.KEYLESS_REQUESTS_PER_DAY;
 const KEYLESS_CREDITS_PER_DAY = config.KEYLESS_CREDITS_PER_DAY;
 
-// Shared 429 copy for both keyless request-cap and credit-cap failures.
-export const KEYLESS_FREE_TIER_LIMIT_MESSAGE = `You've hit Firecrawl's keyless free tier rate limit. To continue now, create a free API key at https://www.firecrawl.dev/signin.
+// Keyless prompts link to signup at firecrawl.dev/k/<token>, where <token>
+// is the encrypted prompt (see keyless-signup-link.ts). The constant uses the
+// regular signup link and stays the marker for internal equality checks;
+// responses swap in the caller's own link where they leave the API. The URL
+// ends its line, so a copied link never picks up punctuation.
+function keylessFreeTierLimitMessage(signupUrl: string): string {
+  return `You've hit Firecrawl's keyless free tier rate limit. To continue now, create a free API key at ${signupUrl}
 
 Then authenticate with:
 Authorization: Bearer YOUR_API_KEY`;
+}
+
+export const KEYLESS_FREE_TIER_LIMIT_MESSAGE = keylessFreeTierLimitMessage(
+  keylessFallbackSignupUrl("api"),
+);
 
 // The tier is "configured" when BOTH limits are set — even to 0. Unset means the
 // feature is off (callers get a plain Unauthorized); 0 means it's on but the
@@ -36,6 +62,32 @@ export function isKeylessConfigured(): boolean {
 }
 
 const DAY_SECONDS = 86400;
+
+// A World ID verified human gets their own bucket, keyed on a hash of their
+// World ID subject instead of the client IP, with 20% more requests and
+// credits than the per-IP tier.
+const WORLD_ID_IDENTITY_PREFIX = "wid_";
+const WORLD_ID_LIMIT_MULTIPLIER = 1.2;
+
+export function keylessWorldIdIdentity(subjectHash: string): string {
+  return `${WORLD_ID_IDENTITY_PREFIX}${subjectHash}`;
+}
+
+/** Daily limits for a keyless identity (a client IP or a World ID identity). */
+function keylessLimitsFor(identity: string): {
+  requests: number;
+  credits: number;
+} {
+  const requests = KEYLESS_REQUESTS_PER_DAY ?? 0;
+  const credits = KEYLESS_CREDITS_PER_DAY ?? 0;
+  if (!identity.startsWith(WORLD_ID_IDENTITY_PREFIX)) {
+    return { requests, credits };
+  }
+  return {
+    requests: Math.floor(requests * WORLD_ID_LIMIT_MULTIPLIER),
+    credits: Math.floor(credits * WORLD_ID_LIMIT_MULTIPLIER),
+  };
+}
 
 // This value is emitted only on quota exhaustion. It is a versioned, keyed
 // pseudonym—not an IP address—so analytics can join the event to the existing
@@ -65,41 +117,31 @@ export function keylessConversionCohort(ip: string): string | undefined {
 }
 
 export function keylessExhaustionTelemetry(ip: string): Record<string, string> {
+  // The conversion cohort joins on a client IP; a World ID bucket has none.
+  if (ip.startsWith(WORLD_ID_IDENTITY_PREFIX)) return {};
   const conversionCohort = keylessConversionCohort(ip);
   return conversionCohort ? { conversionCohort } : {};
 }
 
-// Keyless teams reuse the `preview_` prefix so billing (autumn `isPreviewTeam`)
-// and GCS persistence are skipped automatically, with a dedicated infix so the
-// IP can be recovered when charging credits after a request completes.
-const KEYLESS_TEAM_PREFIX = "preview_keyless_";
+export { keylessTeamId, keylessTeamUuid };
 
-export function keylessTeamId(ip: string): string {
-  return `${KEYLESS_TEAM_PREFIX}${ip}`;
+export function isKeylessTeamId(teamId: string): boolean {
+  return teamId.startsWith(KEYLESS_TEAM_PREFIX);
 }
 
+// The keyless identity (quota bucket) of a team: a client IP or a World ID
+// identity. Quota keys take it as is; prompts take keylessPromptIp.
 function keylessIpFromTeamId(teamId: string): string | null {
   return teamId.startsWith(KEYLESS_TEAM_PREFIX)
     ? teamId.slice(KEYLESS_TEAM_PREFIX.length)
     : null;
 }
 
-// Fixed namespace for deriving a stable per-keyless-team UUID. Tables like
-// `scrapes` require a UUID team_id, but keyless teams are `preview_keyless_<ip>`
-// strings. Mapping each to a deterministic UUIDv5 keeps rows per-IP-distinct
-// (so ownership checks such as interact still isolate keyless users) while
-// satisfying the UUID column — unlike the shared preview placeholder.
-const KEYLESS_TEAM_UUID_NAMESPACE = "9e6c8f2a-3b1d-4c7e-8a5f-2d4b6e8c0a1f";
-
-/**
- * Deterministic UUID for a keyless team's persisted rows, or null for
- * non-keyless teams (callers then fall back to the raw/placeholder team_id).
- */
-export function keylessTeamUuid(
-  teamId: string | null | undefined,
-): string | null {
-  if (!teamId || !teamId.startsWith(KEYLESS_TEAM_PREFIX)) return null;
-  return uuidv5(teamId, KEYLESS_TEAM_UUID_NAMESPACE);
+/** The client IP a signup prompt may key on: none for a World ID bucket. */
+function keylessPromptIp(identity: string | null): string | null {
+  return identity && !identity.startsWith(WORLD_ID_IDENTITY_PREFIX)
+    ? identity
+    : null;
 }
 
 /**
@@ -129,8 +171,8 @@ type KeylessConsumeResult = {
   retryAfterSeconds?: number;
 };
 
-function positiveRedisTtl(ttl: number): number | undefined {
-  return ttl > 0 ? ttl : undefined;
+function positiveRedisTtl(pttl: number): number | undefined {
+  return pttl > 0 ? Math.ceil(pttl / 1000) : undefined;
 }
 
 /**
@@ -140,32 +182,113 @@ function positiveRedisTtl(ttl: number): number | undefined {
  */
 async function retryAfterSecondsFor(key: string): Promise<number | undefined> {
   try {
-    return positiveRedisTtl(await redisRateLimitClient.ttl(key));
+    return positiveRedisTtl(await redisRateLimitClient.pttl(key));
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Signup link for a keyless prompt: the caller's own /k/<token> link for a
+ * valid IPv4 identity, the regular signup link for anything else.
+ */
+export function keylessSignupUrlForIp(
+  ip: string | null | undefined,
+  surface: KeylessSignupSurface,
+  reason: KeylessPromptReason,
+): { url: string; signupRef?: string } {
+  return keylessSignupLink(
+    ip && isKeylessIpEligible(ip) ? normalizeKeylessIpv4(ip) : null,
+    surface,
+    reason,
+  );
+}
+
+/**
+ * Report a keyless prompt shown to the caller, for the prompt to signup
+ * funnel. Deduplicated per identity, surface and reason per UTC day; never
+ * blocks or throws. Only a keyless identity (IPv4) is reported: no other
+ * caller can hold a token link or a keyless ledger row to join on.
+ */
+export function reportKeylessPromptShown(
+  ip: string | null | undefined,
+  surface: KeylessSignupSurface,
+  reason: KeylessPromptReason,
+  httpStatus: number,
+  signupRef?: string,
+): void {
+  try {
+    const teamUuid =
+      ip && isKeylessIpEligible(ip)
+        ? keylessTeamUuid(keylessTeamId(normalizeKeylessIpv4(ip)))
+        : null;
+    if (!teamUuid) return;
+    trackKeylessPromptShown({
+      keylessTeamId: teamUuid,
+      surface,
+      reason,
+      httpStatus,
+      tokenLink: Boolean(signupRef),
+    });
+  } catch {
+    // Analytics only: the prompt itself must still go out.
+  }
+}
+
+/**
+ * The caller's own signup link and the limit message that carries it. Every
+ * caller answers 429 with it, so the prompt is reported here.
+ */
+export function keylessLimitPrompt(
+  ip: string | null | undefined,
+  surface: KeylessSignupSurface,
+): { error: string; signup_url: string; signupRef?: string } {
+  const { url, signupRef } = keylessSignupUrlForIp(ip, surface, "limit");
+  reportKeylessPromptShown(ip, surface, "limit", 429, signupRef);
+  return {
+    error: keylessFreeTierLimitMessage(url),
+    signup_url: url,
+    ...(signupRef ? { signupRef } : {}),
+  };
+}
+
+/** keylessLimitPrompt for a keyless team id; the regular signup link for other teams. */
+export function keylessLimitPromptForTeam(
+  teamId: string,
+  req: Parameters<typeof keylessSignupSurface>[0],
+): ReturnType<typeof keylessLimitPrompt> {
+  return keylessLimitPrompt(
+    keylessPromptIp(keylessIpFromTeamId(teamId)),
+    keylessSignupSurface(req),
+  );
 }
 
 /** Structured response for projected-credit reservation exhaustion. */
 export async function keylessLimitBody(
   teamId: string,
   mode: string,
+  req?: Parameters<typeof keylessSignupSurface>[0],
 ): Promise<{
   success: false;
   error: string;
   reason: "credits";
+  signup_url: string;
   retry_after_seconds?: number;
 }> {
   const ip = keylessIpFromTeamId(teamId);
   let retryAfterSeconds: number | undefined;
   try {
     retryAfterSeconds = ip
-      ? positiveRedisTtl(await redisRateLimitClient.ttl(creditsKey(ip)))
+      ? positiveRedisTtl(await redisRateLimitClient.pttl(creditsKey(ip)))
       : undefined;
   } catch {
     // The reservation already proved the limit; missing TTL must not turn its
     // controlled 429 into a server error.
   }
+  const prompt = keylessLimitPrompt(
+    keylessPromptIp(ip),
+    req ? keylessSignupSurface(req) : "api",
+  );
   logger.warn("Keyless request blocked", {
     canonicalLog: "keyless/consume",
     event: "keyless_exhausted",
@@ -173,12 +296,14 @@ export async function keylessLimitBody(
     reason: "credits",
     mode,
     retryAfterSeconds,
+    ...(prompt.signupRef ? { signupRef: prompt.signupRef } : {}),
     ...keylessExhaustionTelemetry(ip ?? ""),
   });
   return {
     success: false,
-    error: KEYLESS_FREE_TIER_LIMIT_MESSAGE,
+    error: prompt.error,
     reason: "credits",
+    signup_url: prompt.signup_url,
     ...(retryAfterSeconds ? { retry_after_seconds: retryAfterSeconds } : {}),
   };
 }
@@ -197,8 +322,7 @@ type KeylessCreditReservationResult = {
 export async function consumeKeylessRequest(
   ip: string,
 ): Promise<KeylessConsumeResult> {
-  const requestLimit = KEYLESS_REQUESTS_PER_DAY ?? 0;
-  const creditLimit = KEYLESS_CREDITS_PER_DAY ?? 0;
+  const { requests: requestLimit, credits: creditLimit } = keylessLimitsFor(ip);
 
   const rKey = requestsKey(ip);
   const requestsUsed = await redisRateLimitClient.incr(rKey);
@@ -241,7 +365,7 @@ export async function reserveKeylessCredits(
   projectedCredits: number,
 ): Promise<KeylessCreditReservationResult> {
   const ip = keylessIpFromTeamId(teamId);
-  const limit = KEYLESS_CREDITS_PER_DAY ?? 0;
+  const limit = ip ? keylessLimitsFor(ip).credits : 0;
   if (!ip || !Number.isFinite(projectedCredits) || projectedCredits <= 0) {
     return { ok: true, creditsUsed: 0, limit };
   }
@@ -258,7 +382,7 @@ if current + projected > limit then
   return {0, current}
 end
 local total = redis.call("INCRBY", KEYS[1], projected)
-if total == projected then
+if redis.call("TTL", KEYS[1]) < 0 then
   redis.call("EXPIRE", KEYS[1], ttl)
 end
 return {1, total}
@@ -270,6 +394,7 @@ return {1, total}
     DAY_SECONDS,
   )) as [number, number];
 
+  if (result[0] !== 1) keylessCreditBlocksTotal.inc();
   return {
     ok: result[0] === 1,
     creditsUsed: Number(result[1] ?? 0),
@@ -280,6 +405,7 @@ return {1, total}
 /**
  * Reconcile a prior keyless reservation to actual credits. Delta may be
  * negative; the counter is clamped at zero to tolerate retries or races.
+ * The daily window keeps the expiry set on first use.
  */
 export async function adjustKeylessCredits(
   teamId: string,
@@ -298,11 +424,17 @@ export async function adjustKeylessCredits(
 local current = tonumber(redis.call("GET", KEYS[1]) or "0")
 local delta = tonumber(ARGV[1])
 local ttl = tonumber(ARGV[2])
+if delta <= 0 and redis.call("EXISTS", KEYS[1]) == 0 then
+  return 0
+end
 local next = current + delta
 if next < 0 then
   next = 0
 end
-redis.call("SET", KEYS[1], next, "EX", ttl)
+redis.call("SET", KEYS[1], next, "KEEPTTL")
+if redis.call("TTL", KEYS[1]) < 0 then
+  redis.call("EXPIRE", KEYS[1], ttl)
+end
 return next
 `,
     1,
@@ -314,12 +446,67 @@ return next
   return Number(total);
 }
 
+/** Absolute browser reservations, including prompt upgrades, with atomic receipts. */
+export async function updateKeylessBrowserCredits(
+  teamId: string,
+  sessionId: string,
+  credits: number,
+  finalize = false,
+): Promise<boolean> {
+  const ip = keylessIpFromTeamId(teamId);
+  if (!ip) return true;
+  const result = await redisRateLimitClient.eval(
+    `
+    local now = tonumber(ARGV[1])
+    local target = tonumber(ARGV[2])
+    local final = ARGV[3] == '1'
+    local reserved = tonumber(redis.call('HGET', KEYS[2], 'credits') or '0')
+    local deadline = tonumber(redis.call('HGET', KEYS[2], 'deadline') or '0')
+    if redis.call('HGET', KEYS[2], 'final') == '1' then
+      if final then return 1 else return 0 end
+    end
+    -- An expired budget cannot be refunded into a different day's allowance.
+    if deadline > 0 and deadline <= now then
+      if final then return 1 end
+      reserved = 0
+      deadline = 0
+    end
+    if final and deadline == 0 then return 1 end
+    local delta = target - reserved
+    if not final and delta <= 0 then return 1 end
+    local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+    if not final and current + delta > tonumber(ARGV[4]) then return 0 end
+    local ttl = redis.call('PTTL', KEYS[1])
+    if ttl <= 0 then ttl = 86400000 end
+    if deadline == 0 then deadline = now + ttl end
+    redis.call('SET', KEYS[1], math.max(0, current + delta), 'PX', ttl)
+    redis.call('HSET', KEYS[2], 'credits', target, 'deadline', deadline, 'final', ARGV[3])
+    redis.call('EXPIRE', KEYS[2], 172800)
+    return 1
+  `,
+    2,
+    creditsKey(ip),
+    `keyless_browser:${sessionId}`,
+    Date.now(),
+    Math.ceil(credits),
+    finalize ? "1" : "0",
+    keylessLimitsFor(ip).credits,
+  );
+  if (result !== 1 && !finalize) keylessCreditBlocksTotal.inc();
+  return result === 1;
+}
+
 /**
  * Read-only check of whether an IP could currently use the keyless tier (no
  * consumption). Used by the hosted MCP before a keyless tool call so an
  * ineligible caller receives structured recovery without an OAuth challenge.
+ * A World ID identity is checked against its own bucket and skips the IP
+ * checks, as it does in auth.
  */
-export async function checkKeylessEligibility(ip: string): Promise<{
+export async function checkKeylessEligibility(
+  ip: string,
+  worldIdIdentity?: string,
+): Promise<{
   eligible: boolean;
   reason?:
     | KeylessQuotaReason
@@ -330,23 +517,29 @@ export async function checkKeylessEligibility(ip: string): Promise<{
   retryAfterSeconds?: number;
 }> {
   if (!isKeylessConfigured()) return { eligible: false, reason: "disabled" };
-  if (!ip || !isKeylessIpEligible(ip)) {
-    return { eligible: false, reason: "ineligible_ip" };
+  if (worldIdIdentity) {
+    ip = worldIdIdentity;
+  } else {
+    if (!ip || !isKeylessIpEligible(ip)) {
+      return { eligible: false, reason: "ineligible_ip" };
+    }
+    // Key the Spur cache and quota buckets below off the canonical IPv4 form.
+    ip = normalizeKeylessIpv4(ip);
+    // Optional Spur Context check (only when SPUR_API_KEY is set): treat IPs on
+    // anonymizing/rotating infrastructure as ineligible so the hosted MCP can
+    // return a bounded recovery result instead of serving a request auth
+    // rejects.
+    if (await isKeylessIpSuspicious(ip)) {
+      return { eligible: false, reason: "suspicious" };
+    }
   }
-  // Key the Spur cache and quota buckets below off the canonical IPv4 form.
-  ip = normalizeKeylessIpv4(ip);
-  // Optional Spur Context check (only when SPUR_API_KEY is set): treat IPs on
-  // anonymizing/rotating infrastructure as ineligible so the hosted MCP can
-  // return a bounded recovery result instead of serving a request auth rejects.
-  if (await isKeylessIpSuspicious(ip)) {
-    return { eligible: false, reason: "suspicious" };
-  }
+  const limits = keylessLimitsFor(ip);
   try {
     const requestsUsed = parseInt(
       (await redisRateLimitClient.get(requestsKey(ip))) ?? "0",
       10,
     );
-    if (requestsUsed >= (KEYLESS_REQUESTS_PER_DAY ?? 0)) {
+    if (requestsUsed >= limits.requests) {
       return {
         eligible: false,
         reason: "requests",
@@ -358,7 +551,7 @@ export async function checkKeylessEligibility(ip: string): Promise<{
       (await redisRateLimitClient.get(creditKey)) ?? "0",
       10,
     );
-    if (creditsUsed >= (KEYLESS_CREDITS_PER_DAY ?? 0)) {
+    if (creditsUsed >= limits.credits) {
       return {
         eligible: false,
         reason: "credits",
@@ -408,6 +601,22 @@ export async function logKeylessCreditUsage(
   // record: self-hosted deployments without DB auth track nothing.
   if (config.USE_DB_AUTHENTICATION !== true) return;
 
+  keylessCreditsTotal.inc(creditsUsed);
+
+  // `keyless_credit_usage.ip` and the zero-credit line hold the raw client
+  // IP, which a World ID bucket isn't keyed on. Its usage goes to the same
+  // canonical log under the team id instead; the client IP of each World ID
+  // request is already on its `keyless/consume` line.
+  if (ip.startsWith(WORLD_ID_IDENTITY_PREFIX)) {
+    logger.info("Keyless World ID usage", {
+      canonicalLog: "keyless/usage",
+      teamId: teamUuid,
+      worldId: true,
+      creditsUsed,
+    });
+    return;
+  }
+
   if (creditsUsed <= 0) {
     // TODO(firecrawl-db): switch to a `keyless_credit_usage` row once the
     // zero-credit usage migration is merged. The IP is repeated in the
@@ -453,10 +662,18 @@ export async function chargeKeylessCredits(
     const inc = Math.ceil(credits);
     try {
       const key = creditsKey(ip);
-      const total = await redisRateLimitClient.incrby(key, inc);
-      if (total === inc) {
-        await redisRateLimitClient.expire(key, DAY_SECONDS);
-      }
+      await redisRateLimitClient.eval(
+        `
+redis.call("INCRBY", KEYS[1], ARGV[1])
+if redis.call("TTL", KEYS[1]) < 0 then
+  redis.call("EXPIRE", KEYS[1], ARGV[2])
+end
+`,
+        1,
+        key,
+        inc,
+        DAY_SECONDS,
+      );
     } catch {
       // Counter is best-effort; a missed charge just means the IP gets a few
       // extra free credits today.

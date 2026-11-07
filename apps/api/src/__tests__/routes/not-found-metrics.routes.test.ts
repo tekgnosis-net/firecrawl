@@ -34,8 +34,12 @@ function appUnderTest() {
   v2.post("/scrape", (_req, res) => res.status(200).json({ success: true }));
   // Mirrors the real /v2/crawl/:jobId table (src/routes/v2.ts): only GET and
   // DELETE are registered, never PATCH.
-  v2.get("/crawl/:jobId", (_req, res) => res.status(200).json({ success: true }));
-  v2.delete("/crawl/:jobId", (_req, res) => res.status(200).json({ success: true }));
+  v2.get("/crawl/:jobId", (_req, res) =>
+    res.status(200).json({ success: true }),
+  );
+  v2.delete("/crawl/:jobId", (_req, res) =>
+    res.status(200).json({ success: true }),
+  );
 
   app.use("/v2", v2);
   app.use(notFoundHandler);

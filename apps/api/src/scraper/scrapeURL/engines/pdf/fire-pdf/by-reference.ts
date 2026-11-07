@@ -12,7 +12,9 @@ import {
 } from "../../../../../controllers/v2/types";
 import { deterministicPercentage } from "./routing";
 import { storage } from "../../../../../lib/gcs-jobs";
+import { isUsOnly } from "../../../../../lib/us-only";
 import { FIRE_PDF_BY_REFERENCE_MAX_FILE_SIZE } from "../types";
+import { parseAlwaysFirePdf } from "./request-metadata";
 
 /** Input handle for a FirePDF async submit that travels by GCS reference
  * instead of inline base64. Produced by {@link uploadPdfInputForFirePdf}. */
@@ -164,8 +166,9 @@ export async function rewritePdfInputForFirePdf(
 }
 
 /**
- * The per-team large-PDF byte limit: the privileged cap for allowlisted
- * team ids, the default cap for everyone else, both clamped to the 256MB
+ * The per-team large-PDF byte limit: the privileged cap for teams with the
+ * `largePdfs` flag or an id on the env allowlist, the default cap for
+ * everyone else, both clamped to the 256MB
  * architectural ceiling. Every acquisition path enforces this one number —
  * the direct-download admission, the fire-engine handoff download, the
  * by-reference routing gate, and (as pdfMaxSize) fire-engine's own capture
@@ -182,10 +185,12 @@ export function largePdfLimitBytes(meta: Meta): number {
       .map(id => id.trim())
       .filter(Boolean),
   );
-  const raw =
-    teamId && privilegedIds.has(teamId)
-      ? config.PDF_BY_REFERENCE_MAX_BYTES_PRIVILEGED
-      : config.PDF_BY_REFERENCE_MAX_BYTES_DEFAULT;
+  const privileged =
+    meta.internalOptions.teamFlags?.largePdfs === true ||
+    (!!teamId && privilegedIds.has(teamId));
+  const raw = privileged
+    ? config.PDF_BY_REFERENCE_MAX_BYTES_PRIVILEGED
+    : config.PDF_BY_REFERENCE_MAX_BYTES_DEFAULT;
   // Config is schema-validated to positive integers; the clamp bounds both
   // ends anyway so an invalid value can never reject every PDF or send
   // fire-engine a nonsensical pdfMaxSize.
@@ -196,10 +201,13 @@ export function largePdfLimitBytes(meta: Meta): number {
  * id (same distribution as a random draw) precisely so every gate — the
  * fire-engine handoff grant, the download admission, and the PDF engine's
  * routing — sees the SAME verdict; a per-call random draw would let them
- * drift. Keyed apart from the async-cohort hash. */
+ * drift. Keyed apart from the async-cohort hash. Parse requests that must
+ * reach FirePDF (parseAlwaysFirePdf) and US-only teams are never diverted. */
 export function mineruDiverted(meta: Meta): boolean {
   return (
     config.MINERU_PERCENT > 0 &&
+    !parseAlwaysFirePdf(meta) &&
+    !isUsOnly(meta.internalOptions.teamFlags ?? undefined) &&
     deterministicPercentage(`mineru:${meta.id}`) < config.MINERU_PERCENT
   );
 }

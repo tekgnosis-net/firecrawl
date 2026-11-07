@@ -1,3 +1,4 @@
+use crate::xml::exceeds_element_depth;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use regex::Regex;
@@ -717,7 +718,20 @@ pub async fn filter_url(data: FilterUrlCall) -> Result<FilterUrlResult> {
   res.map_err(|e| Error::new(Status::GenericFailure, format!("Filter URL error: {e}")))
 }
 
+/// Sitemaps nest a handful of levels; anything deeper is malformed.
+const MAX_SITEMAP_DEPTH: usize = 32;
+
 fn _parse_sitemap_xml(xml_content: &str) -> std::result::Result<ParsedSitemap, String> {
+  if exceeds_element_depth(xml_content, MAX_SITEMAP_DEPTH) {
+    return Err(format!(
+      "XML parsing error: elements nested deeper than {MAX_SITEMAP_DEPTH} levels"
+    ));
+  }
+  // Entity replacement text can carry nested markup the depth scan never sees.
+  if xml_content.contains("<!ENTITY") {
+    return Err("XML parsing error: entity declarations are not supported".to_string());
+  }
+
   let doc = roxmltree::Document::parse_with_options(
     xml_content,
     roxmltree::ParsingOptions {
@@ -1004,6 +1018,68 @@ mod tests {
 
     let result = _parse_sitemap_xml(xml_content);
     assert!(result.is_err());
+  }
+
+  #[test]
+  fn test_parse_sitemap_xml_deeply_nested_errors_instead_of_overflowing() {
+    let xml_content = format!(
+      r#"<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{}"#,
+      "<url><loc>https://example.com/page%3C%2Floc%3E".repeat(50_000)
+    );
+
+    let result = _parse_sitemap_xml(&xml_content);
+    assert!(result.unwrap_err().contains("nested deeper than"));
+  }
+
+  #[test]
+  fn test_parse_sitemap_xml_deeply_nested_with_quoted_gt_errors() {
+    let xml_content = format!(
+      r#"<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{}"#,
+      r#"<url data="x/>" other='y>'>"#.repeat(100_000)
+    );
+
+    let result = _parse_sitemap_xml(&xml_content);
+    assert!(result.unwrap_err().contains("nested deeper than"));
+  }
+
+  #[test]
+  fn test_parse_sitemap_xml_entity_with_nested_markup_errors() {
+    let xml_content = format!(
+      r#"<!DOCTYPE urlset [<!ENTITY e "{}">]><urlset>&e;</urlset>"#,
+      "<url>".repeat(100_000)
+    );
+
+    let result = _parse_sitemap_xml(&xml_content);
+    assert!(result.unwrap_err().contains("entity declarations"));
+  }
+
+  #[test]
+  fn test_parse_sitemap_xml_with_doctype() {
+    let xml_content = r#"<?xml version="1.0"?>
+<!DOCTYPE urlset>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://example.com/page1</loc></url></urlset>"#;
+
+    let urlset = _parse_sitemap_xml(xml_content).unwrap().urlset.unwrap();
+    assert_eq!(urlset.url[0].loc[0], "https://example.com/page1");
+  }
+
+  #[test]
+  fn test_parse_sitemap_xml_with_extensions_comments_and_cdata() {
+    let xml_content = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!-- generated <by> a plugin -->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:image="http://www.google.com/schemas/sitemap-image/1.1" xmlns:video="http://www.google.com/schemas/sitemap-video/1.1">
+  <url>
+    <loc><![CDATA[https://example.com/page1]]></loc>
+    <image:image><image:loc>https://example.com/a.png</image:loc></image:image>
+    <video:video><video:title>t</video:title><video:price currency="USD">1</video:price><video:live/></video:video>
+  </url>
+  <url><loc>https://example.com/page2</loc></url>
+</urlset>"#;
+
+    let urlset = _parse_sitemap_xml(xml_content).unwrap().urlset.unwrap();
+    assert_eq!(urlset.url.len(), 2);
+    assert_eq!(urlset.url[0].loc[0], "https://example.com/page1");
+    assert_eq!(urlset.url[1].loc[0], "https://example.com/page2");
   }
 
   #[test]

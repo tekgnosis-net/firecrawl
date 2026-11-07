@@ -1,21 +1,58 @@
-import { and, desc, eq, gt, lt, or, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import * as schema from "../../db/schema";
 import { authCreditUsageChunkFromTeam } from "../../db/rpc";
+import { clickhouseClient } from "../../lib/clickhouse-client";
 import { logger } from "../../lib/logger";
+import { logMcpActionLog } from "../logging/log_job";
 
 const STATUSES = ["success", "error"] as const;
 const AUTH_TYPES = ["oauth", "api-key"] as const;
 const RESOURCES = new Set([
   "https://mcp.firecrawl.dev/v2/mcp",
   "https://mcp.firecrawl.dev/v2/mcp-oauth",
+  "https://mcp.firecrawl.dev/v2/mcp-search",
 ]);
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const POSTGRES_BIGINT_MAX = 9_223_372_036_854_775_807n;
 const SECRET_PATTERN =
   /(?:\bBearer\s+\S+|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b|\b(?:sk-|fc-|fco_|fcr_|fcmcp_)[A-Za-z0-9_-]+)/i;
+const SECRET_PATTERN_ALL = new RegExp(SECRET_PATTERN.source, "gi");
+// After any secret key, a leading auth scheme (Basic, Bearer, Token, ...) is
+// consumed with its credential so no part of "password=>Basic <b64>" survives.
+const DETAIL_SECRET_PAIR = new RegExp(
+  "(\\b(?:[A-Za-z0-9]*[_.-]?)(?:api[_-]?key|apikey|key|access[_-]?token|accesstoken|auth[_-]?token|token|client[_-]?secret|secret|password|passwd|passcode|pwd|auth|authorization|signature|sig|credentials?|session[_-]?id|sessionid|otp|nonce|verifier|cookie|jwt|(?:auth|oauth|authorization|verification|confirmation|reset|access|one[_-]?time)[_-]?code)[\"']?)(\\s*(?:=>|[=:])\\s*)(?:\"[^\"]*\"|'[^']*'|(?:(?:(?<=authorization[\"']?\\s*(?:=>|[=:])\\s*)[A-Za-z]+|Basic|Bearer|Token|Digest|Bot|ApiKey|Negotiate|NTLM)\\s+)?[^\\s&#\"',;]+)",
+  "gi",
+);
+// A Basic credential is base64 of "user:password"; only one that decodes
+// to a colon pair is redacted, so prose such as "Basic research" is kept.
+const DETAIL_BASIC_AUTH = /\bBasic\s+([A-Za-z0-9+/]{2,}={0,2})/gi;
+const DETAIL_QUERY_PAIR = /([?&][^\s=&#?]+=)[^\s&#]+/g;
+const DETAIL_URL = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>`]+/gi;
+const DETAIL_TOKEN_RUN = /[A-Za-z0-9]{16,}/g;
+const DETAIL_TOKEN_PATH =
+  /^(?:s|share|shared|invite|invitation|reset|reset[_-]?password|password[_-]?reset|verify|verification|confirm|confirmation|activate|magic|magic[_-]?link|token|auth|login|unsubscribe|callback|otp)$/i;
+const OBJECTIVE_MAX_LENGTH = 1000;
+const ERROR_MESSAGE_MAX_LENGTH = 300;
+const TARGET_MAX_LENGTH = 512;
+const ERROR_CODE_PATTERN = /^(?=.{2,64}$)[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
+const MCP_CLIENT_SOURCES = ["client_info", "user_agent", "oauth"] as const;
+const RATE_LIMIT_RETRY_OUTCOMES = [
+  "recovered",
+  "failed",
+  "over_cap",
+  "not_retryable",
+] as const;
+const DURATION_MS_MAX = 2_147_483_647;
+const LINEAGE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+const SESSION_SOURCES = ["token", "trace", "sse"] as const;
+const THREAD_SOURCES = ["argument", "session", "minted", "client"] as const;
+const LINEAGE_ID_SECRET_PATTERN =
+  /(?:^|[^A-Za-z0-9])(?:sk-|fc-|fco_|fcr_|fcmcp_)/i;
+const INVALID_ARGUMENTS_MAX = 10;
+const INVALID_ARGUMENT_PATTERN =
+  /^(?:\(root\)|\*|[A-Za-z0-9_.-]{1,64}):[a-z_]{1,40}$/;
 const RETENTION_DAYS = 30;
-const CLEANUP_BATCH_SIZE = 500;
 const ALLOWED_FIELDS = new Set([
   "team_id",
   "user_id",
@@ -29,11 +66,28 @@ const ALLOWED_FIELDS = new Set([
   "client_name",
   "client_version",
   "error_class",
+  "error_code",
+  "error_message",
+  "target",
   "resource",
+  "objective",
+  "api_job_id",
+  "mcp_origin",
+  "mcp_client",
+  "mcp_client_source",
+  "llm_model",
+  "duration_ms",
+  "invalid_arguments",
+  "rate_limit_retry",
+  "session_id",
+  "session_source",
+  "thread_id",
+  "thread_source",
 ]);
 
 export class McpActionLogValidationError extends Error {}
 export class McpActionLogAuthorizationError extends Error {}
+export class McpActionLogUnavailableError extends Error {}
 
 function invalid(message: string): never {
   throw new McpActionLogValidationError(message);
@@ -77,6 +131,170 @@ function text(value: unknown, field: string, max = 128, required = false) {
   return normalized || null;
 }
 
+function errorCode(value: unknown) {
+  if (value == null || value === "") return null;
+  if (
+    typeof value !== "string" ||
+    !ERROR_CODE_PATTERN.test(value) ||
+    SECRET_PATTERN.test(value)
+  ) {
+    invalid("error_code must be a lowercase snake_case code");
+  }
+  return value;
+}
+
+function tokenLikeSegment(segment: string) {
+  return (segment.match(DETAIL_TOKEN_RUN) ?? []).some(
+    run => /\d/.test(run) && /[A-Za-z]/.test(run),
+  );
+}
+
+/**
+ * Keeps a URL's scheme, host and plain path: userinfo, every query value, the
+ * fragment and token-like path segments become [redacted].
+ */
+function scrubbedUrl(url: string) {
+  const hashAt = url.indexOf("#");
+  const fragment =
+    hashAt === -1 || hashAt === url.length - 1 ? "" : "#[redacted]";
+  const beforeHash = hashAt === -1 ? url : url.slice(0, hashAt);
+  const queryAt = beforeHash.indexOf("?");
+  const base = queryAt === -1 ? beforeHash : beforeHash.slice(0, queryAt);
+  const query =
+    queryAt === -1
+      ? ""
+      : "?" +
+        beforeHash
+          .slice(queryAt + 1)
+          .split("&")
+          .map(pair => {
+            const eq = pair.indexOf("=");
+            if (eq === -1) return pair && "[redacted]";
+            return eq === pair.length - 1
+              ? pair
+              : pair.slice(0, eq + 1) + "[redacted]";
+          })
+          .join("&");
+  const match = /^([^:]+:\/\/)([^/]*)(.*)$/.exec(base);
+  if (!match) return base + query + fragment;
+  const [, scheme, authority, path] = match;
+  const host = authority.includes("@")
+    ? "[redacted]" + authority.slice(authority.lastIndexOf("@"))
+    : authority;
+  const segments = path.split("/");
+  const scrubbedPath = segments
+    .map((segment, i) =>
+      tokenLikeSegment(segment) ||
+      (i > 0 && DETAIL_TOKEN_PATH.test(segments[i - 1]))
+        ? "[redacted]"
+        : segment,
+    )
+    .join("/");
+  return scheme + host + scrubbedPath + query + fragment;
+}
+
+/**
+ * Error messages and targets also lose URL userinfo, query values, fragments,
+ * token-like path segments, bare query-string values, secret=value pairs
+ * (keys bare or quoted, as in JSON or Python and Ruby dicts) and Basic
+ * credentials.
+ */
+function scrubbedDetail(text: string) {
+  return text
+    .replace(SECRET_PATTERN_ALL, "[redacted]")
+    .replace(DETAIL_URL, scrubbedUrl)
+    .replace(DETAIL_QUERY_PAIR, "$1[redacted]")
+    .replace(DETAIL_BASIC_AUTH, (match, token: string) =>
+      Buffer.from(token, "base64").toString("latin1").includes(":")
+        ? "[redacted]"
+        : match,
+    )
+    .replace(DETAIL_SECRET_PAIR, "$1$2[redacted]");
+}
+
+/**
+ * Free text from the call (objective, error message, target URL):
+ * control characters become spaces, secret-like values become [redacted],
+ * and the result is cut to `max` characters rather than rejected.
+ */
+function redactedText(
+  value: unknown,
+  field: string,
+  max: number,
+  scrub: (text: string) => string = text => text,
+) {
+  if (value == null) return null;
+  if (typeof value !== "string") invalid(`${field} must be a string`);
+  const normalized = scrub(
+    value.slice(0, max * 4).replace(/[\u0000-\u001F\u007F-\u009F]+/g, " "),
+  )
+    .replace(SECRET_PATTERN_ALL, "[redacted]")
+    .replace(/\beyJ[A-Za-z0-9_.-]*$/, "[redacted]")
+    .trim()
+    .slice(0, max)
+    .replace(/[\uD800-\uDBFF]$/, "")
+    .trim();
+  return normalized || null;
+}
+
+function durationMs(value: unknown) {
+  if (value == null) return null;
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < 0 ||
+    value > DURATION_MS_MAX
+  ) {
+    invalid("duration_ms must be a non-negative integer");
+  }
+  return value;
+}
+
+function invalidArguments(value: unknown) {
+  if (value == null) return [];
+  if (
+    !Array.isArray(value) ||
+    value.length > INVALID_ARGUMENTS_MAX ||
+    !value.every(
+      label =>
+        typeof label === "string" && INVALID_ARGUMENT_PATTERN.test(label),
+    )
+  ) {
+    invalid(
+      `invalid_arguments must be at most ${INVALID_ARGUMENTS_MAX} <argument>:<issue> labels`,
+    );
+  }
+  return value as string[];
+}
+
+function lineage<T extends string>(
+  payload: Record<string, unknown>,
+  kind: "session" | "thread",
+  values: readonly T[],
+): { id: string | null; source: T | null } {
+  const id = payload[`${kind}_id`];
+  const source = payload[`${kind}_source`];
+  const hasId = id != null && id !== "";
+  const hasSource = source != null && source !== "";
+  if (hasId && (typeof id !== "string" || !LINEAGE_ID_PATTERN.test(id))) {
+    invalid(
+      `${kind}_id must be 1-128 letters, digits, dots, underscores, colons or hyphens`,
+    );
+  }
+  if (hasSource && !values.includes(source as T)) {
+    invalid(`${kind}_source must be one of ${values.join(", ")}`);
+  }
+  if (hasSource && !hasId) invalid(`${kind}_source requires ${kind}_id`);
+  const usable =
+    hasId &&
+    !SECRET_PATTERN.test(id as string) &&
+    !LINEAGE_ID_SECRET_PATTERN.test(id as string);
+  return {
+    id: usable ? (id as string) : null,
+    source: usable && hasSource ? (source as T) : null,
+  };
+}
+
 type McpActionLogInput = {
   team_id: string;
   user_id: string | null;
@@ -89,7 +307,39 @@ type McpActionLogInput = {
   client_name: string | null;
   client_version: string | null;
   error_class: string | null;
+  error_code: string | null;
+  error_message: string | null;
+  target: string | null;
   resource: string;
+  objective: string | null;
+  api_job_id: string | null;
+  mcp_origin: string | null;
+  mcp_client: string | null;
+  mcp_client_source: (typeof MCP_CLIENT_SOURCES)[number] | null;
+  llm_model: string | null;
+  duration_ms: number | null;
+  invalid_arguments: string[];
+  rate_limit_retry: (typeof RATE_LIMIT_RETRY_OUTCOMES)[number] | null;
+  session_id: string | null;
+  session_source: (typeof SESSION_SOURCES)[number] | null;
+  thread_id: string | null;
+  thread_source: (typeof THREAD_SOURCES)[number] | null;
+};
+
+type McpActionLogRow = {
+  id: string;
+  user_id: string | null;
+  api_key_id: string | null;
+  oauth_client_id: string | null;
+  auth_type: string;
+  tool_name: string;
+  status: string;
+  request_id: string;
+  client_name: string | null;
+  client_version: string | null;
+  error_class: string | null;
+  resource: string;
+  created_at: string;
 };
 
 export function normalizeMcpActionLogInput(
@@ -121,10 +371,32 @@ export function normalizeMcpActionLogInput(
     if (!userId) invalid("user_id is required for oauth events");
     if (!oauthClientId) invalid("oauth_client_id is required for oauth events");
   }
+  const mcpClientSource = payload.mcp_client_source ?? null;
+  if (
+    mcpClientSource !== null &&
+    !MCP_CLIENT_SOURCES.includes(
+      mcpClientSource as (typeof MCP_CLIENT_SOURCES)[number],
+    )
+  ) {
+    invalid("mcp_client_source must be client_info, user_agent or oauth");
+  }
+  const rateLimitRetry = payload.rate_limit_retry ?? null;
+  if (
+    rateLimitRetry !== null &&
+    !RATE_LIMIT_RETRY_OUTCOMES.includes(
+      rateLimitRetry as (typeof RATE_LIMIT_RETRY_OUTCOMES)[number],
+    )
+  ) {
+    invalid(
+      "rate_limit_retry must be recovered, failed, over_cap or not_retryable",
+    );
+  }
   const resource = text(payload.resource, "resource", 128, true)!;
   if (!RESOURCES.has(resource)) {
     invalid("resource must be a canonical hosted MCP URL");
   }
+  const session = lineage(payload, "session", SESSION_SOURCES);
+  const thread = lineage(payload, "thread", THREAD_SOURCES);
   return {
     team_id: uuid(payload.team_id, "team_id")!,
     user_id: userId,
@@ -137,7 +409,38 @@ export function normalizeMcpActionLogInput(
     client_name: text(payload.client_name, "client_name"),
     client_version: text(payload.client_version, "client_version"),
     error_class: text(payload.error_class, "error_class"),
+    error_code: errorCode(payload.error_code),
+    error_message: redactedText(
+      payload.error_message,
+      "error_message",
+      ERROR_MESSAGE_MAX_LENGTH,
+      scrubbedDetail,
+    ),
+    target: redactedText(
+      payload.target,
+      "target",
+      TARGET_MAX_LENGTH,
+      scrubbedDetail,
+    ),
     resource,
+    objective: redactedText(
+      payload.objective,
+      "objective",
+      OBJECTIVE_MAX_LENGTH,
+    ),
+    api_job_id: text(payload.api_job_id, "api_job_id"),
+    mcp_origin: text(payload.mcp_origin, "mcp_origin"),
+    mcp_client: text(payload.mcp_client, "mcp_client"),
+    mcp_client_source:
+      mcpClientSource as McpActionLogInput["mcp_client_source"],
+    llm_model: text(payload.llm_model, "llm_model"),
+    duration_ms: durationMs(payload.duration_ms),
+    invalid_arguments: invalidArguments(payload.invalid_arguments),
+    rate_limit_retry: rateLimitRetry as McpActionLogInput["rate_limit_retry"],
+    session_id: session.id,
+    session_source: session.source,
+    thread_id: thread.id,
+    thread_source: thread.source,
   };
 }
 
@@ -195,101 +498,9 @@ export async function resolveMcpActionLogTeamPolicy(db: any, teamId: string) {
   return { flags: rows[0].flags ?? null };
 }
 
-async function cleanupExpiredMcpActionLogs(db: any) {
-  await db.execute(sql`
-    with expired as (
-      select id from mcp_action_logs
-      where expires_at <= now()
-      order by expires_at asc
-      limit ${CLEANUP_BATCH_SIZE}
-    )
-    delete from mcp_action_logs
-    where id in (select id from expired)
-  `);
-}
-
-export async function purgeMcpActionLogsForTeam(db: any, teamId: string) {
-  await db
-    .delete(schema.mcp_action_logs)
-    .where(eq(schema.mcp_action_logs.team_id, teamId));
-}
-
-type RetentionTimer = {
-  unref?: () => void;
-};
-
-export function startMcpActionLogRetentionWorker(options: {
-  db: any;
-  intervalMs?: number;
-  setIntervalFn?: (callback: () => void, intervalMs: number) => RetentionTimer;
-  clearIntervalFn?: (timer: RetentionTimer) => void;
-}) {
-  const intervalMs = options.intervalMs ?? 5 * 60 * 1000;
-  const setIntervalFn =
-    options.setIntervalFn ?? ((callback, ms) => setInterval(callback, ms));
-  const clearIntervalFn =
-    options.clearIntervalFn ??
-    (timer => clearInterval(timer as NodeJS.Timeout));
-  let running = false;
-
-  const run = async () => {
-    if (running) return;
-    running = true;
-    try {
-      await cleanupExpiredMcpActionLogs(options.db);
-    } catch (error) {
-      logger.warn("Failed to clean up expired MCP action logs", { error });
-    } finally {
-      running = false;
-    }
-  };
-
-  const timer = setIntervalFn(() => void run(), intervalMs);
-  timer.unref?.();
-  const ready = run();
-
-  return {
-    ready,
-    run,
-    stop: () => clearIntervalFn(timer),
-  };
-}
-
-export function startMcpActionLogRetentionWorkerIfEnabled(options: {
-  enabled: boolean;
-  db: any;
-  intervalMs?: number;
-  setIntervalFn?: (callback: () => void, intervalMs: number) => RetentionTimer;
-  clearIntervalFn?: (timer: RetentionTimer) => void;
-}) {
-  if (!options.enabled) return null;
-  return startMcpActionLogRetentionWorker(options);
-}
-
-export async function recordMcpActionLog(db: any, input: McpActionLogInput) {
-  const expiresAt = new Date(
-    Date.now() + RETENTION_DAYS * 24 * 60 * 60 * 1000,
-  ).toISOString();
-  const rows = await db
-    .insert(schema.mcp_action_logs)
-    .values({
-      ...input,
-      api_key_id:
-        input.api_key_id === null
-          ? null
-          : sql`cast(${input.api_key_id} as bigint)`,
-      expires_at: expiresAt,
-    })
-    .onConflictDoNothing({
-      target: [
-        schema.mcp_action_logs.team_id,
-        schema.mcp_action_logs.request_id,
-      ],
-    })
-    .returning({ id: schema.mcp_action_logs.id });
-  return rows[0]
-    ? { disposition: "stored" as const, id: rows[0].id }
-    : { disposition: "duplicate" as const, id: null };
+export async function recordMcpActionLog(input: McpActionLogInput) {
+  await logMcpActionLog({ id: input.request_id, ...input });
+  return { disposition: "accepted" as const, id: input.request_id };
 }
 
 export async function authorizeMcpActionLogViewer(
@@ -345,16 +556,9 @@ export async function authorizeMcpActionLogViewer(
   return { userId: ownerId, role };
 }
 
-export function encodeMcpActionLogCursor(row: {
-  created_at: Date | string;
-  id: string;
-}) {
-  const createdAt =
-    row.created_at instanceof Date
-      ? row.created_at.toISOString()
-      : row.created_at;
+function encodeMcpActionLogCursor(row: { created_at: string; id: string }) {
   return Buffer.from(
-    JSON.stringify({ created_at: createdAt, id: row.id }),
+    JSON.stringify({ created_at: row.created_at, id: row.id }),
   ).toString("base64url");
 }
 
@@ -377,56 +581,39 @@ export function decodeMcpActionLogCursor(cursor: string) {
 }
 
 export async function listMcpActionLogs(
-  db: any,
   teamId: string,
   options: { limit?: number; cursor?: string | null } = {},
 ) {
+  if (!clickhouseClient) {
+    throw new McpActionLogUnavailableError(
+      "MCP action log storage is unavailable",
+    );
+  }
   const limit = Math.min(Math.max(options.limit ?? 50, 1), 100);
   const cursor = options.cursor
     ? decodeMcpActionLogCursor(options.cursor)
     : null;
-  const cursorClause = cursor
-    ? or(
-        lt(schema.mcp_action_logs.created_at, cursor.created_at),
-        and(
-          eq(schema.mcp_action_logs.created_at, cursor.created_at),
-          lt(schema.mcp_action_logs.id, cursor.id),
-        ),
-      )
-    : undefined;
-  const rows = await db
-    .select({
-      id: schema.mcp_action_logs.id,
-      user_id: schema.mcp_action_logs.user_id,
-      // API-key identifiers are bigint in Postgres. Read them as text so the
-      // JSON boundary never rounds values beyond JavaScript's safe integer range.
-      api_key_id: sql<
-        string | null
-      >`${schema.mcp_action_logs.api_key_id}::text`,
-      oauth_client_id: schema.mcp_action_logs.oauth_client_id,
-      auth_type: schema.mcp_action_logs.auth_type,
-      tool_name: schema.mcp_action_logs.tool_name,
-      status: schema.mcp_action_logs.status,
-      request_id: schema.mcp_action_logs.request_id,
-      client_name: schema.mcp_action_logs.client_name,
-      client_version: schema.mcp_action_logs.client_version,
-      error_class: schema.mcp_action_logs.error_class,
-      resource: schema.mcp_action_logs.resource,
-      created_at: schema.mcp_action_logs.created_at,
-    })
-    .from(schema.mcp_action_logs)
-    .where(
-      and(
-        eq(schema.mcp_action_logs.team_id, teamId),
-        gt(schema.mcp_action_logs.expires_at, new Date().toISOString()),
-        cursorClause,
-      ),
-    )
-    .orderBy(
-      desc(schema.mcp_action_logs.created_at),
-      desc(schema.mcp_action_logs.id),
-    )
-    .limit(limit + 1);
+  let rows: McpActionLogRow[];
+  try {
+    const result = await clickhouseClient.query({
+      // The explicit column list is the team-readable contract: objective,
+      // api_job_id, error_message and target stay out of it. Filters name `log.` columns because the
+      // formatted created_at alias would otherwise shadow the stored value.
+      query: `SELECT id, user_id, toString(log.api_key_id) AS api_key_id, oauth_client_id, auth_type, tool_name, status, request_id, client_name, client_version, error_class, resource, formatDateTime(log.created_at, '%Y-%m-%dT%H:%i:%S.%fZ', 'UTC') AS created_at FROM mcp_action_logs AS log FINAL WHERE log.team_id = {teamId: UUID} AND log.created_at > now64(9) - INTERVAL ${RETENTION_DAYS} DAY${cursor ? " AND (log.created_at, log.id) < (parseDateTime64BestEffort({before: String}, 9), {beforeId: UUID})" : ""} ORDER BY log.created_at DESC, log.id DESC LIMIT {limit: UInt32}`,
+      query_params: {
+        teamId,
+        limit: limit + 1,
+        ...(cursor ? { before: cursor.created_at, beforeId: cursor.id } : {}),
+      },
+      format: "JSONEachRow",
+    });
+    rows = await result.json<McpActionLogRow>();
+  } catch (error) {
+    logger.warn("Failed to read MCP action logs", { error });
+    throw new McpActionLogUnavailableError(
+      "MCP action log storage is unavailable",
+    );
+  }
   return {
     data: rows.slice(0, limit),
     nextCursor:

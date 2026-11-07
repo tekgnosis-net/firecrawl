@@ -1,6 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
 import { PgDialect } from "drizzle-orm/pg-core";
 
+const ch = vi.hoisted(() => ({
+  client: { query: vi.fn() } as { query: ReturnType<typeof vi.fn> } | null,
+  logMcpActionLog: vi.fn(),
+}));
+vi.mock("../../lib/clickhouse-client", () => ({
+  get clickhouseClient() {
+    return ch.client;
+  },
+}));
+vi.mock("../logging/log_job", () => ({
+  logMcpActionLog: ch.logMcpActionLog,
+}));
 vi.mock("../../db/rpc", () => ({
   authCreditUsageChunkFromTeam: vi.fn((db: any, teamId: string) =>
     db.getTeamPolicy(teamId),
@@ -9,14 +21,10 @@ vi.mock("../../db/rpc", () => ({
 import {
   authorizeMcpActionLogViewer,
   decodeMcpActionLogCursor,
-  encodeMcpActionLogCursor,
   listMcpActionLogs,
   normalizeMcpActionLogInput,
-  purgeMcpActionLogsForTeam,
   recordMcpActionLog,
   resolveMcpActionLogTeamPolicy,
-  startMcpActionLogRetentionWorker,
-  startMcpActionLogRetentionWorkerIfEnabled,
   validateMcpActionLogActor,
 } from "./action-logs";
 
@@ -131,6 +139,411 @@ describe("MCP action log contract", () => {
     );
   });
 
+  it("accepts the hosted MCP search resource", () => {
+    expect(
+      input({ resource: "https://mcp.firecrawl.dev/v2/mcp-search" }).resource,
+    ).toBe("https://mcp.firecrawl.dev/v2/mcp-search");
+  });
+
+  it("stores an optional, normalized objective with secret-like values redacted", () => {
+    expect(input()).toMatchObject({ objective: null, api_job_id: null });
+    expect(
+      input({
+        tool_name: "firecrawl_find_tools",
+        objective: "Pick a tool to extract product prices",
+      }),
+    ).toMatchObject({
+      objective: "Pick a tool to extract product prices",
+      api_job_id: null,
+    });
+    expect(input({ objective: null }).objective).toBeNull();
+    expect(input({ objective: "   " }).objective).toBeNull();
+    expect(
+      input({ objective: "  Compare pricing pages\nfor three vendors  " })
+        .objective,
+    ).toBe("Compare pricing pages for three vendors");
+    expect(
+      input({ objective: "Check docs using Bearer abc.def and fc-123abc" })
+        .objective,
+    ).toBe("Check docs using [redacted] and [redacted]");
+    expect(input({ objective: "Find\u0085the\u009fdocs" }).objective).toBe(
+      "Find the docs",
+    );
+    const started = performance.now();
+    expect(input({ objective: "eyJ-".repeat(16_000) }).objective).toBe(
+      "[redacted]",
+    );
+    expect(performance.now() - started).toBeLessThan(500);
+    const cutJwt = `${`fc-${"x".repeat(96)} `.repeat(39)}eyJhbGciOi.eyJ${"a".repeat(200)}.c2ln`;
+    expect(input({ objective: cutJwt }).objective).toBe(
+      `${"[redacted] ".repeat(39)}[redacted]`,
+    );
+    expect(input({ objective: "x".repeat(1200) }).objective).toBe(
+      "x".repeat(1000),
+    );
+    expect(input({ objective: `${"x".repeat(999)}\u{1F600}` }).objective).toBe(
+      "x".repeat(999),
+    );
+    expect(() => input({ objective: 42 })).toThrow(
+      "objective must be a string",
+    );
+  });
+
+  it("stores an optional API job ID with the standard text limits", () => {
+    expect(input({ api_job_id: " 0190a5d4-7b10-7cc3 " }).api_job_id).toBe(
+      "0190a5d4-7b10-7cc3",
+    );
+    expect(input({ api_job_id: "" }).api_job_id).toBeNull();
+    expect(() => input({ api_job_id: "j".repeat(129) })).toThrow(
+      "api_job_id must be at most 128 characters",
+    );
+    expect(() => input({ api_job_id: "fc-secret" })).toThrow(
+      "api_job_id must not contain secret-like values",
+    );
+    expect(() => input({ api_job_id: 7 })).toThrow(
+      "api_job_id must be a string",
+    );
+  });
+
+  it("stores an optional error message and target, redacted and capped", () => {
+    expect(input()).toMatchObject({ error_message: null, target: null });
+    expect(
+      input({
+        status: "error",
+        error_message: "Request failed with status code 408: Scrape timed out",
+        target: "https://example.com/pricing",
+      }),
+    ).toMatchObject({
+      error_message: "Request failed with status code 408: Scrape timed out",
+      target: "https://example.com/pricing",
+    });
+    expect(input({ error_message: "", target: "  " })).toMatchObject({
+      error_message: null,
+      target: null,
+    });
+    expect(
+      input({ error_message: "Unauthorized:\nBearer abc.def for fc-123abc" })
+        .error_message,
+    ).toBe("Unauthorized: [redacted] for [redacted]");
+    expect(
+      input({ target: "https://example.com/?key=fc-123abc&page=2" }).target,
+    ).toBe("https://example.com/?key=[redacted]&page=[redacted]");
+    expect(
+      input({
+        target:
+          "https://user:pw@example.com/oauth/callback?code=c0de&state=s7ate&flag#access_token=t",
+      }).target,
+    ).toBe(
+      "https://[redacted]@example.com/oauth/callback?code=[redacted]&state=[redacted]&[redacted]#[redacted]",
+    );
+    expect(
+      input({
+        target:
+          "https://files.example.com/scl/fi/k8sj2h4l9q0w1e3r5t7y/report.pdf?dl=0",
+      }).target,
+    ).toBe(
+      "https://files.example.com/scl/fi/[redacted]/report.pdf?dl=[redacted]",
+    );
+    expect(
+      input({ target: "https://example.com/reset-password/abc" }).target,
+    ).toBe("https://example.com/reset-password/[redacted]");
+    expect(
+      input({ target: "https://example.com/blog/how-to-build-an-api-in-2024" })
+        .target,
+    ).toBe("https://example.com/blog/how-to-build-an-api-in-2024");
+    expect(
+      input({
+        error_message:
+          "Authorization: Basic dXNlcjpwYXNz; otp=123456 resetToken: r3s3t verification_code=99 bad ?code=abc&state=def",
+      }).error_message,
+    ).toBe(
+      "Authorization: [redacted]; otp=[redacted] resetToken: [redacted] verification_code=[redacted] bad ?code=[redacted]&state=[redacted]",
+    );
+    expect(input({ error_message: "Status code: 500" }).error_message).toBe(
+      "Status code: 500",
+    );
+    expect(
+      input({
+        error_message:
+          "{'password': 'hunter2', 'api_key': 'abc123secret'} {'Authorization': 'Basic dXNlcjpwYXNz'} {\"token\"=>\"t0k\"}",
+      }).error_message,
+    ).toBe(
+      "{'password': [redacted], 'api_key': [redacted]} {'Authorization': [redacted]} {\"token\"=>[redacted]}",
+    );
+    expect(
+      input({ error_message: "401 for Basic dXNlcjpwYXNz on Basic research" })
+        .error_message,
+    ).toBe("401 for [redacted] on Basic research");
+    expect(
+      input({
+        error_message: "password=>Basic dXNlcjpwYXNz cred: Basic dXNlcjpwYXNz",
+      }).error_message,
+    ).toBe("password=>[redacted] cred: [redacted]");
+    expect(input({ error_message: "401 for Basic YTo=" }).error_message).toBe(
+      "401 for [redacted]",
+    );
+    for (const [message, expected] of [
+      ["password=Basic dXNlcjpwYXNz", "password=[redacted]"],
+      ["x-auth: Basic dXNlcjpwYXNz", "x-auth: [redacted]"],
+      ["password=Basic c2VjcmV0dG9rZW4", "password=[redacted]"],
+      ["auth_token: Token abc123tok", "auth_token: [redacted]"],
+      ["secret=Bearer abc123tok", "secret=[redacted]"],
+      ["password=hunter2 Basic research", "password=[redacted] Basic research"],
+    ]) {
+      expect(input({ error_message: message }).error_message).toBe(expected);
+    }
+    expect(input({ error_message: "x".repeat(400) }).error_message).toBe(
+      "x".repeat(300),
+    );
+    expect(input({ target: "q".repeat(600) }).target).toBe("q".repeat(512));
+    expect(input({ target: `${"q".repeat(511)}\u{1F600}` }).target).toBe(
+      "q".repeat(511),
+    );
+    expect(() => input({ error_message: 500 })).toThrow(
+      "error_message must be a string",
+    );
+    expect(() => input({ target: ["https://example.com"] })).toThrow(
+      "target must be a string",
+    );
+  });
+
+  it("stores an optional coarse error code and rejects anything but snake_case", () => {
+    expect(input().error_code).toBeNull();
+    expect(
+      input({ status: "error", error_code: "rate_limited" }).error_code,
+    ).toBe("rate_limited");
+    expect(
+      input({ status: "error", error_code: "scrape_all_engines_failed" })
+        .error_code,
+    ).toBe("scrape_all_engines_failed");
+    expect(input({ error_code: "" }).error_code).toBeNull();
+    for (const value of [
+      "Rate limit exceeded",
+      "https://example.com",
+      "RATE_LIMITED",
+      "rate_",
+      "rate__limited",
+      "fcmcp_abc123",
+      "x".repeat(65),
+      429,
+    ]) {
+      expect(() => input({ error_code: value })).toThrow(
+        "error_code must be a lowercase snake_case code",
+      );
+    }
+  });
+
+  it("stores the optional per-call fields the hosted MCP reads itself", () => {
+    expect(input()).toMatchObject({
+      mcp_origin: null,
+      mcp_client: null,
+      mcp_client_source: null,
+      llm_model: null,
+      duration_ms: null,
+      invalid_arguments: [],
+      rate_limit_retry: null,
+    });
+    expect(
+      input({
+        status: "error",
+        error_class: "InvalidArguments",
+        mcp_origin: "mcp-ua-codex-cli-rs",
+        mcp_client: "codex",
+        mcp_client_source: "user_agent",
+        llm_model: " gpt-6.1-sol ",
+        duration_ms: 55,
+        invalid_arguments: ["limit:invalid_type", "*:unrecognized_keys"],
+      }),
+    ).toMatchObject({
+      mcp_origin: "mcp-ua-codex-cli-rs",
+      mcp_client: "codex",
+      mcp_client_source: "user_agent",
+      llm_model: "gpt-6.1-sol",
+      duration_ms: 55,
+      invalid_arguments: ["limit:invalid_type", "*:unrecognized_keys"],
+    });
+    expect(input({ duration_ms: 0 }).duration_ms).toBe(0);
+    for (const rate_limit_retry of [
+      "recovered",
+      "failed",
+      "over_cap",
+      "not_retryable",
+    ]) {
+      expect(input({ rate_limit_retry }).rate_limit_retry).toBe(
+        rate_limit_retry,
+      );
+    }
+    expect(input({ invalid_arguments: ["(root):invalid_type"] })).toMatchObject(
+      { invalid_arguments: ["(root):invalid_type"] },
+    );
+  });
+
+  it("rejects malformed per-call fields", () => {
+    expect(() => input({ mcp_client_source: "header" })).toThrow(
+      "mcp_client_source must be client_info, user_agent or oauth",
+    );
+    for (const duration_ms of [-1, 1.5, "55", 2_147_483_648]) {
+      expect(() => input({ duration_ms })).toThrow(
+        "duration_ms must be a non-negative integer",
+      );
+    }
+    for (const invalid_arguments of [
+      "limit:invalid_type",
+      ["limit"],
+      ["limit:Invalid Type"],
+      ["my secret value:custom"],
+      Array.from({ length: 11 }, (_, i) => `a${i}:invalid_type`),
+    ]) {
+      expect(() => input({ invalid_arguments })).toThrow(
+        "invalid_arguments must be at most 10 <argument>:<issue> labels",
+      );
+    }
+    for (const rate_limit_retry of ["retrying", "RECOVERED", 1]) {
+      expect(() => input({ rate_limit_retry })).toThrow(
+        "rate_limit_retry must be recovered, failed, over_cap or not_retryable",
+      );
+    }
+    expect(() => input({ llm_model: "m".repeat(129) })).toThrow(
+      "llm_model must be at most 128 characters",
+    );
+    expect(() => input({ mcp_client: "fc-secret" })).toThrow(
+      "mcp_client must not contain secret-like values",
+    );
+  });
+
+  it("stores optional session and thread ids with their sources", () => {
+    expect(input()).toMatchObject({
+      session_id: null,
+      session_source: null,
+      thread_id: null,
+      thread_source: null,
+    });
+    expect(
+      input({
+        session_id: "AbC-123_xyz.789:abcdefg",
+        session_source: "token",
+        thread_id: "0b7c9a8e-1f2d-4e3c-9b8a-7f6e5d4c3b2a",
+        thread_source: "argument",
+      }),
+    ).toMatchObject({
+      session_id: "AbC-123_xyz.789:abcdefg",
+      session_source: "token",
+      thread_id: "0b7c9a8e-1f2d-4e3c-9b8a-7f6e5d4c3b2a",
+      thread_source: "argument",
+    });
+    expect(
+      input({
+        session_id: "s".repeat(128),
+        thread_id: "t",
+        thread_source: "minted",
+      }),
+    ).toMatchObject({
+      session_id: "s".repeat(128),
+      session_source: null,
+      thread_id: "t",
+      thread_source: "minted",
+    });
+    expect(
+      input({
+        thread_id: "0f8fad5b-d9cb-869f-a165-70867728950e",
+        thread_source: "client",
+      }),
+    ).toMatchObject({
+      thread_id: "0f8fad5b-d9cb-869f-a165-70867728950e",
+      thread_source: "client",
+    });
+  });
+
+  it("stores a credential-like session or thread id as null instead of rejecting the event", async () => {
+    ch.logMcpActionLog.mockReset().mockResolvedValue(undefined);
+    await expect(
+      recordMcpActionLog(
+        input({
+          session_id: "fc-FAKESECRET1234567890",
+          session_source: "trace",
+        }),
+      ),
+    ).resolves.toEqual({ disposition: "accepted", id: REQUEST_ID });
+    expect(ch.logMcpActionLog.mock.calls[0][0]).toMatchObject({
+      id: REQUEST_ID,
+      session_id: null,
+      session_source: null,
+    });
+
+    expect(
+      input({
+        session_id: "fc-FAKESECRET1234567890",
+        session_source: "token",
+        thread_id: "sk-FAKESECRET1234567890",
+        thread_source: "argument",
+      }),
+    ).toMatchObject({
+      session_id: null,
+      session_source: null,
+      thread_id: null,
+      thread_source: null,
+    });
+    expect(
+      input({
+        session_id: "fc-FAKESECRET1234567890",
+        thread_id: "thread-1",
+        thread_source: "minted",
+      }),
+    ).toMatchObject({
+      session_id: null,
+      thread_id: "thread-1",
+      thread_source: "minted",
+    });
+    for (const id of [
+      "x_fc-FAKESECRET1234567890",
+      "_sk-FAKESECRET1234567890",
+      "s_fcmcp_FAKESECRET1234567890",
+    ]) {
+      expect(
+        input({
+          session_id: id,
+          session_source: "token",
+          thread_id: id,
+          thread_source: "client",
+        }),
+      ).toMatchObject({
+        session_id: null,
+        session_source: null,
+        thread_id: null,
+        thread_source: null,
+      });
+    }
+    expect(() =>
+      input({
+        session_id: "fc-FAKESECRET1234567890",
+        session_source: "header",
+      }),
+    ).toThrow("session_source must be one of token, trace, sse");
+  });
+
+  it("rejects malformed session and thread fields", () => {
+    for (const session_id of ["s".repeat(129), "has space", "a/b", 42]) {
+      expect(() => input({ session_id })).toThrow(
+        "session_id must be 1-128 letters, digits, dots, underscores, colons or hyphens",
+      );
+    }
+    expect(() => input({ thread_id: "é" })).toThrow(
+      "thread_id must be 1-128 letters, digits, dots, underscores, colons or hyphens",
+    );
+    expect(() =>
+      input({ session_id: "abc", session_source: "header" }),
+    ).toThrow("session_source must be one of token, trace, sse");
+    expect(() => input({ thread_id: "abc", thread_source: "Session" })).toThrow(
+      "thread_source must be one of argument, session, minted, client",
+    );
+    expect(() => input({ session_source: "token" })).toThrow(
+      "session_source requires session_id",
+    );
+    expect(() => input({ thread_source: "session" })).toThrow(
+      "thread_source requires thread_id",
+    );
+  });
+
   it("validates API-key and OAuth actors against the claimed team", async () => {
     const apiKeyDb = {
       select: vi.fn(() => ({
@@ -198,24 +611,58 @@ describe("MCP action log contract", () => {
     expect(primaryDb.getTeamPolicy).toHaveBeenCalledWith(TEAM_ID);
   });
 
-  it("reports stored and duplicate deliveries correctly", async () => {
-    const returning = vi.fn().mockResolvedValue([]);
-    const onConflictDoNothing = vi.fn(() => ({ returning }));
-    const values = vi.fn(() => ({ onConflictDoNothing }));
-    const db = { insert: () => ({ values }) };
-
-    await expect(recordMcpActionLog(db as any, input())).resolves.toEqual({
-      disposition: "duplicate",
-      id: null,
-    });
-    expect(onConflictDoNothing).toHaveBeenCalledTimes(1);
-    expect((values.mock.calls as any)[0][0]).not.toHaveProperty("user_agent");
-
-    returning.mockResolvedValueOnce([{ id: REQUEST_ID }]);
-    await expect(recordMcpActionLog(db as any, input())).resolves.toEqual({
-      disposition: "stored",
+  it("publishes accepted events keyed by the MCP request ID", async () => {
+    ch.logMcpActionLog.mockReset().mockResolvedValue(undefined);
+    await expect(
+      recordMcpActionLog(
+        input({
+          objective: "Find the refund policy",
+          api_job_id: REQUEST_ID,
+          error_code: "rate_limited",
+          error_message: "Rate limit exceeded",
+          target: "https://example.com/pricing",
+          user_agent: "Claude/1.0",
+          mcp_origin: "mcp-ua-codex-cli-rs",
+          mcp_client: "codex-cli-rs",
+          mcp_client_source: "user_agent",
+          llm_model: "gpt-6.1-sol",
+          duration_ms: 55,
+          invalid_arguments: ["limit:invalid_type"],
+          rate_limit_retry: "recovered",
+          session_id: "AbC-123_xyz.789:abcdefg",
+          session_source: "trace",
+          thread_id: "AbC-123_xyz.789:abcdefg",
+          thread_source: "session",
+        }),
+      ),
+    ).resolves.toEqual({ disposition: "accepted", id: REQUEST_ID });
+    const row = ch.logMcpActionLog.mock.calls[0][0];
+    expect(row).toMatchObject({
       id: REQUEST_ID,
+      request_id: REQUEST_ID,
+      team_id: TEAM_ID,
+      api_key_id: "123",
+      objective: "Find the refund policy",
+      api_job_id: REQUEST_ID,
+      error_code: "rate_limited",
+      error_message: "Rate limit exceeded",
+      target: "https://example.com/pricing",
+      mcp_origin: "mcp-ua-codex-cli-rs",
+      mcp_client: "codex-cli-rs",
+      mcp_client_source: "user_agent",
+      llm_model: "gpt-6.1-sol",
+      duration_ms: 55,
+      invalid_arguments: ["limit:invalid_type"],
+      rate_limit_retry: "recovered",
+      session_id: "AbC-123_xyz.789:abcdefg",
+      session_source: "trace",
+      thread_id: "AbC-123_xyz.789:abcdefg",
+      thread_source: "session",
     });
+    expect(row).not.toHaveProperty("user_agent");
+
+    ch.logMcpActionLog.mockRejectedValueOnce(new Error("publish failed"));
+    await expect(recordMcpActionLog(input())).rejects.toThrow("publish failed");
   });
 
   it("requires the API-key owner to be a team admin or owner for listing", async () => {
@@ -258,96 +705,81 @@ describe("MCP action log contract", () => {
     ).rejects.toThrow("An owner-bound API key is required");
   });
 
-  it("purges all retained rows for a team on the supplied primary DB", async () => {
-    const where = vi.fn().mockResolvedValue(undefined);
-    const db = { delete: vi.fn(() => ({ where })) };
-    await purgeMcpActionLogsForTeam(db as any, TEAM_ID);
-    expect(db.delete).toHaveBeenCalledTimes(1);
-    expect(where).toHaveBeenCalledTimes(1);
-  });
-
-  it("runs bounded retention independently on an unrefed, stoppable timer", async () => {
-    const db = { execute: vi.fn().mockResolvedValue(undefined) };
-    let callback: (() => void) | undefined;
-    const timer = { unref: vi.fn() };
-    const clear = vi.fn();
-    const worker = startMcpActionLogRetentionWorker({
-      db,
-      intervalMs: 1234,
-      setIntervalFn: (next, interval) => {
-        callback = next;
-        expect(interval).toBe(1234);
-        return timer;
-      },
-      clearIntervalFn: clear,
-    });
-    await worker.ready;
-    expect(db.execute).toHaveBeenCalled();
-    expect(timer.unref).toHaveBeenCalledTimes(1);
-    callback?.();
-    await vi.waitFor(() =>
-      expect(db.execute.mock.calls.length).toBeGreaterThan(1),
-    );
-    worker.stop();
-    expect(clear).toHaveBeenCalledWith(timer);
-  });
-
-  it("does not touch storage when retention is disabled", () => {
-    const db = { execute: vi.fn() };
-    const setIntervalFn = vi.fn();
-    expect(
-      startMcpActionLogRetentionWorkerIfEnabled({
-        enabled: false,
-        db,
-        setIntervalFn,
-      }),
-    ).toBeNull();
-    expect(db.execute).not.toHaveBeenCalled();
-    expect(setIntervalFn).not.toHaveBeenCalled();
-  });
-
-  it("paginates non-expired rows with stable cursors", async () => {
+  it("paginates non-expired ClickHouse rows with stable cursors", async () => {
     const rows = [
       {
         id: REQUEST_ID,
         api_key_id: "9007199254740993",
-        created_at: "2026-07-10T10:03:00.000Z",
+        created_at: "2026-07-10T10:03:00.123456789Z",
       },
-      { id: USER_ID, api_key_id: null, created_at: "2026-07-10T10:02:00.000Z" },
+      {
+        id: USER_ID,
+        api_key_id: null,
+        created_at: "2026-07-10T10:02:00.000000000Z",
+      },
     ];
-    const execute = vi.fn().mockResolvedValue(undefined);
-    const db = {
-      execute,
-      select: () => ({
-        from() {
-          return this;
-        },
-        where() {
-          return this;
-        },
-        orderBy() {
-          return this;
-        },
-        limit: () => Promise.resolve(rows),
-      }),
+    ch.client = {
+      query: vi.fn().mockResolvedValue({ json: async () => rows }),
     };
-    const result = await listMcpActionLogs(db as any, TEAM_ID, { limit: 1 });
+    const result = await listMcpActionLogs(TEAM_ID, { limit: 1 });
     expect(result.data).toEqual(rows.slice(0, 1));
     expect(result.data[0].api_key_id).toBe("9007199254740993");
     expect(decodeMcpActionLogCursor(result.nextCursor!)).toEqual({
       id: rows[0].id,
       created_at: rows[0].created_at,
     });
-    expect(execute).not.toHaveBeenCalled();
+    const first = ch.client.query.mock.calls[0][0];
+    expect(first.query).toContain("FROM mcp_action_logs AS log FINAL");
+    expect(first.query).toContain("log.team_id = {teamId: UUID}");
+    expect(first.query).toContain("INTERVAL 30 DAY");
+    expect(first.query).not.toContain("{beforeId: UUID}");
+    expect(first.query_params).toEqual({ teamId: TEAM_ID, limit: 2 });
 
-    const cursor = encodeMcpActionLogCursor(rows[0]);
-    expect(decodeMcpActionLogCursor(cursor)).toEqual({
-      id: rows[0].id,
-      created_at: rows[0].created_at,
+    await listMcpActionLogs(TEAM_ID, { limit: 500, cursor: result.nextCursor });
+    const second = ch.client.query.mock.calls[1][0];
+    expect(second.query).toContain(
+      "(log.created_at, log.id) < (parseDateTime64BestEffort({before: String}, 9), {beforeId: UUID})",
+    );
+    expect(second.query_params).toEqual({
+      teamId: TEAM_ID,
+      limit: 101,
+      before: rows[0].created_at,
+      beforeId: rows[0].id,
     });
-    expect(() => decodeMcpActionLogCursor("bad")).toThrow("cursor is invalid");
 
-    const complete = await listMcpActionLogs(db as any, TEAM_ID, { limit: 2 });
+    expect(() => decodeMcpActionLogCursor("bad")).toThrow("cursor is invalid");
+    await expect(listMcpActionLogs(TEAM_ID, { cursor: "bad" })).rejects.toThrow(
+      "cursor is invalid",
+    );
+
+    const complete = await listMcpActionLogs(TEAM_ID, { limit: 2 });
     expect(complete.data[1].api_key_id).toBeNull();
+    expect(complete.nextCursor).toBeNull();
+  });
+
+  it("never selects call content or the API job ID for the team-readable list", async () => {
+    ch.client = { query: vi.fn().mockResolvedValue({ json: async () => [] }) };
+    await listMcpActionLogs(TEAM_ID);
+    const sql = ch.client.query.mock.calls[0][0].query as string;
+    const columns = sql.slice(0, sql.indexOf(" FROM "));
+    expect(columns).toContain("tool_name");
+    expect(columns).not.toContain("objective");
+    expect(columns).not.toContain("api_job_id");
+    expect(columns).not.toContain("error_message");
+    expect(columns).not.toMatch(/\btarget\b/);
+  });
+
+  it("reports storage as unavailable when the read fails", async () => {
+    ch.client = { query: vi.fn().mockRejectedValue(new Error("timeout")) };
+    await expect(listMcpActionLogs(TEAM_ID)).rejects.toThrow(
+      "MCP action log storage is unavailable",
+    );
+  });
+
+  it("reports storage as unavailable without ClickHouse", async () => {
+    ch.client = null;
+    await expect(listMcpActionLogs(TEAM_ID)).rejects.toThrow(
+      "MCP action log storage is unavailable",
+    );
   });
 });

@@ -51,9 +51,8 @@ vi.mock("../../../lib/key-restriction", () => ({
   checkKeyEndpointRestriction: vi.fn().mockResolvedValue({ allowed: true }),
 }));
 
-vi.mock("../../../services/sentry", () => ({
-  applyZdrScope: vi.fn(),
-  captureExceptionWithZdrCheck: vi.fn(),
+vi.mock("../../../lib/alexandria-activity", () => ({
+  markAlexandriaActivity: vi.fn(),
 }));
 
 vi.mock("../../../lib/logger", () => ({
@@ -67,6 +66,7 @@ vi.mock("../../../lib/logger", () => ({
 }));
 
 import { searchController } from "../search";
+import { markAlexandriaActivity } from "../../../lib/alexandria-activity";
 
 const TEAM_ID = "11111111-1111-1111-1111-111111111111";
 
@@ -91,7 +91,7 @@ function executeResult(overrides: Record<string, any> = {}) {
   return {
     response: { web: developerResults },
     totalResultsCount: 2,
-    developerResultsCount: 2,
+    indexResultsCount: 2,
     searchCredits: 2,
     scrapeCredits: 0,
     totalCredits: 2,
@@ -148,7 +148,12 @@ describe("developer category code_searches ledger", () => {
     await searchController(req, res);
 
     expect(res.status).toHaveBeenCalledWith(429);
-    expect(mockKeylessLimitBody).toHaveBeenCalledWith(TEAM_ID, "v2_search");
+    // The request picks the utm_medium of the caller's signup link.
+    expect(mockKeylessLimitBody).toHaveBeenCalledWith(
+      TEAM_ID,
+      "v2_search",
+      req,
+    );
     expect(res.json).toHaveBeenCalledWith({
       success: false,
       error: "keyless limit reached",
@@ -212,7 +217,7 @@ describe("developer category code_searches ledger", () => {
       executeResult({ response: { web: [] } }),
     );
 
-    for (const categories of [undefined, ["github"]]) {
+    for (const categories of [undefined, ["pdf"]]) {
       mockLogResearchEndpoint.mockClear();
       const req = makeReq({
         query: "http client",
@@ -273,7 +278,7 @@ describe("developer category code_searches ledger", () => {
       executeResult({
         response: { web: [] },
         totalResultsCount: 0,
-        developerResultsCount: 0,
+        indexResultsCount: 0,
       }),
     );
     const req = makeReq({ query: "http client", categories: ["developer"] });
@@ -324,5 +329,221 @@ describe("developer category code_searches ledger", () => {
       { type: "developer" },
     ]);
     expect(res.status).not.toHaveBeenCalledWith(403);
+  });
+});
+
+describe("gov category gov_searches ledger", () => {
+  it("writes exactly one gov_searches row for a gov category search", async () => {
+    const req = makeReq({ query: "zoning variance", categories: ["gov"] });
+    const res = makeRes();
+
+    await searchController(req, res);
+    await flushAsync();
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(mockLogResearchEndpoint).toHaveBeenCalledTimes(1);
+    const row = mockLogResearchEndpoint.mock.calls[0][0];
+    expect(row.table).toBe("gov_searches");
+    expect(row.target).toBe("zoning variance");
+    expect(row.num_results).toBe(2);
+    expect(row.options.categories).toEqual([{ type: "gov" }]);
+    expect(row.options.via).toBe("search_category");
+  });
+
+  it("reserves no keyless credits for a gov category search", async () => {
+    mockProjectSearchTotalCredits.mockReturnValue(2);
+    mockReserveKeylessCredits.mockResolvedValue({ ok: false });
+    const req = makeReq({ query: "zoning variance", categories: ["gov"] });
+    const res = makeRes();
+
+    await searchController(req, res);
+
+    expect(mockReserveKeylessCredits).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(200);
+  });
+});
+
+describe("tool discovery availability", () => {
+  const unavailable = executeResult({
+    response: { tools: [] },
+    totalResultsCount: 0,
+    indexResultsCount: 0,
+    searchCredits: 0,
+    totalCredits: 0,
+    toolsWarning: "Some tool discovery results are unavailable.",
+    toolsUnavailable: true,
+  });
+
+  it("answers a retryable 503 when a tools-only search finds nothing because discovery failed", async () => {
+    mockExecuteSearch.mockResolvedValue(unavailable);
+    const res = makeRes();
+
+    await searchController(
+      makeReq({ query: "weather", sources: [{ type: "alexandria" }] }),
+      res,
+    );
+
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        success: false,
+        code: "TOOL_DISCOVERY_UNAVAILABLE",
+      }),
+    );
+    expect(mockLogSearch).toHaveBeenCalledWith(
+      expect.objectContaining({ is_successful: false, credits_cost: 0 }),
+    );
+  });
+
+  it("keeps the partial success when web results answered", async () => {
+    mockExecuteSearch.mockResolvedValue({
+      ...unavailable,
+      response: { web: developerResults, tools: [] },
+      totalResultsCount: 2,
+    });
+    const res = makeRes();
+
+    await searchController(
+      makeReq({
+        query: "weather",
+        sources: [{ type: "web" }, { type: "alexandria" }],
+      }),
+      res,
+    );
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        success: true,
+        warning: "Some tool discovery results are unavailable.",
+      }),
+    );
+  });
+});
+
+describe("skill discovery source", () => {
+  const card = {
+    id: "official/search",
+    name: "Search",
+    description: "Find records",
+    source: "official",
+  };
+
+  it("returns skill cards without billing or reserving keyless credits", async () => {
+    mockProjectSearchTotalCredits.mockReturnValue(2);
+    mockExecuteSearch.mockResolvedValue(
+      executeResult({
+        response: { skills: [card] },
+        skillsDiscovered: true,
+        totalResultsCount: 0,
+        indexResultsCount: 0,
+        searchCredits: 0,
+        totalCredits: 0,
+      }),
+    );
+    const res = makeRes();
+
+    await searchController(
+      makeReq({ query: "records", sources: ["skills"] }),
+      res,
+    );
+
+    expect(mockReserveKeylessCredits).not.toHaveBeenCalled();
+    expect(mockExecuteSearch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sources: [{ type: "skills" }],
+      }),
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        success: true,
+        creditsUsed: 0,
+        data: { skills: [card] },
+      }),
+    );
+    expect(markAlexandriaActivity).toHaveBeenCalledWith(TEAM_ID);
+  });
+
+  it("answers 200 with empty cards when discovery produced nothing", async () => {
+    mockExecuteSearch.mockResolvedValue(
+      executeResult({
+        response: { skills: [] },
+        skillsDiscovered: false,
+        totalResultsCount: 0,
+        indexResultsCount: 0,
+        searchCredits: 0,
+        totalCredits: 0,
+        toolsUnavailable: true,
+      }),
+    );
+    const res = makeRes();
+
+    await searchController(
+      makeReq({ query: "records", sources: [{ type: "skills" }] }),
+      res,
+    );
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ success: true, data: { skills: [] } }),
+    );
+    expect(markAlexandriaActivity).not.toHaveBeenCalled();
+  });
+
+  it("opens the feedback window for a successful lookup that matched nothing", async () => {
+    mockExecuteSearch.mockResolvedValue(
+      executeResult({
+        response: { skills: [] },
+        skillsDiscovered: true,
+        totalResultsCount: 0,
+        indexResultsCount: 0,
+        searchCredits: 0,
+        totalCredits: 0,
+      }),
+    );
+    const res = makeRes();
+
+    await searchController(
+      makeReq({ query: "records", sources: ["skills"] }),
+      res,
+    );
+
+    expect(markAlexandriaActivity).toHaveBeenCalledWith(TEAM_ID);
+  });
+
+  it("requires a query", async () => {
+    const res = makeRes();
+
+    await searchController(makeReq({ query: "  ", sources: ["skills"] }), res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(mockExecuteSearch).not.toHaveBeenCalled();
+  });
+
+  it("refuses keyless and zero data retention the same way tool search does", async () => {
+    const keyless = makeRes();
+    await searchController(
+      {
+        ...makeReq({ query: "records", sources: ["skills"] }),
+        auth: { team_id: "preview_keyless_203.0.113.8" },
+      },
+      keyless,
+    );
+    expect(keyless.status).toHaveBeenCalledWith(403);
+
+    const zdr = makeRes();
+    await searchController(
+      makeReq({
+        query: "records",
+        sources: ["skills"],
+        enterprise: ["zdr"],
+      }),
+      zdr,
+    );
+    expect(zdr.status).toHaveBeenCalledWith(403);
+    expect(mockExecuteSearch).not.toHaveBeenCalled();
   });
 });

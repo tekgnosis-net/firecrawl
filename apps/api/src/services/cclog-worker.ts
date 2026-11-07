@@ -1,7 +1,6 @@
 import "dotenv/config";
 import { config } from "../config";
-import "./sentry";
-import { setSentryServiceTag } from "./sentry";
+import { shutdownTracing } from "../otel";
 import Express from "express";
 import { logger as _logger } from "../lib/logger";
 import {
@@ -15,6 +14,14 @@ const CCLOG_WORKER_LOCK_KEY = "cclog:worker:tick-lock";
 const CCLOG_WORKER_LOCK_TTL_SECONDS = 55;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function sleepUntilNextMinute() {
+  const now = new Date();
+  const nextMinute = now.getTime() + getMsUntilNextMinute(now);
+  while (Date.now() < nextMinute) {
+    await sleep(nextMinute - Date.now());
+  }
+}
 
 async function sendHeartbeat() {
   if (config.CCLOG_WORKER_HEARTBEAT_URL) {
@@ -34,8 +41,6 @@ async function sendHeartbeat() {
 }
 
 (async () => {
-  setSentryServiceTag("cclog-worker");
-
   let isShuttingDown = false;
   let tickInFlight = false;
 
@@ -68,7 +73,8 @@ async function sendHeartbeat() {
       await sleep(1000);
     }
 
-    server.close(() => {
+    server.close(async () => {
+      await shutdownTracing();
       _logger.info("cclog worker shut down");
       process.exit(0);
     });
@@ -82,7 +88,7 @@ async function sendHeartbeat() {
   _logger.info("Waiting for next exact minute to start cclog worker", {
     waitMs: getMsUntilNextMinute(),
   });
-  await sleep(getMsUntilNextMinute());
+  await sleepUntilNextMinute();
 
   const redis = getRedisConnection();
 
@@ -118,7 +124,7 @@ async function sendHeartbeat() {
     }
 
     if (!isShuttingDown) {
-      await sleep(getMsUntilNextMinute());
+      await sleepUntilNextMinute();
     }
   }
 })();

@@ -23,7 +23,9 @@ import { UnsafeDomainBlockedError } from "../../lib/threat-protection/error";
 import { calculateThreatScanCredits } from "../../lib/scrape-billing";
 import { billTeam } from "../../services/billing/credit_billing";
 import { emitRejectedScrapeActivityEvents } from "../../lib/siem-logging";
-import { CrawlDenialError } from "../../lib/error";
+import { UnsupportedSiteError } from "../../lib/error";
+import { UsOnlyUnavailableError } from "../../scraper/scrapeURL/error";
+import { checkExtractAvailable } from "../../lib/extract/fire-0/extraction-service-f0";
 
 /**
  * Extracts data from the provided URLs based on the request parameters.
@@ -44,6 +46,17 @@ export async function extractController(
       success: false,
       error:
         "Your team has zero data retention enabled. This is not supported on extract. Please contact support@firecrawl.com to unblock this feature.",
+    });
+  }
+
+  try {
+    checkExtractAvailable(req.acuc?.flags);
+  } catch (error) {
+    if (!(error instanceof UsOnlyUnavailableError)) throw error;
+    return res.status(403).json({
+      success: false,
+      code: error.code,
+      error: error.message,
     });
   }
 
@@ -84,7 +97,7 @@ export async function extractController(
       apiKeyId: req.acuc?.api_key_id ?? null,
       auditMetadata: req.body.scrapeOptions?.auditMetadata,
       url,
-      error: new CrawlDenialError(UNSUPPORTED_SITE_MESSAGE),
+      error: new UnsupportedSiteError(),
       origin: req.body.origin ?? "api",
       integration: req.body.integration,
       zeroDataRetention: false,
@@ -131,10 +144,12 @@ export async function extractController(
     if (threatScanCredits > 0) {
       billTeam(
         req.auth.team_id,
+        req.acuc?.org_id ?? null,
         threatScanCredits,
         req.acuc?.api_key_id ?? null,
         {
           endpoint: "extract",
+          externalRequestId: externalRequestId(req),
           jobId: extractId,
           // Suffixed: the extract's MAIN charge (fire-0) uses the bare
           // extractId — a shared key would collapse the two into one charge.
@@ -218,6 +233,7 @@ export async function extractController(
   await addExtractJobToQueue(extractId, {
     ...jobData,
     apiKeyId: req.acuc?.api_key_id ?? undefined,
+    externalRequestId: externalRequestId(req),
   });
 
   return res.status(200).json({

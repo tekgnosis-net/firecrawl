@@ -9,7 +9,10 @@ name: Upstream Sync
 # 2026-09-08 after two multi-week stalls waiting on a human merge — issues #13
 # and #19): the tsc build gate is the quality bar, the PR remains the audit
 # trail, and `git revert -m 1 <merge sha>` is the rollback. Non-deterministic
-# conflicts still stop for a human via the escalation issue.
+# conflicts still stop for a human via the escalation issue, whose comment
+# lists the unmerged paths and the commits-behind count inline (added
+# 2026-11-07: run logs expire, and the 8-week stall on issue #22 was being
+# re-diagnosed from scratch each time).
 
 on:
   schedule:
@@ -99,6 +102,8 @@ jobs:
           # Bind step outputs to env vars (data, not inlined into shell syntax).
           RESULT: ${{ steps.sync.outputs.result }}
           BRANCH: ${{ steps.sync.outputs.branch }}
+          BEHIND: ${{ steps.sync.outputs.behind }}
+          CONFLICTS: ${{ steps.sync.outputs.conflicts }}
         run: |
           set -euo pipefail
           case "$RESULT" in
@@ -143,8 +148,9 @@ jobs:
               # FAIL the run — otherwise a successful `gh issue create` lets the
               # job exit green and the escalation hides behind a passing check.
               TITLE="Upstream sync needs manual resolution"
-              BODY="$(printf 'sync-upstream.sh stopped with result=%s (non-deterministic conflict or build failure) on %s.\n\nResolve locally:\n\n    bash .github/scripts/sync-upstream.sh\n\nRun logs (conflicting paths): %s/%s/actions/runs/%s' \
-                "${RESULT:-<none>}" "$(date +%Y-%m-%d)" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")"
+              BODY="$(printf 'sync-upstream.sh stopped with result=%s (non-deterministic conflict or build failure) on %s. Fork is %s upstream commits behind.\n\nResolve locally:\n\n    bash .github/scripts/sync-upstream.sh\n\nUnmerged paths (`git status --porcelain`; DU/DD are auto-resolved, so these are the real ones):\n\n```\n%s\n```\n\nRun logs: %s/%s/actions/runs/%s' \
+                "${RESULT:-<none>}" "$(date +%Y-%m-%d)" "${BEHIND:-?}" "${CONFLICTS:-<none captured — build failure or script crash>}" \
+                "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")"
               EXISTING="$(gh issue list --state open --limit 100 --json number,title \
                 --jq "map(select(.title == \"$TITLE\")) | .[0].number // empty")"
               if [ -n "$EXISTING" ]; then

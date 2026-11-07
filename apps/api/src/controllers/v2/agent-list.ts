@@ -19,6 +19,76 @@ type RecentAgent = {
     | "credit_limit_reached";
 };
 
+// ClickHouse returns the `agents.options` column as a JSON string, not an
+// object. Parse it so the option fields can be read. A value that does not
+// parse to an object reads as no options.
+function parseAgentOptions(options: unknown): Record<string, any> {
+  let parsed = options;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return {};
+    }
+  }
+  return parsed !== null && typeof parsed === "object" ? parsed : {};
+}
+
+// JSONEachRow can quote 64-bit integers, so a turn can arrive as "2". A turn
+// that a number cannot hold exactly is dropped, not rounded.
+function threadTurnOf(value: unknown): number | undefined {
+  const turn =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim() !== ""
+        ? Number(value)
+        : NaN;
+  return Number.isSafeInteger(turn) ? turn : undefined;
+}
+
+const ZDR_TARGET_HINT = "<redacted due to zero data retention>";
+
+function isZdrOptions(options: any): boolean {
+  return options?.zeroDataRetention === true;
+}
+
+// A zero data retention run is listed with its model, effort and the flag
+// only, whichever source the row comes from.
+function withoutZdrContent(options: any): any {
+  return isZdrOptions(options)
+    ? {
+        model: options.model,
+        modelPreset: options.modelPreset,
+        effort: options.effort,
+        safe: options.safe,
+        zeroDataRetention: true,
+      }
+    : options;
+}
+
+function safeOption(options: any): { safe?: true } {
+  return options?.safe === true ? { safe: true } : {};
+}
+
+function zdrOptions(options: any): { zeroDataRetention?: true } {
+  return isZdrOptions(options) ? { zeroDataRetention: true } : {};
+}
+
+// Each turn of a thread is its own run, so clients need the thread to list
+// a conversation once.
+function threadOptions(options: any): {
+  threadId?: string;
+  threadTurn?: number;
+} {
+  const threadTurn = threadTurnOf(options?.threadTurn);
+  return {
+    ...(typeof options?.threadId === "string" && {
+      threadId: options.threadId,
+    }),
+    ...(threadTurn !== undefined && { threadTurn }),
+  };
+}
+
 export async function agentListController(
   req: RequestWithAuth<{}, AgentListResponse>,
   res: Response<AgentListResponse>,
@@ -41,6 +111,22 @@ export async function agentListController(
     return res.status(400).json({
       success: false,
       error: "Invalid before timestamp.",
+    });
+  }
+
+  // Tiebreaker for agents created in the same millisecond as the cursor. A
+  // `next` link always carries it; a hand-built `before` may omit it.
+  const beforeId = req.query.beforeId ? String(req.query.beforeId) : undefined;
+  if (
+    beforeId !== undefined &&
+    (parsedBefore === undefined ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+        beforeId,
+      ))
+  ) {
+    return res.status(400).json({
+      success: false,
+      error: "Invalid beforeId cursor.",
     });
   }
 
@@ -91,18 +177,28 @@ export async function agentListController(
       );
     })(),
     (async () => {
+      // Keyset pagination on (created_at, id), the same order the rows are
+      // returned in, so agents created in the same millisecond as the last
+      // one on a page are not skipped. Millisecond precision matches the
+      // `before` value the `next` link carries; the old whole-second cursor
+      // dropped every other agent created in that second.
+      const cursorPredicate =
+        beforeId !== undefined
+          ? "(created_at, id) < ({before: DateTime64(3)}, {beforeId: UUID})"
+          : "created_at < {before: DateTime64(3)}";
       const requestsRes = await clickhouseClient.query({
-        query:
-          "SELECT id, created_at, target_hint, origin, integration FROM public_requests WHERE team_id = {teamId: UUID} AND kind = 'agent' AND created_at < {before: DateTime} ORDER BY created_at DESC LIMIT {limit: UInt32};",
+        query: `SELECT id, created_at, target_hint, origin, integration FROM requests WHERE team_id = {teamId: UUID} AND kind = 'agent' AND ${cursorPredicate} ORDER BY created_at DESC, id DESC LIMIT 1 BY id LIMIT {limit: UInt32};`,
         query_params: {
           teamId: req.auth.team_id,
           // Fetch one extra row so we can tell whether another page exists
           // instead of emitting a next cursor whenever the page is full.
           limit: limit + 1,
-          before: (parsedBefore !== undefined
-            ? new Date(parsedBefore).toISOString()
-            : new Date().toISOString()
-          ).split(".")[0], // slice .nnnZ off the end of the ISO string because clickhouse hates it
+          // "YYYY-MM-DD hh:mm:ss.mmm": what a DateTime64(3) parameter takes.
+          before: new Date(parsedBefore ?? Date.now())
+            .toISOString()
+            .replace("T", " ")
+            .replace("Z", ""),
+          ...(beforeId !== undefined ? { beforeId } : {}),
         },
         format: "JSONEachRow",
       });
@@ -129,10 +225,14 @@ export async function agentListController(
         }),
       );
 
+      // `agents` is keyed by (team_id, id); the team filter keeps this a
+      // primary-key read instead of a scan. The table keeps the latest
+      // publication per id on merge; argMax picks the same row before it.
       const agentsRes = await clickhouseClient.query({
         query:
-          "SELECT id, options, is_successful FROM public_agents WHERE id IN {ids: Array(UUID)};",
+          "SELECT id, argMax(options, _publish_time) AS options, argMax(is_successful, _publish_time) AS is_successful, argMax(error, _publish_time) AS error FROM agents WHERE team_id = {teamId: UUID} AND id IN {ids: Array(UUID)} GROUP BY id;",
         query_params: {
+          teamId: req.auth.team_id,
           ids: bareRequests.map(x => x.id),
         },
         format: "JSONEachRow",
@@ -150,7 +250,7 @@ export async function agentListController(
           error: string | null;
         }) => ({
           id: x.id,
-          options: x.options,
+          options: parseAgentOptions(x.options),
           isSuccessful: x.is_successful,
           error: x.error,
         }),
@@ -205,15 +305,19 @@ export async function agentListController(
     const recent = recentAgents.get(id);
     const db = dbAgents.get(id);
     const settings = sessionSettingsMap.get(id);
+    const recentOptions = withoutZdrContent(recent?.options);
+    const dbOptions = db?.agent ? withoutZdrContent(db.agent.options) : null;
 
     agents.push({
       id: db?.id ?? recent!.id,
       createdAt: db?.createdAt.toISOString() ?? recent!.createdAt,
       targetHint:
         db?.targetHint ??
-        (recent?.options
-          ? (recent.options.urls?.[0] ?? recent.options.prompt ?? "")
-          : ""),
+        (isZdrOptions(recentOptions)
+          ? ZDR_TARGET_HINT
+          : recentOptions
+            ? (recentOptions.urls?.[0] ?? recentOptions.prompt ?? "")
+            : ""),
       origin: db?.origin ?? "api", // recent cannot know origin so we lie
       integration: db?.integration ?? undefined, // recent cannot know integration so we omit
       settings: {
@@ -232,27 +336,33 @@ export async function agentListController(
           : recent!.status === "succeeded"
             ? "completed"
             : "failed",
-      options: db?.agent
+      options: dbOptions
         ? {
-            urls: db.agent.options.urls ?? undefined,
-            prompt: db.agent.options.prompt ?? "",
-            schema: db.agent.options.schema ?? undefined,
-            model: db.agent.options.model ?? "spark-1-pro",
+            urls: dbOptions.urls ?? undefined,
+            prompt: dbOptions.prompt ?? "",
+            schema: dbOptions.schema ?? undefined,
+            model: dbOptions.model ?? "spark-1-pro",
             effort:
-              db.agent.options.effort ??
-              (db.agent.options.model === "spark-2" ? "medium" : undefined),
+              dbOptions.effort ??
+              (dbOptions.model === "spark-2" ? "medium" : undefined),
+            ...safeOption(dbOptions),
+            ...threadOptions(dbOptions),
+            ...zdrOptions(dbOptions),
           }
-        : recent?.options
+        : recentOptions
           ? {
-              urls: recent.options.urls ?? undefined,
-              prompt: recent.options.prompt ?? "",
-              schema: recent.options.schema ?? undefined,
-              model: recent.options.modelPreset ?? "spark-1-pro",
+              urls: recentOptions.urls ?? undefined,
+              prompt: recentOptions.prompt ?? "",
+              schema: recentOptions.schema ?? undefined,
+              model: recentOptions.modelPreset ?? "spark-1-pro",
               effort:
-                recent.options.effort ??
-                (recent.options.modelPreset === "spark-2"
+                recentOptions.effort ??
+                (recentOptions.modelPreset === "spark-2"
                   ? "medium"
                   : undefined),
+              ...safeOption(recentOptions),
+              ...threadOptions(recentOptions),
+              ...zdrOptions(recentOptions),
             }
           : undefined,
     });
@@ -275,7 +385,7 @@ export async function agentListController(
     success: true,
     agents: page,
     next: hasMore
-      ? `${req.protocol}://${req.host}/v2/agent?before=${new Date(page.slice(-1)[0].createdAt).valueOf()}`
+      ? `${req.protocol}://${req.host}/v2/agent?before=${new Date(page.slice(-1)[0].createdAt).valueOf()}&beforeId=${encodeURIComponent(page.slice(-1)[0].id)}`
       : undefined,
   });
 }
